@@ -7,7 +7,7 @@ Set operations: INTERSECT binds tighter than UNION and EXCEPT, as in standard SQ
 """
 
 from . import nodes as n
-from .errors import SqlError
+from ..errors import SqlError
 from .lexer import EOF, FLOAT, INT, OP, QUOTED, STRING, WORD, tokenize
 
 # Words that are never a bare name. Other keywords (KEY, INDEX, ROWS, FIRST, ...)
@@ -43,6 +43,11 @@ def parse(sql: str):
 
 def parse_script(sql: str) -> list:
     """Parse any number of semicolon-separated statements."""
+    return [statement for statement, _ in parse_statements(sql)]
+
+
+def parse_statements(sql: str) -> list:
+    """Parse a script into (statement, source text of that statement) pairs."""
     p = _Parser(sql)
     statements = []
     while True:
@@ -50,7 +55,9 @@ def parse_script(sql: str) -> list:
             pass
         if p.tok.kind == EOF:
             return statements
-        statements.append(p.statement())
+        start = p.tok.pos
+        statement = p.statement()
+        statements.append((statement, sql[start:p.tok.pos].strip()))
         if p.tok.kind != EOF:
             p.expect_op(";")
 
@@ -69,6 +76,11 @@ class _Parser:
 
     def peek(self, k=1):
         return self.tokens[min(self.i + k, len(self.tokens) - 1)]
+
+    @property
+    def prev_pos(self):
+        """Position of the token just consumed."""
+        return self.tokens[self.i - 1].pos
 
     def advance(self):
         tok = self.tok
@@ -368,12 +380,13 @@ class _Parser:
 
     def select_item(self):
         if self.accept_op("*"):
-            return n.SelectItem(n.Star())
+            return n.SelectItem(n.Star(pos=self.prev_pos))
+        pos = self.tok.pos
         if self.is_name() and (self.peek().kind, self.peek().value, self.peek(2).kind, self.peek(2).value) == (OP, ".", OP, "*"):
             table = self.ident()
             self.advance()
             self.advance()
-            return n.SelectItem(n.Star(table))
+            return n.SelectItem(n.Star(table, pos))
         return n.SelectItem(self.expr(), self.alias())
 
     def alias(self):
@@ -426,7 +439,8 @@ class _Parser:
             if alias is None:
                 raise self.error("a subquery in FROM needs an alias, e.g. (SELECT ...) AS sub", tok)
             return n.SubqueryRef(query, alias)
-        return n.TableRef(self.ident("a table name"), self.alias())
+        pos = self.tok.pos
+        return n.TableRef(self.ident("a table name"), self.alias(), pos)
 
     def order_by(self):
         self.expect_kw("BY")
@@ -449,25 +463,29 @@ class _Parser:
     def expr(self):
         left = self.and_expr()
         while self.accept_kw("OR"):
-            left = n.Binary("OR", left, self.and_expr())
+            pos = self.prev_pos
+            left = n.Binary("OR", left, self.and_expr(), pos)
         return left
 
     def and_expr(self):
         left = self.not_expr()
         while self.accept_kw("AND"):
-            left = n.Binary("AND", left, self.not_expr())
+            pos = self.prev_pos
+            left = n.Binary("AND", left, self.not_expr(), pos)
         return left
 
     def not_expr(self):
         if self.accept_kw("NOT"):
-            return n.Unary("NOT", self.not_expr())
+            pos = self.prev_pos
+            return n.Unary("NOT", self.not_expr(), pos)
         return self.comparison()
 
     def comparison(self):
         left = self.concat()
         while True:
             if op := self.accept_op(*_COMPARISONS):
-                left = n.Binary("!=" if op == "<>" else op, left, self.concat())
+                pos = self.prev_pos
+                left = n.Binary("!=" if op == "<>" else op, left, self.concat(), pos)
             elif self.accept_kw("IS"):
                 negated = bool(self.accept_kw("NOT"))
                 self.expect_kw("NULL")
@@ -500,27 +518,31 @@ class _Parser:
     def concat(self):
         left = self.additive()
         while self.accept_op("||"):
-            left = n.Binary("||", left, self.additive())
+            pos = self.prev_pos
+            left = n.Binary("||", left, self.additive(), pos)
         return left
 
     def additive(self):
         left = self.multiplicative()
         while op := self.accept_op("+", "-"):
-            left = n.Binary(op, left, self.multiplicative())
+            pos = self.prev_pos
+            left = n.Binary(op, left, self.multiplicative(), pos)
         return left
 
     def multiplicative(self):
         left = self.unary()
         while op := self.accept_op("*", "/", "%"):
-            left = n.Binary(op, left, self.unary())
+            pos = self.prev_pos
+            left = n.Binary(op, left, self.unary(), pos)
         return left
 
     def unary(self):
         if op := self.accept_op("-", "+"):
+            pos = self.prev_pos
             operand = self.unary()
             if op == "-" and isinstance(operand, n.Literal) and type(operand.value) in (int, float):
                 return n.Literal(-operand.value)  # so -9223372036854775808 stays in range
-            return n.Unary(op, operand)
+            return n.Unary(op, operand, pos)
         return self.primary()
 
     def primary(self):
@@ -560,12 +582,12 @@ class _Parser:
             self.expect_op(")")
             return n.Exists(query)
         if tok.kind == WORD and self.is_name() and self.peek().kind == OP and self.peek().value == "(":
-            return self.call(self.advance().value.upper())
+            return self.call(self.advance().value.upper(), tok.pos)
         if self.is_name():
             name = self.ident()
             if self.accept_op("."):
-                return n.ColumnRef(self.ident("a column name"), name)
-            return n.ColumnRef(name)
+                return n.ColumnRef(self.ident("a column name"), name, tok.pos)
+            return n.ColumnRef(name, pos=tok.pos)
         raise self.error(f"expected an expression, got {self.describe()}")
 
     def case(self):
@@ -581,9 +603,9 @@ class _Parser:
         self.expect_kw("END")
         return n.Case(operand, whens, else_)
 
-    def call(self, name):
+    def call(self, name, pos):
         self.expect_op("(")
-        call = n.Call(name)
+        call = n.Call(name, pos=pos)
         if self.accept_op("*"):
             call.star = True
         elif not self.is_op(")"):

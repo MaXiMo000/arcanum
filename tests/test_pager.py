@@ -67,3 +67,33 @@ def test_rejects_foreign_files(tmp_path):
     path.write_bytes(b"SQLite format 3\x00" + bytes(PAGE_SIZE))
     with pytest.raises(CorruptDatabaseError):
         Pager(path)
+
+
+def test_savepoint_rollback_restores_pages_and_allocation(tmp_path):
+    with Pager(tmp_path / "t.db", pool_size=2) as pager:  # tiny pool: originals must survive eviction
+        a = pager.allocate()
+        pager.write(a, b"before")
+        pager.savepoint()
+        pager.write(a, b"after")
+        b = pager.allocate()
+        pager.write(b, b"new page")
+        pager.free(a)
+        pager.rollback()
+        assert pager.read(a).rstrip(b"\x00") == b"before"
+        assert pager.page_count == 2 and pager.free_head == 0
+        assert pager.allocate() == b  # the page allocated inside the savepoint is handed out again
+
+
+def test_nested_savepoints(tmp_path):
+    with Pager(tmp_path / "t.db") as pager:
+        a = pager.allocate()
+        pager.write(a, b"v1")
+        pager.savepoint()
+        pager.write(a, b"v2")
+        pager.savepoint()
+        pager.write(a, b"v3")
+        pager.release()  # v3 now belongs to the outer savepoint
+        assert pager.read(a).rstrip(b"\x00") == b"v3"
+        pager.rollback()
+        assert pager.read(a).rstrip(b"\x00") == b"v1"
+        assert not pager.in_savepoint

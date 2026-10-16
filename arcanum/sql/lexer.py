@@ -8,7 +8,7 @@ used as a table or column name.
 import re
 from dataclasses import dataclass
 
-from .errors import SqlError
+from ..errors import SqlError
 
 WORD, QUOTED, INT, FLOAT, STRING, OP, EOF = "word", "quoted", "int", "float", "string", "op", "eof"
 

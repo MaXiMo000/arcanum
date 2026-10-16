@@ -1,5 +1,7 @@
 """The syntax tree produced by the parser.
 
+Nodes that name something (columns, tables, functions, operators) carry
+the offset of their token in `pos` for error messages; it is ignored by ==.
 Unquoted identifiers are lower-cased; quoted identifiers keep their exact
 spelling. Function names are upper-cased. Type names are normalised to
 INTEGER, REAL, TEXT or BOOLEAN.
@@ -19,18 +21,21 @@ class Literal:
 class ColumnRef:
     name: str
     table: str | None = None
+    pos: int | None = field(default=None, compare=False, repr=False)  # offset in the SQL text
 
 
 @dataclass(slots=True)
 class Star:
     """`*` or `t.*` in a select list."""
     table: str | None = None
+    pos: int | None = field(default=None, compare=False, repr=False)  # offset in the SQL text
 
 
 @dataclass(slots=True)
 class Unary:
     op: str  # "-", "+" or "NOT"
     operand: object
+    pos: int | None = field(default=None, compare=False, repr=False)  # offset in the SQL text
 
 
 @dataclass(slots=True)
@@ -38,6 +43,7 @@ class Binary:
     op: str  # OR AND = != < <= > >= || + - * / %
     left: object
     right: object
+    pos: int | None = field(default=None, compare=False, repr=False)  # offset in the SQL text
 
 
 @dataclass(slots=True)
@@ -126,6 +132,7 @@ class Call:
     distinct: bool = False
     star: bool = False  # COUNT(*)
     over: WindowSpec | None = None
+    pos: int | None = field(default=None, compare=False, repr=False)  # offset in the SQL text
 
 
 # ---- queries -------------------------------------------------------------------
@@ -148,6 +155,7 @@ class SelectItem:
 class TableRef:
     name: str
     alias: str | None = None
+    pos: int | None = field(default=None, compare=False, repr=False)  # offset in the SQL text
 
 
 @dataclass(slots=True)

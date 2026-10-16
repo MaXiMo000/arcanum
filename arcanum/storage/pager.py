@@ -4,12 +4,17 @@ Page 0 holds the file header; every other page belongs to a B+tree or to the
 free list. read() hands out immutable bytes and every change goes back through
 write(), so the pool is the only place a page is modified and evicting a dirty
 page can never lose an update a caller is still holding.
+
+Savepoints make a group of writes undoable: before a page is first changed
+inside a savepoint, its original bytes are kept in memory, and rollback()
+puts them back. Statements and transactions are built on this.
 """
 
 import os
 import struct
 from collections import OrderedDict
 
+from ..errors import ArcanumError
 from ..events import EventBus
 
 PAGE_SIZE = 4096
@@ -20,7 +25,7 @@ _HEADER = struct.Struct("<8sHII")  # magic, version, page_count, free_list_head
 _NEXT_FREE = struct.Struct("<I")  # a free page starts with the id of the next free page
 
 
-class CorruptDatabaseError(Exception):
+class CorruptDatabaseError(ArcanumError):
     pass
 
 
@@ -33,6 +38,7 @@ class Pager:
         self.events = events if events is not None else EventBus()
         self.stats = {"hits": 0, "misses": 0, "evictions": 0, "disk_reads": 0, "disk_writes": 0}
         self._pool = OrderedDict()  # page id -> [data, dirty], least recently used first
+        self._savepoints = []  # [(original page images, page_count, free_head)], innermost last
         fresh = not os.path.exists(path) or os.path.getsize(path) == 0
         self._file = open(path, "w+b" if fresh else "r+b")
         if fresh:
@@ -63,6 +69,10 @@ class Pager:
         self._check(page_id)
         if len(data) > PAGE_SIZE:
             raise ValueError(f"page {page_id}: {len(data)} bytes does not fit in a {PAGE_SIZE}-byte page")
+        if self._savepoints:
+            originals, page_count, _ = self._savepoints[-1]
+            if page_id < page_count and page_id not in originals:
+                originals[page_id] = self._current(page_id)
         self._put(page_id, bytes(data).ljust(PAGE_SIZE, b"\x00"), dirty=True)
         self.events.emit("page_write", page=page_id)
 
@@ -82,6 +92,32 @@ class Pager:
         self.write(page_id, _NEXT_FREE.pack(self.free_head))
         self.free_head = page_id
         self.events.emit("page_free", page=page_id)
+
+    def savepoint(self):
+        """Start a group of writes that rollback() can undo. Savepoints nest."""
+        self._savepoints.append(({}, self.page_count, self.free_head))
+
+    def release(self):
+        """Keep the writes of the innermost savepoint (they join the enclosing one, if any)."""
+        originals, _, _ = self._savepoints.pop()
+        if self._savepoints:
+            outer = self._savepoints[-1][0]
+            for page_id, data in originals.items():
+                outer.setdefault(page_id, data)
+
+    def rollback(self):
+        """Undo every write since the innermost savepoint and end it."""
+        originals, page_count, free_head = self._savepoints.pop()
+        for page_id in [p for p in self._pool if p >= page_count]:
+            del self._pool[page_id]  # pages allocated inside the savepoint no longer exist
+        self.page_count, self.free_head = page_count, free_head
+        for page_id, data in originals.items():
+            self._put(page_id, data, dirty=True)
+        self.events.emit("rollback", pages=len(originals))
+
+    @property
+    def in_savepoint(self):
+        return bool(self._savepoints)
 
     def flush(self):
         """Write every dirty page and the header, then fsync."""
@@ -114,6 +150,14 @@ class Pager:
                 self._write_page(victim, victim_data)
             self.stats["evictions"] += 1
             self.events.emit("cache_evict", page=victim, dirty=victim_dirty)
+
+    def _current(self, page_id):
+        """A page's bytes without touching LRU order, stats or events."""
+        entry = self._pool.get(page_id)
+        if entry is not None:
+            return entry[0]
+        self._file.seek(page_id * PAGE_SIZE)
+        return self._file.read(PAGE_SIZE).ljust(PAGE_SIZE, b"\x00")
 
     def _write_page(self, page_id, data):
         self._file.seek(page_id * PAGE_SIZE)

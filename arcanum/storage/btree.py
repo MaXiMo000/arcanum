@@ -108,6 +108,22 @@ class BTree:
                 return
             node, i = self._load(node.next_leaf), 0
 
+    def last_key(self):
+        """The largest key, or None if the tree is empty."""
+        node = self._load(self.root)
+        while not node.leaf:
+            node = self._load(node.children[-1])
+        return node.keys[-1] if node.keys else None
+
+    def drop(self):
+        """Free every page of the tree, including the root. The tree is unusable afterwards."""
+        pages = [self.root]
+        while pages:
+            node = self._load(pages.pop())
+            if not node.leaf:
+                pages.extend(node.children)
+            self.pager.free(node.page)
+
     # ---- insert ------------------------------------------------------------
 
     def insert(self, key, value, replace=False):
