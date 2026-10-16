@@ -1,0 +1,17 @@
+# Local-only material
+.dev/
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Database files created while experimenting
+*.db
