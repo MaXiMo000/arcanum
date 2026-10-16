@@ -15,3 +15,6 @@ dist/
 
 # Database files created while experimenting
 *.db
+
+# Write-ahead logs of databases left open by a crash
+*.db-wal

@@ -1,9 +1,15 @@
-"""Fixed-size pages on disk behind an LRU buffer pool.
+"""Fixed-size pages behind an LRU buffer pool, made durable by a write-ahead log.
 
 Page 0 holds the file header; every other page belongs to a B+tree or to the
 free list. read() hands out immutable bytes and every change goes back through
-write(), so the pool is the only place a page is modified and evicting a dirty
-page can never lose an update a caller is still holding.
+write(), so the pool is the only place a page is modified.
+
+Durability: commit() appends every changed page and then the header (the
+commit frame) to the write-ahead log and syncs it. The data file only ever
+receives committed pages, copied over by checkpoint(). A dirty page evicted
+from the pool mid-transaction is written to the log without a commit frame,
+so it counts only if its transaction commits. Opening a database replays the
+committed part of the log (see wal.py).
 
 Savepoints make a group of writes undoable: before a page is first changed
 inside a savepoint, its original bytes are kept in memory, and rollback()
@@ -16,6 +22,8 @@ from collections import OrderedDict
 
 from ..errors import ArcanumError
 from ..events import EventBus
+from .files import OsFileSystem
+from .wal import Wal
 
 PAGE_SIZE = 4096
 MAGIC = b"ARCANUM\x00"
@@ -30,22 +38,40 @@ class CorruptDatabaseError(ArcanumError):
 
 
 class Pager:
-    def __init__(self, path, pool_size=256, events=None):
+    def __init__(self, path, pool_size=256, events=None, fs=None, checkpoint_frames=1000):
+        """checkpoint_frames: copy the log into the data file once it holds this many committed frames."""
         if pool_size < 1:
             raise ValueError("pool_size must be at least 1")
-        self.path = path
+        self.path = os.fspath(path)
         self.pool_size = pool_size
         self.events = events if events is not None else EventBus()
-        self.stats = {"hits": 0, "misses": 0, "evictions": 0, "disk_reads": 0, "disk_writes": 0}
+        self.fs = fs if fs is not None else OsFileSystem()
+        self.checkpoint_frames = checkpoint_frames
+        self.stats = {"hits": 0, "misses": 0, "evictions": 0, "disk_reads": 0, "wal_frames": 0, "checkpoints": 0}
+        self.recovered_frames = 0  # committed frames replayed from the log when the file was opened
         self._pool = OrderedDict()  # page id -> [data, dirty], least recently used first
         self._savepoints = []  # [(original page images, page_count, free_head)], innermost last
-        fresh = not os.path.exists(path) or os.path.getsize(path) == 0
-        self._file = open(path, "w+b" if fresh else "r+b")
-        if fresh:
+        self._closed = False
+        self._file = self.fs.open(self.path)
+        if self._file.size() < PAGE_SIZE:
+            # New database (or one whose creation never finished: nothing was ever committed to it).
             self.page_count, self.free_head = 1, 0
-            self._write_header()
+            self._file.truncate(0)
+            self._file.write(0, self._header_page())
+            self._file.sync()
+            self.wal = Wal(self.fs.open(self.path + "-wal"), PAGE_SIZE, self.events)
+            self.wal.reset()
         else:
-            self._read_header()
+            self._read_header()  # rejects files that are not Arcanum databases before touching anything
+            self.wal = Wal(self.fs.open(self.path + "-wal"), PAGE_SIZE, self.events)
+            self.recovered_frames = self.wal.recover()
+            if self.recovered_frames:
+                self.events.emit("recovery", frames=self.recovered_frames, pages=len(self.wal.committed_pages))
+                self.checkpoint()
+                self._read_header()
+        self._committed_header = (self.page_count, self.free_head)
+
+    # ---- pages -----------------------------------------------------------------
 
     def read(self, page_id) -> bytes:
         self._check(page_id)
@@ -57,10 +83,7 @@ class Pager:
             return entry[0]
         self.stats["misses"] += 1
         self.stats["disk_reads"] += 1
-        self._file.seek(page_id * PAGE_SIZE)
-        data = self._file.read(PAGE_SIZE)
-        if len(data) != PAGE_SIZE:
-            raise CorruptDatabaseError(f"page {page_id} is truncated")
+        data = self._stored(page_id)
         self.events.emit("page_read", page=page_id, source="disk")
         self._put(page_id, data, dirty=False)
         return data
@@ -93,8 +116,16 @@ class Pager:
         self.free_head = page_id
         self.events.emit("page_free", page=page_id)
 
+    # ---- savepoints --------------------------------------------------------------
+
     def savepoint(self):
-        """Start a group of writes that rollback() can undo. Savepoints nest."""
+        """Start a group of writes that rollback() can undo. Savepoints nest.
+
+        An outermost savepoint first commits any changes made outside savepoints,
+        so rolling it back never discards work it did not contain.
+        """
+        if not self._savepoints:
+            self.commit()
         self._savepoints.append(({}, self.page_count, self.free_head))
 
     def release(self):
@@ -108,37 +139,79 @@ class Pager:
     def rollback(self):
         """Undo every write since the innermost savepoint and end it."""
         originals, page_count, free_head = self._savepoints.pop()
-        for page_id in [p for p in self._pool if p >= page_count]:
-            del self._pool[page_id]  # pages allocated inside the savepoint no longer exist
+        # Drop every page the savepoint touched before restoring any, so restoring one can
+        # never evict another that still holds rolled-back changes. Pages allocated inside
+        # the savepoint no longer exist at all.
+        for page_id in [p for p in self._pool if p >= page_count or p in originals]:
+            del self._pool[page_id]
         self.page_count, self.free_head = page_count, free_head
+        outermost = not self._savepoints
+        if outermost:
+            self.wal.rollback()  # pages spilled to the log by this transaction no longer count
         for page_id, data in originals.items():
-            self._put(page_id, data, dirty=True)
+            # An outermost savepoint began at a commit, so its originals are exactly what is
+            # stored: they come back clean. Inside a transaction they still need writing.
+            self._put(page_id, data, dirty=not outermost)
         self.events.emit("rollback", pages=len(originals))
 
     @property
     def in_savepoint(self):
         return bool(self._savepoints)
 
-    def flush(self):
-        """Write every dirty page and the header, then fsync."""
-        for page_id, entry in sorted(self._pool.items()):
-            if entry[1]:
-                self._write_page(page_id, entry[0])
-                entry[1] = False
-        self._write_header()
-        self._file.flush()
-        os.fsync(self._file.fileno())
+    # ---- durability --------------------------------------------------------------
+
+    def commit(self):
+        """Make every change so far durable: log the dirty pages and a commit frame, then sync the log."""
+        if self._savepoints:
+            raise RuntimeError("cannot commit while a savepoint is open")
+        dirty = [(page_id, entry[0]) for page_id, entry in sorted(self._pool.items()) if entry[1]]
+        header = (self.page_count, self.free_head)
+        if not dirty and header == self._committed_header and not self.wal.has_uncommitted:
+            return
+        for page_id, data in dirty:
+            self.wal.append(page_id, data)
+        self.wal.append(0, self._header_page(), commit=True)
+        self.wal.commit()
+        for page_id, _ in dirty:
+            self._pool[page_id][1] = False
+        self._committed_header = header
+        self.stats["wal_frames"] += len(dirty) + 1
+        self.events.emit("commit", pages=len(dirty))
+        if self.wal.committed_frames >= self.checkpoint_frames:
+            self.checkpoint()
+
+    def checkpoint(self):
+        """Copy committed pages from the log into the data file, sync it, then empty the log."""
+        if self._savepoints or self.wal.has_uncommitted:
+            raise RuntimeError("cannot checkpoint while a transaction is open")
+        pages = self.wal.committed_pages
+        for page_id, offset in sorted(pages.items()):
+            self._file.write(page_id * PAGE_SIZE, self.wal.read(offset))
+        self._file.sync()
+        self.wal.reset()
+        self.stats["checkpoints"] += 1
+        self.events.emit("checkpoint", pages=len(pages))
 
     def close(self):
-        if not self._file.closed:
-            self.flush()
-            self._file.close()
+        """Commit outstanding changes, checkpoint and remove the log. Open savepoints are rolled back."""
+        if self._closed:
+            return
+        while self._savepoints:
+            self.rollback()
+        self.commit()
+        self.checkpoint()
+        self.wal.close()
+        self._file.close()
+        self.fs.remove(self.path + "-wal")
+        self._closed = True
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         self.close()
+
+    # ---- internals ----------------------------------------------------------------
 
     def _put(self, page_id, data, dirty):
         entry = self._pool.get(page_id)
@@ -147,38 +220,39 @@ class Pager:
         while len(self._pool) > self.pool_size:
             victim, (victim_data, victim_dirty) = self._pool.popitem(last=False)
             if victim_dirty:
-                self._write_page(victim, victim_data)
+                self.wal.append(victim, victim_data)  # uncommitted until the next commit frame
+                self.stats["wal_frames"] += 1
             self.stats["evictions"] += 1
             self.events.emit("cache_evict", page=victim, dirty=victim_dirty)
+
+    def _stored(self, page_id):
+        """The newest stored image of a page: from the log if it is there, else the data file."""
+        offset = self.wal.index.get(page_id)
+        if offset is not None:
+            return self.wal.read(offset)
+        data = self._file.read(page_id * PAGE_SIZE, PAGE_SIZE)
+        if len(data) != PAGE_SIZE:
+            raise CorruptDatabaseError(f"page {page_id} is truncated")
+        return data
 
     def _current(self, page_id):
         """A page's bytes without touching LRU order, stats or events."""
         entry = self._pool.get(page_id)
-        if entry is not None:
-            return entry[0]
-        self._file.seek(page_id * PAGE_SIZE)
-        return self._file.read(PAGE_SIZE).ljust(PAGE_SIZE, b"\x00")
-
-    def _write_page(self, page_id, data):
-        self._file.seek(page_id * PAGE_SIZE)
-        self._file.write(data)
-        self.stats["disk_writes"] += 1
+        return entry[0] if entry is not None else self._stored(page_id)
 
     def _check(self, page_id):
         if not 1 <= page_id < self.page_count:
             raise IndexError(f"page {page_id} does not exist (file has {self.page_count} pages)")
 
-    def _write_header(self):
-        self._file.seek(0)
-        self._file.write(_HEADER.pack(MAGIC, VERSION, self.page_count, self.free_head).ljust(PAGE_SIZE, b"\x00"))
+    def _header_page(self):
+        return _HEADER.pack(MAGIC, VERSION, self.page_count, self.free_head).ljust(PAGE_SIZE, b"\x00")
 
     def _read_header(self):
-        self._file.seek(0)
-        raw = self._file.read(PAGE_SIZE)
-        if len(raw) < _HEADER.size:
-            raise CorruptDatabaseError(f"{self.path} is too short to be an Arcanum database")
-        magic, version, self.page_count, self.free_head = _HEADER.unpack_from(raw)
+        raw = self._file.read(0, _HEADER.size)
+        magic, version, self.page_count, self.free_head = _HEADER.unpack(raw)
         if magic != MAGIC:
+            self._file.close()
             raise CorruptDatabaseError(f"{self.path} is not an Arcanum database")
         if version != VERSION:
+            self._file.close()
             raise CorruptDatabaseError(f"{self.path} uses format version {version}, expected {VERSION}")

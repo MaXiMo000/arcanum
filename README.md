@@ -2,7 +2,7 @@
 
 A relational database written from scratch in Python, built so you can watch it work.
 No SQLite or Postgres underneath: Arcanum has its own pager, B+tree, SQL parser, binder and
-query executor, and, as it grows, its own write-ahead log, crash recovery and cost-based
+query executor, write-ahead log and crash recovery, and, as it grows, its own cost-based
 optimizer. Every internal step emits an event, so a UI can show pages loading, nodes
 splitting and rows flowing through a query plan in real time.
 
@@ -57,8 +57,8 @@ with Database("company.db") as db:
 | Binder: name resolution, type checking, correlated subqueries | done |
 | Executor: iterator-model operators, hash join, hash aggregate, window functions, recursive CTEs | done |
 | Atomic statements, `BEGIN` / `COMMIT` / `ROLLBACK`, `EXPLAIN [ANALYZE]` | done |
-| Write-ahead log and crash recovery | next |
-| Cost-based optimizer: index scans, statistics, join ordering, subquery decorrelation | planned |
+| Write-ahead log, checkpoints and crash recovery | done |
+| Cost-based optimizer: index scans, statistics, join ordering, subquery decorrelation | next |
 | API with live event stream, 3D visualizer | planned |
 
 ## SQL support
@@ -84,7 +84,7 @@ with Database("company.db") as db:
 - `NULL` follows SQL's three-valued logic, sorts first in ascending order and last in descending order.
 - Integer division truncates toward zero; `%` takes integers; dividing by zero and integer overflow are errors.
 - `LIKE` is case-sensitive.
-- Every statement is atomic. Committed changes are flushed and fsynced to the file.
+- Every statement is atomic, and a committed transaction survives any crash (see below).
 
 Errors point at the exact spot:
 
@@ -92,6 +92,25 @@ Errors point at the exact spot:
 >>> db.execute("SELECT * FROM users WHERE id = 'one'")
 SqlError: line 1, col 30: cannot compare INTEGER with TEXT
 ```
+
+## Durability and crash recovery
+
+Arcanum keeps a write-ahead log next to the database file (`<name>-wal`):
+
+1. **Commit.** The new image of every page the transaction changed is appended to the log, followed by
+   a commit frame, and the log is fsynced. `COMMIT` returns only after that, and the data file is not
+   touched.
+2. **Big transactions.** When the buffer pool is full, changed pages are written to the log early,
+   without a commit frame, so they count only if the transaction commits. `ROLLBACK` cuts them off again.
+3. **Checkpoint.** Once the log grows past a threshold (and on close), committed pages are copied into
+   the data file, the data file is fsynced, and only then is the log emptied.
+4. **Recovery.** Opening a database scans the log. Every frame carries a CRC-32 chained from the frame
+   before it, plus a salt that changes each time the log is emptied, so a torn write, a missing write or a
+   frame left over from an older log ends the scan. Transactions that reached a commit frame are replayed;
+   anything after the last commit is discarded.
+
+A crash at any moment therefore leaves either the state before a transaction or the state after it,
+never a mix.
 
 ## Setup
 
@@ -110,6 +129,11 @@ python -m pytest
 - **Differential testing against SQLite.** The same data is loaded into Arcanum and SQLite, and a corpus
   of joins, subqueries, CTEs, window functions and set operations, plus hundreds of randomly generated
   queries, must return identical results.
+- **Crash testing.** A simulated file system loses power at a random file operation, then keeps a random
+  subset of the unsynced writes (disks reorder them), tearing some of them. Across hundreds of crash
+  points in a workload of transactions, failing statements, rollbacks and checkpoints, including crashes
+  during recovery itself, the database must come back as exactly the last committed state, or that state
+  plus the transaction that was committing. Another test kills a real process mid-write.
 - **B+tree model testing.** Thousands of random inserts and deletes are checked against a plain
   dictionary, verifying every structural invariant (key order, key bounds, balanced depth, leaf chain).
 - Tests for constraints, transactions, atomic statements, persistence across reopen, and error messages.
@@ -138,7 +162,9 @@ arcanum/
   events.py        event bus the engine reports its internal steps to
   errors.py        error types
   storage/
-    pager.py       pages on disk, buffer pool, free list, savepoints
+    pager.py       pages, buffer pool, free list, savepoints, commit and checkpoint
+    wal.py         write-ahead log: frames, checksums, recovery
+    files.py       file access (swappable for crash tests)
     codec.py       order-preserving encoding of value tuples
     btree.py       B+tree
   sql/

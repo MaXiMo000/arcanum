@@ -26,20 +26,25 @@ class Database:
     """A database stored in one file.
 
     Every statement is atomic: if it fails, none of its changes remain.
-    BEGIN ... COMMIT groups statements; ROLLBACK undoes the group. Committed
-    changes are written and fsynced to the file. (Crash-safety in the middle
-    of a write arrives with the write-ahead log.)
+    BEGIN ... COMMIT groups statements; ROLLBACK undoes the group. A commit is
+    durable once it returns: it is in the write-ahead log, and opening the
+    database after a crash replays every committed transaction and drops the rest.
 
     max_keys caps the keys per B+tree node, so trees split after a few rows;
-    useful for demos and tests.
+    useful for demos and tests. fs and checkpoint_frames are passed to the Pager.
     """
 
-    def __init__(self, path, pool_size=256, max_keys=None, events=None):
-        self.pager = Pager(path, pool_size, events)
+    def __init__(self, path, pool_size=256, max_keys=None, events=None, fs=None, checkpoint_frames=1000):
+        self.pager = Pager(path, pool_size, events, fs, checkpoint_frames)
         self.events = self.pager.events
         self.catalog = Catalog(self.pager, max_keys)
-        self.pager.flush()
+        self.pager.commit()
         self.in_transaction = False
+
+    @property
+    def recovered_frames(self):
+        """How many committed log frames were replayed when this database was opened."""
+        return self.pager.recovered_frames
 
     def execute(self, sql):
         """Run one statement and return its Result."""
@@ -78,7 +83,7 @@ class Database:
             self._require_transaction()
             self.pager.release()
             self.in_transaction = False
-            self.pager.flush()
+            self.pager.commit()
             return Result(status="COMMIT")
         if isinstance(statement, n.Rollback):
             self._require_transaction()
@@ -96,7 +101,7 @@ class Database:
             raise
         self.pager.release()
         if not self.in_transaction and isinstance(statement, _WRITES):
-            self.pager.flush()
+            self.pager.commit()
         return result
 
     def _require_transaction(self):
