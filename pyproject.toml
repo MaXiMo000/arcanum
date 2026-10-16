@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "A relational database built from scratch, with a live view of its internals."
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = []
 
 [project.optional-dependencies]
