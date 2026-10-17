@@ -8,7 +8,7 @@ from ..sql.parser import parse_statements
 from ..storage import Pager
 from .binder import Binder
 from .catalog import Catalog
-from .executor import SORT_MEMORY_ROWS, Context, index_scan_pairs, run
+from .executor import Context, QueryLimits, index_scan_pairs, run
 from .optimizer import Optimizer
 from .plan import IndexScan, TableScan, explain, plan_tree
 
@@ -22,6 +22,7 @@ class Result:
     rowcount: int = -1  # rows changed by INSERT, UPDATE or DELETE
     status: str = ""  # e.g. "INSERT 3", "CREATE TABLE"
     plan: dict | None = None  # the query plan as a tree (see plan.plan_tree), when traced
+    row_total: int = 0  # rows the query produced; more than len(rows) when max_rows cut them off
 
 
 class Database:
@@ -34,15 +35,16 @@ class Database:
 
     max_keys caps the keys per B+tree node, so trees split after a few rows;
     useful for demos and tests. optimize=False runs plans exactly as the binder
-    builds them, to compare against the optimizer. sort_memory_rows is how many
-    rows a sort keeps in memory before spilling sorted runs to disk. fs,
+    builds them, to compare against the optimizer. limits (a QueryLimits) bounds
+    what one statement may use: rows a sort keeps in memory before spilling,
+    rows held in memory, temporary sort space and recursive CTE size. fs,
     checkpoint_frames and max_pages are passed to the Pager.
     """
 
     def __init__(self, path, pool_size=256, max_keys=None, events=None, fs=None, checkpoint_frames=1000,
-                 optimize=True, sort_memory_rows=SORT_MEMORY_ROWS, max_pages=None):
+                 optimize=True, limits=None, max_pages=None):
         self.optimize = optimize
-        self.sort_memory_rows = sort_memory_rows
+        self.limits = limits or QueryLimits()
         self.pager = Pager(path, pool_size, events, fs, checkpoint_frames, max_pages)
         self.events = self.pager.events
         self.catalog = Catalog(self.pager, max_keys)
@@ -54,21 +56,22 @@ class Database:
         """How many committed log frames were replayed when this database was opened."""
         return self.pager.recovered_frames
 
-    def execute(self, sql, trace=False):
+    def execute(self, sql, trace=False, max_rows=None):
         """Run one statement and return its Result.
 
         trace=True also returns the plan of a query or EXPLAIN as a tree, with
-        each operator's actual rows and time.
+        each operator's actual rows and time. max_rows keeps only the first rows
+        of a query's result (the rest are counted in row_total, not stored).
         """
         statements = parse_statements(sql)
         if len(statements) != 1:
             raise SqlError(f"execute() runs exactly one statement, got {len(statements)}; use execute_script()")
         statement, text = statements[0]
-        return self._execute(statement, text, sql, trace)
+        return self._execute(statement, text, sql, trace, max_rows)
 
-    def execute_script(self, sql, trace=False):
+    def execute_script(self, sql, trace=False, max_rows=None):
         """Run several semicolon-separated statements; returns one Result per statement."""
-        return [self._execute(statement, text, sql, trace) for statement, text in parse_statements(sql)]
+        return [self._execute(statement, text, sql, trace, max_rows) for statement, text in parse_statements(sql)]
 
     def close(self):
         if self.in_transaction:
@@ -84,7 +87,7 @@ class Database:
 
     # ---- statement dispatch ---------------------------------------------------------
 
-    def _execute(self, statement, text, sql, trace=False):
+    def _execute(self, statement, text, sql, trace=False, max_rows=None):
         if isinstance(statement, n.Begin):
             if self.in_transaction:
                 raise SqlError("a transaction is already in progress")
@@ -106,7 +109,7 @@ class Database:
 
         self.pager.savepoint()
         try:
-            result = self._run(statement, text, sql, trace)
+            result = self._run(statement, text, sql, trace, max_rows)
         except BaseException:
             self.pager.rollback()
             self.catalog.reload()
@@ -120,14 +123,18 @@ class Database:
         if not self.in_transaction:
             raise SqlError("there is no transaction in progress")
 
-    def _run(self, statement, text, sql, trace=False):
+    def _run(self, statement, text, sql, trace=False, max_rows=None):
         binder = Binder(self.catalog, sql)
         if isinstance(statement, n.Query):
             plan = self._plan(binder.bind_query(statement))
             ctx = self._context(analyze=trace)
-            rows = list(run(plan, ctx))
-            return Result([c.name for c in plan.columns], rows, status=f"SELECT {len(rows)}",
-                          plan=plan_tree(plan, ctx.stats) if trace else None)
+            rows, total = [], 0
+            for row in run(plan, ctx):
+                total += 1
+                if max_rows is None or total <= max_rows:
+                    rows.append(row)
+            return Result([c.name for c in plan.columns], rows, status=f"SELECT {total}",
+                          plan=plan_tree(plan, ctx.stats) if trace else None, row_total=total)
         if isinstance(statement, n.Explain):
             if not isinstance(statement.statement, n.Query):
                 raise SqlError("Arcanum doesn't support EXPLAIN for statements other than queries yet")
@@ -184,7 +191,10 @@ class Database:
         table, positions, source = binder.bind_insert(statement)
         source = self._plan(source)
         # Read every source row first, so INSERT ... SELECT from the same table never sees its own inserts.
-        rows = list(run(source, self._context()))
+        ctx, rows = self._context(), []
+        for values in run(source, ctx):
+            ctx.hold()
+            rows.append(values)
         defaults = [c.default for c in table.columns]
         for values in rows:
             row = list(defaults)
@@ -194,7 +204,7 @@ class Database:
         return Result(rowcount=len(rows), status=f"INSERT {len(rows)}")
 
     def _context(self, analyze=False):
-        return Context(self.catalog, analyze, self.sort_memory_rows)
+        return Context(self.catalog, analyze, self.limits)
 
     def _plan(self, plan):
         return Optimizer().optimize(plan) if self.optimize else plan
@@ -208,7 +218,12 @@ class Database:
             scan, conditions = optimizer.access_path(scan, _conjuncts(where))
         pairs = index_scan_pairs(scan, ctx) if isinstance(scan, IndexScan) else self.catalog.scan(table)
         checks = [ctx.compile(c) for c in conditions]
-        return [(key, row) for key, row in pairs if all(check(row, ()) is True for check in checks)]
+        matches = []
+        for key, row in pairs:
+            if all(check(row, ()) is True for check in checks):
+                ctx.hold()
+                matches.append((key, row))
+        return matches
 
     def _update(self, binder, statement):
         table, where, assignments = binder.bind_update(statement)

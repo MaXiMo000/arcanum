@@ -31,6 +31,11 @@ _COMPARISONS = ("=", "!=", "<>", "<", "<=", ">", ">=")
 _UNSUPPORTED_CREATE = ("VIEW", "TRIGGER", "PROCEDURE", "FUNCTION", "SCHEMA", "DATABASE", "SEQUENCE", "TYPE")
 
 
+# Deeper trees would exhaust Python's recursion limit in later stages, so they are refused here.
+MAX_NESTING = 64  # parentheses, subqueries, NOT and unary minus inside each other
+MAX_TREE_DEPTH = 150  # including long left-leaning chains like a + a + a + ...
+
+
 def parse(sql: str):
     """Parse exactly one statement. A trailing semicolon is allowed."""
     p = _Parser(sql)
@@ -38,7 +43,21 @@ def parse(sql: str):
     p.accept_op(";")
     if p.tok.kind != EOF:
         raise p.error(f"expected end of statement, got {p.describe()}")
+    _check_depth(statement, sql)
     return statement
+
+
+def _check_depth(statement, sql):
+    stack = [(statement, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > MAX_TREE_DEPTH:
+            raise SqlError(f"the statement is nested too deeply (limit {MAX_TREE_DEPTH} levels)", sql,
+                           getattr(node, "pos", None))
+        if isinstance(node, (list, tuple)):
+            stack.extend((x, depth) for x in node)
+        elif hasattr(node, "__dataclass_fields__"):
+            stack.extend((getattr(node, name), depth + 1) for name in node.__dataclass_fields__ if name != "pos")
 
 
 def parse_script(sql: str) -> list:
@@ -57,6 +76,7 @@ def parse_statements(sql: str) -> list:
             return statements
         start = p.tok.pos
         statement = p.statement()
+        _check_depth(statement, sql)
         statements.append((statement, sql[start:p.tok.pos].strip()))
         if p.tok.kind != EOF:
             p.expect_op(";")
@@ -67,6 +87,15 @@ class _Parser:
         self.sql = sql
         self.tokens = tokenize(sql)
         self.i = 0
+        self.nesting = 0
+
+    def nest(self):
+        self.nesting += 1
+        if self.nesting > MAX_NESTING:
+            raise self.error(f"the statement is nested too deeply (limit {MAX_NESTING} levels)")
+
+    def unnest(self):
+        self.nesting -= 1
 
     # ---- token helpers ---------------------------------------------------------
 
@@ -306,6 +335,13 @@ class _Parser:
     # ---- queries -------------------------------------------------------------
 
     def query(self):
+        self.nest()
+        try:
+            return self._query()
+        finally:
+            self.unnest()
+
+    def _query(self):
         with_ = None
         if self.accept_kw("WITH"):
             recursive = bool(self.accept_kw("RECURSIVE"))
@@ -461,6 +497,13 @@ class _Parser:
     # ---- expressions ---------------------------------------------------------
 
     def expr(self):
+        self.nest()
+        try:
+            return self._expr()
+        finally:
+            self.unnest()
+
+    def _expr(self):
         left = self.and_expr()
         while self.accept_kw("OR"):
             pos = self.prev_pos
@@ -477,7 +520,11 @@ class _Parser:
     def not_expr(self):
         if self.accept_kw("NOT"):
             pos = self.prev_pos
-            return n.Unary("NOT", self.not_expr(), pos)
+            self.nest()
+            try:
+                return n.Unary("NOT", self.not_expr(), pos)
+            finally:
+                self.unnest()
         return self.comparison()
 
     def comparison(self):
@@ -539,7 +586,11 @@ class _Parser:
     def unary(self):
         if op := self.accept_op("-", "+"):
             pos = self.prev_pos
-            operand = self.unary()
+            self.nest()
+            try:
+                operand = self.unary()
+            finally:
+                self.unnest()
             if op == "-" and isinstance(operand, n.Literal) and type(operand.value) in (int, float):
                 return n.Literal(-operand.value)  # so -9223372036854775808 stays in range
             return n.Unary(op, operand, pos)

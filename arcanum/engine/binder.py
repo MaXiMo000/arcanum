@@ -13,6 +13,7 @@ A SELECT is planned in SQL's logical order:
 """
 
 import itertools
+import math
 from dataclasses import dataclass, fields, is_dataclass, replace
 
 from ..errors import SqlError
@@ -518,7 +519,9 @@ class Binder:
     def _bind_Literal(self, level, node):
         v = node.value
         if type(v) is int and not -(2**63) <= v < 2**63:
-            raise self.error(f"integer {v} is out of the 64-bit range")
+            raise self.error("integer literal is out of the 64-bit range")
+        if type(v) is float and not math.isfinite(v):
+            raise self.error("number literal is out of range")
         return Const(v, literal_type(v))
 
     def _bind_ColumnRef(self, level, node):

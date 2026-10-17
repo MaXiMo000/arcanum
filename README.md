@@ -171,8 +171,11 @@ Errors are JSON: `{"error": {"type": "SqlError", "message": "column nope does no
 Each session's database runs in its own worker process. That is what lets the crash demo kill the
 engine for real, and what keeps one visitor's runaway query from affecting anyone else: a statement that
 outlives the time limit has its worker stopped and restarted, and the database recovers from its log
-like after any crash. Sessions, statement time, database size, returned rows and SQL length are all
-limited; see [`.env.example`](.env.example) for the settings.
+like after any crash. Every resource a visitor can consume is bounded: request and session rates,
+sessions and WebSockets per client, statement time and concurrency, rows held in memory, sort space,
+database size, returned rows and request size. See [`.env.example`](.env.example) for the settings and
+[SECURITY.md](SECURITY.md) for the protections, including why a public deployment still belongs behind
+a reverse proxy or CDN.
 
 ## Setup
 

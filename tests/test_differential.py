@@ -17,7 +17,7 @@ from collections import Counter
 
 import pytest
 
-from arcanum import Database
+from arcanum import Database, QueryLimits
 
 SCHEMA = """
 CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT NOT NULL, dept TEXT, salary REAL, manager_id INTEGER,
@@ -75,7 +75,8 @@ ANALYZE;
 def engines(request, tmp_path_factory):
     # The indexed run also sorts with a 7-row memory budget, so ORDER BY spills runs to disk and merges them.
     db = Database(tmp_path_factory.mktemp("diff") / "arcanum.db", max_keys=4,
-                  optimize=request.param != "unoptimized", sort_memory_rows=7 if request.param == "indexed" else 50_000)
+                  optimize=request.param != "unoptimized",
+                  limits=QueryLimits(sort_memory_rows=7) if request.param == "indexed" else None)
     lite = sqlite3.connect(":memory:")
     lite.execute("PRAGMA case_sensitive_like = ON")
     db.execute_script(SCHEMA)

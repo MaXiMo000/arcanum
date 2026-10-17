@@ -6,7 +6,7 @@ these tests check the shapes and costs themselves.
 
 import pytest
 
-from arcanum import Database
+from arcanum import Database, QueryLimits
 
 
 @pytest.fixture
@@ -111,7 +111,7 @@ def test_in_lists_become_index_point_lookups(db):
 
 def test_large_sorts_spill_to_disk_and_merge(tmp_path):
     spills = []
-    with Database(tmp_path / "sort.db", sort_memory_rows=100) as db:
+    with Database(tmp_path / "sort.db", limits=QueryLimits(sort_memory_rows=100)) as db:
         db.events.subscribe(lambda kind, data: spills.append(data) if kind == "sort_spill" else None)
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, s TEXT, flag BOOLEAN)")
         db.execute("INSERT INTO t SELECT n, (n * 7919) % 101, CASE WHEN n % 13 = 0 THEN NULL ELSE 'v' || (n % 37) END, "

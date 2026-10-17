@@ -4,8 +4,21 @@ import os
 
 import uvicorn
 
-from .app import create_app
+from .app import _flag, create_app
 
 if __name__ == "__main__":
-    uvicorn.run(create_app(), host=os.environ.get("ARCANUM_HOST", "127.0.0.1"),
-                port=int(os.environ.get("ARCANUM_PORT", "8000")))
+    uvicorn.run(
+        create_app(),
+        host=os.environ.get("ARCANUM_HOST", "127.0.0.1"),
+        port=int(os.environ.get("ARCANUM_PORT", "8000")),
+        # Only these proxy addresses may set the client address through X-Forwarded-For.
+        forwarded_allow_ips=os.environ.get("ARCANUM_TRUSTED_PROXIES", "127.0.0.1"),
+        limit_concurrency=int(os.environ.get("ARCANUM_MAX_CONNECTIONS", "500")),
+        timeout_keep_alive=5,
+        ws_max_size=64 * 1024,  # clients never need to send large WebSocket messages
+        ws_ping_interval=20,
+        ws_ping_timeout=20,
+        h11_max_incomplete_event_size=16 * 1024,
+        server_header=False,
+        access_log=_flag(os.environ.get("ARCANUM_ACCESS_LOG", "0")),  # URLs carry session ids
+    )

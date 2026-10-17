@@ -11,11 +11,39 @@ version or commit you tested.
 
 Arcanum is an educational database engine. It is not meant to store sensitive data in production.
 
-- The engine validates its file header and page structure and refuses files it does not recognise.
-- SQL is parsed by a hand-written parser into a typed syntax tree; queries are never built by
-  string concatenation.
-- The API server gives each session its own database file and engine process, behind an unguessable
-  session id. Statement run time, database size, returned rows, SQL length, the number of sessions and
-  idle time are all limited, and browser origins are restricted by configuration.
-- The engine runs SQL only against its own files: there are no functions that read or write other files,
-  run programs or open network connections.
+## Protections
+
+**Isolation**
+
+- Each session has its own database file and its own engine process, behind an unguessable session id.
+- The engine runs SQL only against its own files. There are no functions that read or write other files,
+  run programs or open network connections. SQL is parsed into a typed syntax tree, never assembled by
+  string concatenation, and the engine refuses database files it does not recognise.
+- The server and its engine processes exchange JSON only, never pickled objects.
+- Session files are readable only by the server's user, are deleted when the session ends, and are
+  cleared at startup.
+
+**Resource limits** (all configurable, see `.env.example`)
+
+- Per-client request rate, session creation rate and number of sessions; per-client and global
+  WebSocket connections; total connections.
+- Statement run time (an over-running engine process is stopped and restarted, and its database recovers
+  from the log), statements running at once, rows a statement may hold in memory, temporary sort space,
+  recursive query size, returned rows, SQL length, request body size, and database size.
+- The parser refuses statements nested beyond a fixed depth, and `LIKE` runs in polynomial time whatever
+  the pattern.
+
+**No leaks**
+
+- Unexpected errors return a generic message with a reference; details stay in the server log.
+- Invalid requests are not echoed back. Access logs are off by default because URLs carry session ids.
+- Responses send `nosniff`, `no-referrer`, frame denial and a strict Content Security Policy for the UI;
+  CORS allows only configured origins and never credentials. WebSockets from other origins are refused.
+
+## What the application cannot do on its own
+
+No application can absorb a volumetric denial-of-service attack: a large flood fills the network link
+before the server sees a request. A public deployment should sit behind a reverse proxy or CDN that
+terminates TLS, filters floods and enforces connection limits (for example Cloudflare, or Caddy / nginx
+with rate limiting), with `ARCANUM_TRUSTED_PROXIES` set to the proxy's address so per-client limits see
+real client addresses, and `ARCANUM_HSTS=1`.

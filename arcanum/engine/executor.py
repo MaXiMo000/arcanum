@@ -17,6 +17,7 @@ import struct
 import tempfile
 import time
 from collections import Counter
+from dataclasses import dataclass
 
 from ..errors import ExecutionError
 from ..storage import decode, encode
@@ -26,21 +27,43 @@ from .expr import (
     to_text,
 )
 
-MAX_RECURSIVE_ROWS = 1_000_000
-SORT_MEMORY_ROWS = 50_000  # rows a sort holds in memory before it spills sorted runs to disk
+@dataclass(frozen=True)
+class QueryLimits:
+    """Resource limits for one statement. None means unlimited."""
+    sort_memory_rows: int = 50_000  # rows a sort keeps in memory before spilling sorted runs to disk
+    memory_rows: int | None = None  # rows held at once in hash tables, groups and materialised inputs
+    spill_bytes: int | None = None  # bytes a statement may write to temporary sort files
+    recursive_rows: int = 1_000_000  # rows a recursive CTE may produce
 
 
 class Context:
     """State for running one statement."""
 
-    def __init__(self, catalog, analyze=False, sort_memory_rows=SORT_MEMORY_ROWS):
+    def __init__(self, catalog, analyze=False, limits=None):
         self.catalog = catalog
         self.events = catalog.pager.events if catalog is not None else None
-        self.sort_memory_rows = sort_memory_rows
+        self.limits = limits or QueryLimits()
+        self.sort_memory_rows = self.limits.sort_memory_rows
+        self.held = 0  # rows this statement holds in memory (never decremented: a conservative bound)
+        self.spilled = 0
         self.work_tables = {}  # recursive CTE id -> rows of the previous iteration
         self.cache = {}  # id(subquery) -> result of an uncorrelated subquery
         self.stats = {} if analyze else None  # id(plan node) -> [rows, seconds]
         self._compiled = {}
+
+    def hold(self, count=1):
+        """Account for rows kept in memory; refuse statements that would hold too many."""
+        self.held += count
+        limit = self.limits.memory_rows
+        if limit is not None and self.held > limit:
+            raise ExecutionError(f"the statement needs to hold more than {limit:,} rows in memory; "
+                                 "add a filter or a LIMIT")
+
+    def spill(self, size):
+        self.spilled += size
+        limit = self.limits.spill_bytes
+        if limit is not None and self.spilled > limit:
+            raise ExecutionError(f"the statement needs more than {limit:,} bytes of temporary sort space")
 
     def compile(self, e):
         entry = self._compiled.get(id(e))
@@ -266,13 +289,24 @@ def _compile_subquery(e, ctx):
 
     if e.correlated:
         def in_correlated(row, outer):
-            found = [r[0] for r in rows(row, outer)]
-            return membership(needle(row, outer), set(found) - {None}, None in found, not found)
+            # Streams the subquery's rows, so nothing is held between outer rows.
+            v = needle(row, outer)
+            empty, saw_null = True, False
+            for (item,) in rows(row, outer):
+                empty = False
+                if item is None:
+                    saw_null = True
+                elif v is not None and item == v:
+                    return True
+            return membership(v, (), saw_null, empty)
         return in_correlated
 
     def in_uncorrelated(row, outer):
         if key not in ctx.cache:
-            found = [r[0] for r in run(plan, ctx, ())]
+            found = []
+            for r in run(plan, ctx, ()):
+                ctx.hold()
+                found.append(r[0])
             ctx.cache[key] = (set(found) - {None}, None in found, not found)
         return membership(needle(row, outer), *ctx.cache[key])
     return in_uncorrelated
@@ -368,7 +402,10 @@ def _join(plan, ctx, outer):
     streams. RIGHT and FULL joins remember which right rows found a partner.
     SEMI and ANTI joins emit each left row at most once, without right columns.
     """
-    right_rows = list(run(plan.right, ctx, outer))
+    right_rows = []
+    for row in run(plan.right, ctx, outer):
+        ctx.hold()
+        right_rows.append(row)
     residual = ctx.compile(plan.residual) if plan.residual is not None else None
     left_keys = [ctx.compile(k) for k in plan.left_keys]
     if left_keys:
@@ -425,6 +462,7 @@ def _aggregate(plan, ctx, outer):
         key = tuple(f(row, outer) for f in group_fns)
         accumulators = groups.get(key)
         if accumulators is None:
+            ctx.hold()
             accumulators = groups[key] = [make_accumulator(a.name, a.distinct) for a in plan.aggs]
         for acc, f in zip(accumulators, arg_fns):
             acc.add(f(row, outer) if f is not None else 1)  # COUNT(*) counts a non-NULL 1 per row
@@ -435,7 +473,10 @@ def _aggregate(plan, ctx, outer):
 
 
 def _window(plan, ctx, outer):
-    rows = list(run(plan.input, ctx, outer))
+    rows = []
+    for row in run(plan.input, ctx, outer):
+        ctx.hold()
+        rows.append(row)
     extra = [[None] * len(plan.calls) for _ in rows]
     specs = {}
     for k, call in enumerate(plan.calls):
@@ -478,7 +519,7 @@ def _sort(plan, ctx, outer):
             batch.append((key, row))
             count += 1
             if len(batch) >= ctx.sort_memory_rows:
-                runs.append(_spill(batch))
+                runs.append(_spill(batch, ctx))
                 batch = []
         batch.sort(key=operator.itemgetter(0))
         if not runs:
@@ -523,11 +564,12 @@ def sort_key(values, directions, types):
     return b"".join(parts)
 
 
-def _spill(batch):
+def _spill(batch, ctx):
     batch.sort(key=operator.itemgetter(0))
     f = tempfile.TemporaryFile()
     for key, row in batch:
         data = encode(row)
+        ctx.spill(_RUN_ENTRY.size + len(key) + len(data))
         f.write(_RUN_ENTRY.pack(len(key), len(data)) + key + data)
     f.seek(0)
     return f
@@ -552,19 +594,18 @@ def _limit(plan, ctx, outer):
 
 
 def _distinct(plan, ctx, outer):
-    seen = set()
-    for row in run(plan.input, ctx, outer):
-        if row not in seen:
-            seen.add(row)
-            yield row
+    yield from _distinct_rows(run(plan.input, ctx, outer), ctx)
 
 
 def _set_op(plan, ctx, outer):
     if plan.op == "UNION":
         rows = itertools.chain(run(plan.left, ctx, outer), run(plan.right, ctx, outer))
-        yield from rows if plan.all else _distinct_rows(rows)
+        yield from rows if plan.all else _distinct_rows(rows, ctx)
         return
-    right = Counter(run(plan.right, ctx, outer))
+    right = Counter()
+    for row in run(plan.right, ctx, outer):
+        ctx.hold()
+        right[row] += 1
     emitted = set()
     for row in run(plan.left, ctx, outer):
         in_right = right[row] > 0
@@ -574,14 +615,16 @@ def _set_op(plan, ctx, outer):
             if in_right == (plan.op == "INTERSECT"):
                 yield row
         elif in_right == (plan.op == "INTERSECT") and row not in emitted:
+            ctx.hold()
             emitted.add(row)
             yield row
 
 
-def _distinct_rows(rows):
+def _distinct_rows(rows, ctx):
     seen = set()
     for row in rows:
         if row not in seen:
+            ctx.hold()
             seen.add(row)
             yield row
 
@@ -590,13 +633,14 @@ def _recursive_cte(plan, ctx, outer):
     seen = None if plan.all else set()
 
     def fresh(rows):
-        if seen is None:
-            return list(rows)
         out = []
         for row in rows:
-            if row not in seen:
+            if seen is not None:
+                if row in seen:
+                    continue
                 seen.add(row)
-                out.append(row)
+            ctx.hold()
+            out.append(row)
         return out
 
     working = fresh(run(plan.anchor, ctx, outer))
@@ -606,8 +650,8 @@ def _recursive_cte(plan, ctx, outer):
         ctx.work_tables[plan.cte_id] = working
         working = fresh(run(plan.recursive, ctx, outer))
         total += len(working)
-        if total > MAX_RECURSIVE_ROWS:
-            raise ExecutionError(f"recursive CTE {plan.name} produced more than {MAX_RECURSIVE_ROWS:,} rows; "
+        if total > ctx.limits.recursive_rows:
+            raise ExecutionError(f"recursive CTE {plan.name} produced more than {ctx.limits.recursive_rows:,} rows; "
                                  "is it missing a stop condition?")
         yield from working
 

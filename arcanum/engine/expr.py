@@ -6,9 +6,7 @@ binder can match `a + 1` in SELECT against `a + 1` in GROUP BY with ==.
 """
 
 import math
-import re
 from dataclasses import dataclass, field
-from functools import lru_cache
 
 from ..errors import ExecutionError
 
@@ -225,8 +223,12 @@ def format_expr(e):
 
 
 def check_int(v):
-    if type(v) is int and not _INT_MIN <= v <= _INT_MAX:
-        raise ExecutionError("integer overflow")
+    """Keep arithmetic results in range: 64-bit integers and finite floats."""
+    if type(v) is int:
+        if not _INT_MIN <= v <= _INT_MAX:
+            raise ExecutionError("integer overflow")
+    elif type(v) is float and not math.isfinite(v):
+        raise ExecutionError("numeric overflow")
     return v
 
 
@@ -236,7 +238,7 @@ def divide(a, b):
     if type(a) is int and type(b) is int:
         q = abs(a) // abs(b)  # integer division truncates toward zero, as in C and SQLite
         return check_int(-q if (a < 0) != (b < 0) else q)
-    return a / b
+    return check_int(a / b)
 
 
 def modulo(a, b):
@@ -268,7 +270,10 @@ def cast(v, target):
                 raise ValueError
             return v != 0
         if target == REAL:
-            return float(v.strip() if isinstance(v, str) else v)
+            result = float(v.strip() if isinstance(v, str) else v)
+            if not math.isfinite(result):
+                raise ValueError  # 'inf' and 'nan' are not SQL numbers
+            return result
         if target == INTEGER:
             if isinstance(v, str):
                 text = v.strip()
@@ -284,15 +289,30 @@ def cast(v, target):
     raise ExecutionError(f"cannot convert {to_text(v)!r} to {target}")
 
 
-@lru_cache(maxsize=256)
-def _like_pattern(pattern):
-    regex = "".join(".*" if ch == "%" else "." if ch == "_" else re.escape(ch) for ch in pattern)
-    return re.compile(regex, re.DOTALL)
-
-
 def like(value, pattern):
-    """SQL LIKE: % matches any run of characters, _ matches one. Case-sensitive."""
-    return _like_pattern(pattern).fullmatch(value) is not None
+    """SQL LIKE: % matches any run of characters, _ matches one. Case-sensitive.
+
+    A two-pointer match that only ever backtracks to the latest %, so it runs in
+    O(len(value) * len(pattern)) whatever the pattern; a regex translation could
+    take exponential time on patterns like '%a%a%a%a%b'.
+    """
+    v = p = 0
+    star, resume = -1, 0
+    while v < len(value):
+        if p < len(pattern) and pattern[p] == "%":
+            star, resume = p, v
+            p += 1
+        elif p < len(pattern) and (pattern[p] == "_" or pattern[p] == value[v]):
+            v += 1
+            p += 1
+        elif star != -1:
+            resume += 1  # let the latest % swallow one more character
+            v, p = resume, star + 1
+        else:
+            return False
+    while p < len(pattern) and pattern[p] == "%":
+        p += 1
+    return p == len(pattern)
 
 
 def _substr(s, start, length=None):

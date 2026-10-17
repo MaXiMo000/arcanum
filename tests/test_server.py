@@ -8,21 +8,41 @@ pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
+from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 from arcanum.server.app import Settings, create_app  # noqa: E402
+from arcanum.server.worker import error_json  # noqa: E402
+from arcanum.storage import CorruptDatabaseError  # noqa: E402
+
+GENEROUS = dict(query_timeout=3, max_sessions=2, max_sessions_per_client=5, max_rows=5, max_pages=300,
+                max_sql_bytes=2000, rate_per_second=1000, rate_burst=1000, sessions_per_minute=1000,
+                crashes_per_minute=1000)
 
 
 @pytest.fixture
-def client(tmp_path):
-    settings = Settings(data_dir=str(tmp_path), query_timeout=3, max_sessions=2, max_rows=5, max_pages=300,
-                        max_sql_bytes=2000)
-    with TestClient(create_app(settings)) as test_client:
-        yield test_client
+def make_client(tmp_path):
+    clients = []
+
+    def make(**overrides):
+        settings = Settings(data_dir=str(tmp_path / "data"), web_dir=str(tmp_path / "no-web"), **{**GENEROUS, **overrides})
+        client = TestClient(create_app(settings))
+        client.__enter__()
+        clients.append(client)
+        return client
+
+    yield make
+    for client in clients:
+        client.__exit__(None, None, None)
+
+
+@pytest.fixture
+def client(make_client):
+    return make_client()
 
 
 def new_session(client):
     response = client.post("/sessions")
-    assert response.status_code == 201
+    assert response.status_code == 201, response.text
     return response.json()["id"]
 
 
@@ -37,6 +57,9 @@ def events_until(ws, kind):
         message = ws.receive_json()
         seen |= {e["kind"] for e in message.get("events", [])}
     return seen
+
+
+# ---- behaviour ------------------------------------------------------------------------------
 
 
 def test_queries_return_rows_and_the_traced_plan(client):
@@ -65,7 +88,8 @@ def test_errors_are_structured(client):
     response = sql(client, session, "INSERT INTO customers VALUES (1, 'Dup', NULL)")
     assert response.status_code == 400 and response.json()["error"]["type"] == "ConstraintError"
     assert sql(client, session, "SELECT 1 " + " " * 3000).status_code == 413
-    assert sql(client, "no-such-session", "SELECT 1").status_code == 404
+    assert sql(client, "x" * 24, "SELECT 1").status_code == 404
+    assert sql(client, "../../etc/passwd", "SELECT 1").status_code == 404
 
 
 def test_events_stream_the_engine_at_work(client):
@@ -87,17 +111,50 @@ def test_pulling_the_plug_mid_write_keeps_every_acknowledged_commit(client):
             assert summary["recovered_frames"] > 0
             seen = events_until(ws, "recovered")
             assert {"crash", "recovery", "checkpoint"} <= seen
-    rows = sql(client, session, "SELECT count(*), count(DISTINCT batch) FROM crash_demo").json()["results"][0]["rows"]
+    rows = sql(client, session, "SELECT count(*) FROM crash_demo").json()["results"][0]["rows"]
     assert rows[0][0] == summary["rows_after_recovery"]
     assert sql(client, session, "SELECT count(*) FROM orders").json()["results"][0]["rows"] == [[80]]
 
 
-def test_runaway_query_is_stopped_without_losing_data(client):
+def test_state_describes_trees_cache_and_log(client):
+    session = new_session(client)
+    state = client.get(f"/sessions/{session}/state").json()
+    trees = {t["name"]: t for t in state["trees"]}
+    assert set(trees) == {"catalog", "customers", "orders", "orders_customer"}
+    customers = trees["customers"]
+    assert customers["key_columns"] == ["id"] and customers["nodes"][0]["page"] == customers["root"]
+    leaves = [n for n in customers["nodes"] if n["leaf"]]
+    assert sorted(k[0] for leaf in leaves for k in leaf["keys"]) == list(range(1, 25))
+    assert all(len(n["keys"]) <= 4 for n in customers["nodes"])  # max_keys keeps the tree visibly branchy
+    assert trees["orders_customer"]["key_columns"] == ["customer_id", "id"]
+    assert state["pager"]["page_count"] > 10 and state["pager"]["cached"]
+
+
+# ---- resource limits ----------------------------------------------------------------------------
+
+
+def test_runaway_statement_is_stopped_without_losing_data(client):
     session = new_session(client)
     sql(client, session, "INSERT INTO customers VALUES (77, 'Kept', 'Lima')")
     response = sql(client, session, "SELECT count(*) FROM orders a, orders b, orders c, orders d")
     assert response.status_code == 408 and response.json()["error"]["type"] == "QueryTimeout"
     assert sql(client, session, "SELECT name FROM customers WHERE id = 77").json()["results"][0]["rows"] == [["Kept"]]
+
+
+def test_statements_that_need_too_much_memory_are_refused(make_client):
+    client = make_client(memory_rows=1000, recursive_rows=500)
+    session = new_session(client)
+    for statement in ["SELECT DISTINCT a.id, b.id FROM orders a, orders b",
+                      "SELECT a.id, count(*) FROM orders a, orders b GROUP BY a.id, b.id",
+                      "INSERT INTO customers SELECT a.id * 1000 + b.id, 'x', 'y' FROM orders a, orders b"]:
+        error = sql(client, session, statement).json()["error"]
+        assert error["type"] == "ExecutionError" and "rows in memory" in error["message"]
+    error = sql(client, session, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) "
+                                 "SELECT count(*) FROM r").json()["error"]
+    assert "more than 500 rows" in error["message"]
+    # Streaming results are not held: the first rows come back and the rest are only counted.
+    result = sql(client, session, "SELECT a.id, b.id FROM orders a, orders b").json()["results"][0]
+    assert result["row_total"] == 6400 and len(result["rows"]) == 5
 
 
 def test_database_size_is_capped(client):
@@ -116,27 +173,105 @@ def test_database_size_is_capped(client):
     assert count % 400 == 0  # the statement that hit the limit left nothing behind
 
 
+@pytest.mark.parametrize("statement,fragment", [
+    ("SELECT 1e999", "out of range"),
+    ("SELECT 1e300 * 1e300", "numeric overflow"),
+    ("SELECT CAST('nan' AS REAL)", "cannot convert"),
+    ("SELECT " + "(" * 100 + "1" + ")" * 100, "nested too deeply"),
+    ("SELECT " + "- " * 200 + "1", "nested too deeply"),
+    ("SELECT " + " + ".join(["1"] * 400), "nested too deeply"),
+])
+def test_hostile_sql_gets_a_clean_error(client, statement, fragment):
+    session = new_session(client)
+    response = sql(client, session, statement)
+    assert response.status_code == 400 and fragment in response.json()["error"]["message"]
+    assert sql(client, session, "SELECT 1").status_code == 200  # and the session carries on
+
+
 def test_sessions_are_limited_and_deletable(client, tmp_path):
     first, second = new_session(client), new_session(client)
     response = client.post("/sessions")
     assert response.status_code == 503 and response.json()["error"]["type"] == "ServerFull"
     assert client.delete(f"/sessions/{first}").status_code == 204
-    assert not os.path.exists(tmp_path / f"{first}.db")
+    assert not os.path.exists(tmp_path / "data" / f"{first}.db")
     assert sql(client, first, "SELECT 1").status_code == 404
     new_session(client)
     assert sql(client, second, "SELECT 1").status_code == 200
 
 
-def test_state_describes_trees_cache_and_log(client):
+# ---- abuse protection ------------------------------------------------------------------------------
+
+
+def test_requests_are_rate_limited_per_client(make_client):
+    client = make_client(rate_per_second=1, rate_burst=5)
+    statuses = [client.get("/health").status_code for _ in range(8)]
+    assert statuses[:5] == [200] * 5 and statuses[-1] == 429
+    response = client.get("/health")
+    assert response.headers["retry-after"] == "1" and response.json()["error"]["type"] == "RateLimited"
+
+
+def test_session_creation_is_rate_limited_and_capped_per_client(make_client):
+    client = make_client(max_sessions=10, max_sessions_per_client=2, sessions_per_minute=3)
+    new_session(client), new_session(client)
+    response = client.post("/sessions")
+    assert response.status_code == 429 and response.json()["error"]["type"] == "TooManySessions"
+    response = client.post("/sessions")
+    assert response.status_code == 429 and response.json()["error"]["type"] == "RateLimited"
+
+
+def test_request_bodies_are_bounded(client):
     session = new_session(client)
-    state = client.get(f"/sessions/{session}/state").json()
-    trees = {t["name"]: t for t in state["trees"]}
-    assert set(trees) == {"catalog", "customers", "orders", "orders_customer"}
-    customers = trees["customers"]
-    assert customers["key_columns"] == ["id"] and customers["nodes"][0]["page"] == customers["root"]
-    leaves = [n for n in customers["nodes"] if n["leaf"]]
-    assert sorted(k[0] for leaf in leaves for k in leaf["keys"]) == list(range(1, 25))
-    assert all(len(n["keys"]) <= 4 for n in customers["nodes"])  # max_keys keeps the tree visibly branchy
-    assert trees["orders_customer"]["key_columns"] == ["customer_id", "id"]
-    assert state["pager"]["page_count"] > 10 and state["pager"]["cached"]
-    assert state["wal"]["committed_frames"] >= 0
+    response = client.post(f"/sessions/{session}/query", content=b"{" + b" " * 50_000 + b"}",
+                           headers={"content-type": "application/json"})
+    assert response.status_code == 413
+
+    def chunks():
+        yield b'{"sql": "SELECT 1"}'
+
+    response = client.post(f"/sessions/{session}/query", content=chunks(), headers={"content-type": "application/json"})
+    assert response.status_code == 411
+
+
+def test_invalid_requests_do_not_echo_their_input(client):
+    session = new_session(client)
+    response = client.post(f"/sessions/{session}/query", json={"sql": {"secret-looking": "payload"}})
+    assert response.status_code == 422
+    assert "payload" not in response.text and response.json()["error"]["type"] == "InvalidRequest"
+
+
+def test_responses_carry_security_headers_and_no_docs(client):
+    response = client.get("/health")
+    for header in ("x-content-type-options", "referrer-policy", "x-frame-options", "cache-control"):
+        assert header in response.headers
+    assert response.headers["cache-control"] == "no-store" and "server" not in response.headers
+    assert client.get("/docs").status_code == 404 and client.get("/openapi.json").status_code == 404
+
+
+def test_websockets_check_origin_and_are_capped(make_client):
+    client = make_client(max_websockets_per_session=1)
+    session = new_session(client)
+    with pytest.raises(WebSocketDisconnect) as refused:
+        with client.websocket_connect(f"/sessions/{session}/events", headers={"origin": "https://evil.example"}):
+            pass
+    assert refused.value.code == 4403
+    with client.websocket_connect(f"/sessions/{session}/events", headers={"origin": "http://localhost:5173"}) as ws:
+        ws.receive_json()
+        with pytest.raises(WebSocketDisconnect) as capped:
+            with client.websocket_connect(f"/sessions/{session}/events"):
+                pass
+        assert capped.value.code == 4429
+
+
+def test_internal_errors_do_not_leak_details():
+    error = error_json(CorruptDatabaseError("C:/private/data/abc.db is not an Arcanum database"))
+    assert error["type"] == "InternalError" and "private" not in error["message"] and "reference" in error["message"]
+
+
+def test_stale_session_files_are_removed_at_startup(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    stale, unrelated = data / ("A" * 24 + ".db"), data / "notes.db"
+    stale.write_bytes(b"old")
+    unrelated.write_bytes(b"keep")
+    create_app(Settings(data_dir=str(data)))
+    assert not stale.exists() and unrelated.exists()
