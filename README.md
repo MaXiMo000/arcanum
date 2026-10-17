@@ -107,13 +107,16 @@ The binder's plan is correct but naive; the optimizer rewrites it into a cheaper
 
 1. **Decorrelation.** A correlated `EXISTS`, `NOT EXISTS` or `IN` in `WHERE` re-runs its subquery for
    every row. When the correlation is through equalities, it becomes a semi or anti hash join that reads
-   the subquery's tables once.
+   the subquery's tables once. A correlated scalar aggregate such as
+   `(SELECT count(*) FROM orders o WHERE o.customer = c.id)` becomes a `LEFT JOIN` to the grouped
+   aggregate when that beats an index lookup per row; customers without orders still get `0`, not `NULL`.
 2. **Predicate pushdown.** Conditions move down through joins, projections, aggregates (when they only
    test grouping keys), sorts and set operations, so rows are discarded as early as possible. Equalities
    between the two sides of an inner join become hash join keys, so `FROM a, b WHERE a.x = b.y` is a
    hash join, not a cross product.
 3. **Access paths.** A filter on a table becomes an index scan when the primary key or an index matches
-   a prefix of equalities, optionally followed by a range, and the cost model says that beats a full scan.
+   a prefix of equalities, optionally followed by a range or an `IN (...)` list (one point lookup per
+   value), and the cost model says that beats a full scan.
    Bounds can come from an enclosing query, so a correlated subquery looks its rows up through an index.
    `UPDATE` and `DELETE` find their rows the same way.
 4. **Join ordering.** A cluster of inner joins is re-planned by dynamic programming over subsets of
@@ -160,7 +163,8 @@ python -m pytest
 - **Differential testing against SQLite.** The same data is loaded into Arcanum and SQLite, and a corpus
   of joins, subqueries, CTEs, window functions and set operations, plus hundreds of randomly generated
   queries, must return identical results. Everything runs three times: with the optimizer off, on plain
-  tables, and with secondary indexes and statistics, so every rewrite and access path is checked.
+  tables, and with secondary indexes and statistics (plus a tiny sort budget, so `ORDER BY` spills to
+  disk), so every rewrite, access path and the external sort are checked.
 - **Optimizer tests** check the plans themselves: point lookups read a root-to-leaf path instead of the
   whole table, index scans are chosen only when selective, and subqueries become semi and anti joins.
 - **Crash testing.** A simulated file system loses power at a random file operation, then keeps a random
@@ -186,7 +190,9 @@ SQL text -> lexer -> parser -> syntax tree -> binder -> optimizer -> plan -> exe
    `DISTINCT`, `ORDER BY`, `LIMIT`.
 3. The **optimizer** rewrites that plan using statistics (see above).
 4. The **executor** turns each plan node into a generator that pulls rows from its inputs on demand,
-   so `LIMIT` and `EXISTS` stop work early. Equality joins use a hash join.
+   so `LIMIT` and `EXISTS` stop work early. Equality joins use a hash join. `ORDER BY` is an external
+   merge sort: each row gets one byte-string key built from the order-preserving encoding (inverted for
+   `DESC`), and past a memory budget sorted runs go to temporary files and are merged back.
 5. **Storage**: tables are B+trees keyed by primary key (or a hidden row id); indexes are B+trees keyed
    by the indexed values. Keys use an order-preserving byte encoding, so the tree compares raw bytes.
 

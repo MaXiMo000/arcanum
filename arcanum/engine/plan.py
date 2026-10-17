@@ -33,8 +33,10 @@ class IndexScan:
     """Rows of `table` found through an index (None = the primary key).
 
     The first len(eq) index columns equal the eq values; the next column, if
-    lo or hi is set, lies in that range. lo and hi are (expr, inclusive). All
-    bound expressions are constants or outer references, evaluated once per scan.
+    lo or hi is set, lies in that range, or if points is set, equals one of
+    those values (an IN list: one lookup per distinct value). lo and hi are
+    (expr, inclusive). All bound expressions are constants or outer
+    references, evaluated once per scan.
     """
     table: object
     index: object  # catalog.IndexSchema, or None for the table's primary key
@@ -42,6 +44,7 @@ class IndexScan:
     lo: tuple | None
     hi: tuple | None
     columns: list
+    points: list | None = None
 
     @property
     def key_columns(self):
@@ -191,6 +194,8 @@ def describe(node):
             conditions.append(f"{column} {'>=' if node.lo[1] else '>'} {format_expr(node.lo[0])}")
         if node.hi is not None:
             conditions.append(f"{column} {'<=' if node.hi[1] else '<'} {format_expr(node.hi[0])}")
+        if node.points is not None:
+            conditions.append(f"{column} IN ({', '.join(map(format_expr, node.points))})")
         using = node.index.name if node.index is not None else "primary key"
         return f"IndexScan {node.table.name} using {using} ({' AND '.join(conditions)})"
     if isinstance(node, WorkTableScan):

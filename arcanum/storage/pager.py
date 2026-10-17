@@ -20,7 +20,7 @@ import os
 import struct
 from collections import OrderedDict
 
-from ..errors import ArcanumError
+from ..errors import ArcanumError, ExecutionError
 from ..events import EventBus
 from .files import OsFileSystem
 from .wal import Wal
@@ -38,8 +38,9 @@ class CorruptDatabaseError(ArcanumError):
 
 
 class Pager:
-    def __init__(self, path, pool_size=256, events=None, fs=None, checkpoint_frames=1000):
-        """checkpoint_frames: copy the log into the data file once it holds this many committed frames."""
+    def __init__(self, path, pool_size=256, events=None, fs=None, checkpoint_frames=1000, max_pages=None):
+        """checkpoint_frames: copy the log into the data file once it holds this many committed frames.
+        max_pages: refuse to grow the file beyond this many pages (None = no limit)."""
         if pool_size < 1:
             raise ValueError("pool_size must be at least 1")
         self.path = os.fspath(path)
@@ -47,6 +48,7 @@ class Pager:
         self.events = events if events is not None else EventBus()
         self.fs = fs if fs is not None else OsFileSystem()
         self.checkpoint_frames = checkpoint_frames
+        self.max_pages = max_pages
         self.stats = {"hits": 0, "misses": 0, "evictions": 0, "disk_reads": 0, "wal_frames": 0, "checkpoints": 0}
         self.recovered_frames = 0  # committed frames replayed from the log when the file was opened
         self._pool = OrderedDict()  # page id -> [data, dirty], least recently used first
@@ -105,6 +107,8 @@ class Pager:
             page_id = self.free_head
             self.free_head = _NEXT_FREE.unpack_from(self.read(page_id))[0]
         else:
+            if self.max_pages is not None and self.page_count >= self.max_pages:
+                raise ExecutionError(f"the database is full (limit {self.max_pages} pages)")
             page_id = self.page_count
             self.page_count += 1
         self.write(page_id, b"")

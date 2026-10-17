@@ -4,7 +4,11 @@ Passes, in order:
 
 1. Decorrelation. A correlated EXISTS / NOT EXISTS / IN in a WHERE clause runs
    its subquery once per row. When the correlation is through equalities, it
-   becomes a SEMI or ANTI hash join that reads the subquery's tables once.
+   becomes a SEMI or ANTI hash join that reads the subquery's tables once. A
+   correlated scalar aggregate, `(SELECT count(*) FROM t WHERE t.k = outer.k)`,
+   becomes a LEFT JOIN to `t` grouped by k, when that beats an index lookup per
+   outer row; rows without a match get the aggregate's value over no rows
+   (0 for COUNT), not NULL.
 2. Predicate pushdown. WHERE and ON conditions move down through joins,
    projections, aggregates (when they only test grouping keys), sorts and set
    operations, so rows are discarded as early as possible. Equalities between
@@ -26,7 +30,8 @@ from dataclasses import replace
 
 from . import plan as p
 from .expr import (
-    BOOLEAN, INTEGER, NULL, REAL, Col, Const, Op, Outer, SubqueryExpr, column_indexes, map_children, shift, walk,
+    BOOLEAN, INTEGER, NULL, REAL, Col, Const, Op, Outer, SubqueryExpr, column_indexes, format_expr, map_children,
+    shift, walk,
 )
 
 DEFAULT_ROWS = 1000
@@ -125,6 +130,71 @@ class Optimizer:
         return p.Join("ANTI" if negated else "SEMI", left, right, left_keys, right_keys, _and_all(residual),
                       left.columns)
 
+    def attach_scalars(self, source, e):
+        """Replace correlated scalar aggregate subqueries in e by LEFT JOINs onto source.
+
+        Returns (new source, new expression). The new source keeps source's
+        columns first, so expressions over source stay valid.
+        """
+        for sub in [x for x in walk(e) if isinstance(x, SubqueryExpr) and x.kind == "SCALAR" and x.correlated]:
+            rewrite = self.scalar_join(source, sub)
+            if rewrite is not None:
+                source, replacement = rewrite
+                e = _replace_node(e, sub, replacement)
+        return source, e
+
+    def scalar_join(self, source, sub):
+        plan = sub.plan
+        if not (isinstance(plan, p.Project) and len(plan.exprs) == 1 and isinstance(plan.input, p.Aggregate)
+                and not plan.input.groups):
+            return None
+        value, aggregate = plan.exprs[0], plan.input
+        inner, conditions = aggregate.input, []
+        if isinstance(inner, p.Filter):
+            conditions, inner = _conjuncts(inner.predicate), inner.input
+        if (_reaches_outside(inner) or _has_outer_or_subquery(value)
+                or any(_has_outer_or_subquery(a) for a in aggregate.aggs)):
+            return None
+        left_keys, right_keys, local = [], [], []
+        for c in conditions:
+            outers = [x for x in walk(c) if isinstance(x, Outer)]
+            if _has_subquery(c) or any(o.depth != 1 for o in outers):
+                return None
+            if not outers:
+                local.append(c)
+                continue
+            key = _correlated_key(c)
+            if key is None:
+                return None
+            left_keys.append(_outer_to_col(key[0]))
+            right_keys.append(key[1])
+        if not left_keys or not self.join_beats_lookups(source, inner, right_keys[0]):
+            return None
+        grouped_input = p.Filter(inner, _and_all(local), inner.columns) if local else inner
+        k, width = len(right_keys), len(source.columns)
+        grouped = p.Aggregate(grouped_input, right_keys, list(aggregate.aggs),
+                              [p.Column(format_expr(g), g.type) for g in right_keys] + list(aggregate.columns))
+        names = [format_expr(g) for g in right_keys]
+        join = p.Join("LEFT", source, grouped, left_keys,
+                      [Col(i, g.type, names[i]) for i, g in enumerate(right_keys)], None,
+                      source.columns + grouped.columns)
+        matched = Op("NOTNULL", (Col(width, right_keys[0].type, names[0]),), BOOLEAN)
+        present = _substitute(value, [Col(width + k + i, a.type, format_expr(a)) for i, a in enumerate(aggregate.aggs)])
+        empty = _substitute(value, [Const(0 if a.name == "COUNT" else None, a.type) for a in aggregate.aggs])
+        return join, Op("CASE", (matched, present, empty), sub.type)
+
+    def join_beats_lookups(self, source, inner, key):
+        """Whether grouping the whole inner table once is cheaper than a lookup per outer row."""
+        inner_rows = self.estimate(inner)
+        per_row = inner_rows
+        if isinstance(inner, p.TableScan) and isinstance(key, Col):
+            table = inner.table
+            leading = [table.primary_key[:1]] + [index.columns[:1] for index in table.indexes]
+            if [key.index] in leading:
+                distinct = self.distinct_values(inner, key.index) or max(inner_rows / 10, 1.0)
+                per_row = math.log2(inner_rows + 2) + inner_rows / distinct
+        return self.estimate(source) * per_row > inner_rows + self.estimate(source)
+
     # ---- 2. predicate pushdown ------------------------------------------------------
 
     def push(self, node, preds):
@@ -135,12 +205,21 @@ class Optimizer:
                 joined = self.semi_join(source, c)
                 if joined is not None:
                     source = joined
-                else:
-                    remaining.append(c)
-            return self.push(source, preds + remaining)
+                    continue
+                source, c = self.attach_scalars(source, c)
+                remaining.append(c)
+            result = self.push(source, preds + remaining)
+            if len(source.columns) != len(node.columns):  # joined aggregates widened the row: trim it back
+                result = p.Project(result, [Col(i, c.type, c.name) for i, c in enumerate(node.columns)], node.columns)
+            return result
         if isinstance(node, p.Join):
             return self.push_join(node, preds)
         if isinstance(node, p.Project):
+            source, exprs = node.input, []
+            for e in node.exprs:
+                source, e = self.attach_scalars(source, e)
+                exprs.append(e)
+            node = replace(node, input=source, exprs=exprs)
             down, keep = [], []
             for c in preds:
                 if _movable(c) and not any(_has_subquery(node.exprs[i]) for i in column_indexes(c)):
@@ -229,7 +308,7 @@ class Optimizer:
         options = [(None, table.primary_key)] if table.primary_key else []
         options += [(index, index.columns) for index in table.indexes]
         for index, key_columns in options:
-            used, eq, lo, hi, fraction = set(), [], None, None, 1.0
+            used, eq, lo, hi, points, fraction = set(), [], None, None, None, 1.0
             for column in key_columns:
                 match = self.find_bound(table, preds, column, ("=",), used)
                 if match is not None:
@@ -247,6 +326,12 @@ class Optimizer:
                         continue
                     used.add(i)
                     fraction *= self.selectivity(preds[i], scan)
+                if lo is None and hi is None:
+                    match = self.find_in_list(table, preds, column, used)
+                    if match is not None:
+                        i, points = match
+                        used.add(i)
+                        fraction *= self.selectivity(preds[i], scan)
                 break
             if not used:
                 continue
@@ -255,10 +340,22 @@ class Optimizer:
                 estimate = min(estimate, 1.0)
             cost = math.log2(rows + 2) + estimate * (1 if index is None else SECONDARY_LOOKUP_COST)
             if cost < best_cost:
-                node = p.IndexScan(table, index, eq, lo, hi, scan.columns)
+                node = p.IndexScan(table, index, eq, lo, hi, scan.columns, points)
                 node.est_rows = estimate
                 best_cost, best = cost, (node, [c for i, c in enumerate(preds) if i not in used])
         return best
+
+    def find_in_list(self, table, preds, column, used):
+        """(position, values) of a `column IN (values)` condition whose values do not depend on the row."""
+        column_type = table.columns[column].type
+        for i, c in enumerate(preds):
+            if (i not in used and isinstance(c, Op) and c.op == "IN" and isinstance(c.args[0], Col)
+                    and c.args[0].index == column
+                    and all(_is_bound_value(v) and (v.type in (column_type, NULL)
+                                                    or (column_type == REAL and v.type == INTEGER))
+                            for v in c.args[1:])):
+                return i, list(c.args[1:])
+        return None
 
     def find_bound(self, table, preds, column, ops, used):
         for i, op, value in self.find_bounds(table, preds, column, used):
@@ -587,6 +684,12 @@ def _substitute(e, exprs):
     if isinstance(e, Col):
         return exprs[e.index]
     return map_children(e, lambda c: _substitute(c, exprs))
+
+
+def _replace_node(e, target, replacement):
+    if e is target:
+        return replacement
+    return map_children(e, lambda c: _replace_node(c, target, replacement))
 
 
 def _remap(e, positions):

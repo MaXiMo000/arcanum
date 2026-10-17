@@ -73,8 +73,9 @@ ANALYZE;
 
 @pytest.fixture(scope="module", params=["unoptimized", "plain", "indexed"])
 def engines(request, tmp_path_factory):
+    # The indexed run also sorts with a 7-row memory budget, so ORDER BY spills runs to disk and merges them.
     db = Database(tmp_path_factory.mktemp("diff") / "arcanum.db", max_keys=4,
-                  optimize=request.param != "unoptimized")
+                  optimize=request.param != "unoptimized", sort_memory_rows=7 if request.param == "indexed" else 50_000)
     lite = sqlite3.connect(":memory:")
     lite.execute("PRAGMA case_sensitive_like = ON")
     db.execute_script(SCHEMA)
@@ -237,6 +238,16 @@ CORPUS = [
     ("SELECT id FROM emp e WHERE NOT EXISTS (SELECT 1 FROM sales s WHERE s.emp_id = e.id AND s.amount > e.salary)", False),
     ("SELECT x.id FROM (SELECT id, salary FROM emp UNION ALL SELECT id, amount FROM sales) x WHERE x.id < 5", False),
     ("DELETE FROM tags WHERE emp_id = -1", False),
+    # IN lists, scalar aggregates turned into joins, and large sorts (the indexed run spills them)
+    ("SELECT id FROM emp WHERE id IN (3, 7, 7, 200, NULL)", False),
+    ("SELECT id FROM sales WHERE day IN (1, 2) AND amount > 10", False),
+    ("SELECT id FROM emp WHERE dept IN ('ops', 'hr') AND hired IN (2012, 2020)", False),
+    ("SELECT id, (SELECT count(*) + 1 FROM sales s WHERE s.emp_id = e.id), "
+     "(SELECT max(amount) FROM sales s WHERE s.emp_id = e.id AND s.region = 'north') FROM emp e", False),
+    ("SELECT name FROM emp e WHERE (SELECT count(*) FROM sales s WHERE s.emp_id = e.id) = 0", False),
+    ("SELECT d.name, (SELECT avg(salary) FROM emp e WHERE e.dept = d.name) FROM dept d", False),
+    ("SELECT id, amount, region FROM sales ORDER BY region DESC NULLS LAST, amount, id", True),
+    ("SELECT emp_id, day, amount FROM sales ORDER BY amount DESC, day, id LIMIT 40", True),
 ]
 
 

@@ -74,9 +74,53 @@ def test_index_ranges_handle_nulls_types_and_composite_keys(db):
     assert db.execute("SELECT count(*) FROM m WHERE a > 1").rows == [(2,)]
 
 
-def test_correlated_subquery_uses_an_index_per_outer_row(db):
-    text = plan(db, "SELECT name, (SELECT max(total) FROM orders o WHERE o.customer = c.id) FROM customers c")
-    assert "IndexScan orders using orders_customer (customer = outer.id)" in text
+def test_scalar_subquery_joins_or_looks_up_by_cost(db):
+    sql = "SELECT name, (SELECT max(total) FROM orders o WHERE o.customer = c.id) FROM customers c"
+    # 100 customers: grouping all orders once beats 100 index lookups.
+    assert "HashJoin LEFT on id = customer" in plan(db, sql)
+    # Two customers: two index lookups beat reading every order.
+    assert "IndexScan orders using orders_customer (customer = outer.id)" in plan(db, sql + " WHERE c.id < 3")
+    joined = db.execute(sql).rows
+    db.optimize = False
+    assert db.execute(sql).rows == joined
+
+
+def test_scalar_count_is_zero_not_null_without_matches(db):
+    db.execute("DELETE FROM orders WHERE customer IN (3, 4)")
+    sql = ("SELECT id, (SELECT count(*) FROM orders o WHERE o.customer = c.id), "
+           "(SELECT count(*) * 2 + 1 FROM orders o WHERE o.customer = c.id), "
+           "(SELECT sum(total) FROM orders o WHERE o.customer = c.id) FROM customers c WHERE id BETWEEN 2 AND 4")
+    assert db.execute(sql).rows == [(2, 20, 41, db.execute(
+        "SELECT sum(total) FROM orders WHERE customer = 2").rows[0][0]), (3, 0, 1, None), (4, 0, 1, None)]
+    assert db.execute("SELECT id FROM customers c WHERE (SELECT count(*) FROM orders o WHERE o.customer = c.id) = 0"
+                      ).rows == [(3,), (4,)]
+
+
+def test_in_lists_become_index_point_lookups(db):
+    sql = "SELECT id, customer FROM orders WHERE id IN (1500, 7, NULL, 7, 99999)"
+    assert "IndexScan orders using primary key (id IN (1500, 7, NULL, 7, 99999))" in plan(db, sql)
+    reads, rows = pages_read(db, sql)
+    db.optimize = False
+    full_scan, same = pages_read(db, sql)
+    db.optimize = True
+    assert rows == same == [(7, 8), (1500, 1)] and reads * 5 < full_scan
+    assert "IndexScan orders using orders_customer (customer IN (4, 5))" in plan(
+        db, "SELECT id FROM orders WHERE customer IN (4, 5)")
+    assert len(db.execute("SELECT id FROM orders WHERE customer IN (4, 5)").rows) == 40
+
+
+def test_large_sorts_spill_to_disk_and_merge(tmp_path):
+    spills = []
+    with Database(tmp_path / "sort.db", sort_memory_rows=100) as db:
+        db.events.subscribe(lambda kind, data: spills.append(data) if kind == "sort_spill" else None)
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, s TEXT, flag BOOLEAN)")
+        db.execute("INSERT INTO t SELECT n, (n * 7919) % 101, CASE WHEN n % 13 = 0 THEN NULL ELSE 'v' || (n % 37) END, "
+                   "n % 2 = 0 FROM (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 1000) "
+                   "SELECT n FROM r) AS q")
+        rows = db.execute("SELECT k, s, id, flag FROM t ORDER BY k DESC, s NULLS FIRST, id").rows
+        assert spills and spills[-1] == {"runs": 10, "rows": 1000}  # ten sorted runs on disk, merged back
+        expected = sorted(rows, key=lambda r: (-r[0], r[1] is not None, r[1] or "", r[2]))
+        assert rows == expected and {type(r[3]) for r in rows} == {bool}
 
 
 def test_update_and_delete_find_rows_through_indexes(db):

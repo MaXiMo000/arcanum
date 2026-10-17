@@ -10,27 +10,33 @@ NULL follows SQL's three-valued logic: comparisons with NULL yield NULL
 (unknown), and WHERE/ON/HAVING keep only rows whose condition is TRUE.
 """
 
+import heapq
 import itertools
 import operator
+import struct
+import tempfile
 import time
 from collections import Counter
 
 from ..errors import ExecutionError
-from ..storage import encode
+from ..storage import decode, encode
 from . import plan as p
 from .expr import (
-    FUNCTIONS, REAL, Col, Const, Op, Outer, SubqueryExpr, cast, check_int, divide, like, modulo,
+    BOOLEAN, FUNCTIONS, REAL, Col, Const, Op, Outer, SubqueryExpr, cast, check_int, divide, like, modulo,
     to_text,
 )
 
 MAX_RECURSIVE_ROWS = 1_000_000
+SORT_MEMORY_ROWS = 50_000  # rows a sort holds in memory before it spills sorted runs to disk
 
 
 class Context:
     """State for running one statement."""
 
-    def __init__(self, catalog, analyze=False):
+    def __init__(self, catalog, analyze=False, sort_memory_rows=SORT_MEMORY_ROWS):
         self.catalog = catalog
+        self.events = catalog.pager.events if catalog is not None else None
+        self.sort_memory_rows = sort_memory_rows
         self.work_tables = {}  # recursive CTE id -> rows of the previous iteration
         self.cache = {}  # id(subquery) -> result of an uncorrelated subquery
         self.stats = {} if analyze else None  # id(plan node) -> [rows, seconds]
@@ -310,6 +316,12 @@ def index_scan_pairs(plan, ctx, outer=()):
         return  # col = NULL is never true
     prefix = encode(eq)
     position = len(eq)
+    if plan.points is not None:
+        # One point lookup per distinct non-NULL value, in key order so the rows come out sorted.
+        keys = {encode(eq + [v]) for v in (value(e, position) for e in plan.points) if v is not None}
+        for key in sorted(keys):
+            yield from ctx.catalog.scan_range(plan.table, plan.index, key, key + _AFTER_ALL)
+        return
     lo, hi, hi_inclusive = prefix or None, (prefix + _AFTER_ALL) if prefix else None, False
     if plan.lo is not None:
         v = value(plan.lo[0], position)
@@ -448,11 +460,90 @@ def _window(plan, ctx, outer):
 
 
 def _sort(plan, ctx, outer):
+    """External merge sort.
+
+    Each row gets one byte-string key that orders like its ORDER BY values
+    (see sort_key), plus its arrival number so ties keep their input order.
+    Up to sort_memory_rows rows are sorted in memory; beyond that, sorted runs
+    go to temporary files and are merged back with a k-way merge.
+    """
     fns = [ctx.compile(k) for k, _, _ in plan.keys]
     directions = [(desc, nulls_first) for _, desc, nulls_first in plan.keys]
-    decorated = [(tuple(f(r, outer) for f in fns), r) for r in run(plan.input, ctx, outer)]
-    for _, row in sort_items(decorated, lambda d: d[0], directions):
-        yield row
+    types = [k.type for k, _, _ in plan.keys]
+    booleans = [i for i, c in enumerate(plan.columns) if c.type == BOOLEAN]
+    batch, runs, count = [], [], 0
+    try:
+        for row in run(plan.input, ctx, outer):
+            key = sort_key([f(row, outer) for f in fns], directions, types) + _SEQUENCE.pack(count)
+            batch.append((key, row))
+            count += 1
+            if len(batch) >= ctx.sort_memory_rows:
+                runs.append(_spill(batch))
+                batch = []
+        batch.sort(key=operator.itemgetter(0))
+        if not runs:
+            for _, row in batch:
+                yield row
+            return
+        if ctx.events is not None:
+            ctx.events.emit("sort_spill", runs=len(runs), rows=count)
+        sources = [_read_run(f, booleans) for f in runs] + [iter(batch)]
+        for _, row in heapq.merge(*sources, key=operator.itemgetter(0)):
+            yield row
+    finally:
+        for f in runs:
+            f.close()
+
+
+_SEQUENCE = struct.Struct(">Q")
+_RUN_ENTRY = struct.Struct(">II")
+_INVERT = bytes(range(255, -1, -1))
+
+
+def sort_key(values, directions, types):
+    """Bytes that compare like the values under ORDER BY's directions.
+
+    Each value is a marker byte then its order-preserving encoding, with every
+    byte inverted for DESC. The codec never makes one value's encoding a prefix
+    of another's, so inverting reverses the order exactly and concatenated keys
+    compare value by value. NULL is a lone marker byte placed before or after
+    every non-NULL value.
+    """
+    parts = []
+    for v, (desc, nulls_first), t in zip(values, directions, types):
+        if nulls_first is None:
+            nulls_first = not desc
+        if v is None:
+            parts.append(b"\x00" if nulls_first else b"\x02")
+            continue
+        if t == REAL and not isinstance(v, float):
+            v = float(v)  # an INTEGER branch of a REAL expression must sort among the floats
+        encoded = encode((v,))
+        parts.append(b"\x01" + (encoded.translate(_INVERT) if desc else encoded))
+    return b"".join(parts)
+
+
+def _spill(batch):
+    batch.sort(key=operator.itemgetter(0))
+    f = tempfile.TemporaryFile()
+    for key, row in batch:
+        data = encode(row)
+        f.write(_RUN_ENTRY.pack(len(key), len(data)) + key + data)
+    f.seek(0)
+    return f
+
+
+def _read_run(f, booleans):
+    while True:
+        head = f.read(_RUN_ENTRY.size)
+        if not head:
+            return
+        key_size, data_size = _RUN_ENTRY.unpack(head)
+        key = f.read(key_size)
+        row = decode(f.read(data_size))
+        if booleans:  # the codec stores booleans as integers
+            row = tuple(bool(v) if v is not None and i in booleans else v for i, v in enumerate(row))
+        yield key, row
 
 
 def _limit(plan, ctx, outer):
