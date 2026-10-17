@@ -1,7 +1,8 @@
 """Query plan nodes. Each node produces rows; `columns` describes them.
 
-The binder builds this tree, the optimizer (later) rewrites it and the
-executor runs it. explain() renders it for EXPLAIN.
+The binder builds this tree, the optimizer rewrites it and the executor runs
+it. explain() renders it for EXPLAIN. The optimizer records its row estimate
+on each node it plans as `est_rows`.
 """
 
 from dataclasses import dataclass, field
@@ -25,6 +26,26 @@ class OneRow:
 class TableScan:
     table: object  # catalog.TableSchema
     columns: list
+
+
+@dataclass(eq=False)
+class IndexScan:
+    """Rows of `table` found through an index (None = the primary key).
+
+    The first len(eq) index columns equal the eq values; the next column, if
+    lo or hi is set, lies in that range. lo and hi are (expr, inclusive). All
+    bound expressions are constants or outer references, evaluated once per scan.
+    """
+    table: object
+    index: object  # catalog.IndexSchema, or None for the table's primary key
+    eq: list
+    lo: tuple | None
+    hi: tuple | None
+    columns: list
+
+    @property
+    def key_columns(self):
+        return self.index.columns if self.index is not None else self.table.primary_key
 
 
 @dataclass(eq=False)
@@ -57,7 +78,8 @@ class Project:
 
 @dataclass(eq=False)
 class Join:
-    """kind: INNER, LEFT, RIGHT, FULL or CROSS. Rows are left + right.
+    """kind: INNER, LEFT, RIGHT, FULL, CROSS, SEMI or ANTI. Rows are left + right,
+    except SEMI (left rows with a match) and ANTI (left rows without one).
 
     left_keys[i] (over left rows) = right_keys[i] (over right rows) are the
     equality conditions a hash join can use; residual is any remaining
@@ -161,6 +183,16 @@ def describe(node):
         return "OneRow"
     if isinstance(node, TableScan):
         return f"TableScan {node.table.name}"
+    if isinstance(node, IndexScan):
+        names = [node.table.columns[i].name for i in node.key_columns]
+        conditions = [f"{names[i]} = {format_expr(v)}" for i, v in enumerate(node.eq)]
+        column = names[len(node.eq)] if len(node.eq) < len(names) else None
+        if node.lo is not None:
+            conditions.append(f"{column} {'>=' if node.lo[1] else '>'} {format_expr(node.lo[0])}")
+        if node.hi is not None:
+            conditions.append(f"{column} {'<=' if node.hi[1] else '<'} {format_expr(node.hi[0])}")
+        using = node.index.name if node.index is not None else "primary key"
+        return f"IndexScan {node.table.name} using {using} ({' AND '.join(conditions)})"
     if isinstance(node, WorkTableScan):
         return f"WorkTableScan {node.name}"
     if isinstance(node, Values):
@@ -203,9 +235,14 @@ def explain(plan, stats=None):
 
     def visit(node, depth, prefix):
         text = describe(node)
+        details = []
+        if getattr(node, "est_rows", None) is not None:
+            details.append(f"est={node.est_rows:,.0f}")
         if stats is not None:
             rows, seconds = stats.get(id(node), (0, 0.0))
-            text += f"  (rows={rows} time={seconds * 1000:.3f}ms)"
+            details.append(f"rows={rows} time={seconds * 1000:.3f}ms")
+        if details:
+            text += f"  ({' '.join(details)})"
         lines.append("  " * depth + prefix + text)
         for e in expressions(node):
             for sub in walk(e):

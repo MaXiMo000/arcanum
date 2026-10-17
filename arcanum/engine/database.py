@@ -8,10 +8,11 @@ from ..sql.parser import parse_statements
 from ..storage import Pager
 from .binder import Binder
 from .catalog import Catalog
-from .executor import Context, run
-from .plan import explain
+from .executor import Context, index_scan_pairs, run
+from .optimizer import Optimizer
+from .plan import IndexScan, TableScan, explain
 
-_WRITES = (n.Insert, n.Update, n.Delete, n.CreateTable, n.DropTable, n.CreateIndex, n.DropIndex)
+_WRITES = (n.Insert, n.Update, n.Delete, n.CreateTable, n.DropTable, n.CreateIndex, n.DropIndex, n.Analyze)
 
 
 @dataclass
@@ -31,10 +32,14 @@ class Database:
     database after a crash replays every committed transaction and drops the rest.
 
     max_keys caps the keys per B+tree node, so trees split after a few rows;
-    useful for demos and tests. fs and checkpoint_frames are passed to the Pager.
+    useful for demos and tests. optimize=False runs plans exactly as the binder
+    builds them, to compare against the optimizer. fs and checkpoint_frames are
+    passed to the Pager.
     """
 
-    def __init__(self, path, pool_size=256, max_keys=None, events=None, fs=None, checkpoint_frames=1000):
+    def __init__(self, path, pool_size=256, max_keys=None, events=None, fs=None, checkpoint_frames=1000,
+                 optimize=True):
+        self.optimize = optimize
         self.pager = Pager(path, pool_size, events, fs, checkpoint_frames)
         self.events = self.pager.events
         self.catalog = Catalog(self.pager, max_keys)
@@ -111,13 +116,13 @@ class Database:
     def _run(self, statement, text, sql):
         binder = Binder(self.catalog, sql)
         if isinstance(statement, n.Query):
-            plan = binder.bind_query(statement)
+            plan = self._plan(binder.bind_query(statement))
             rows = list(run(plan, Context(self.catalog)))
             return Result([c.name for c in plan.columns], rows, status=f"SELECT {len(rows)}")
         if isinstance(statement, n.Explain):
             if not isinstance(statement.statement, n.Query):
                 raise SqlError("Arcanum doesn't support EXPLAIN for statements other than queries yet")
-            plan = binder.bind_query(statement.statement)
+            plan = self._plan(binder.bind_query(statement.statement))
             stats = None
             if statement.analyze:
                 ctx = Context(self.catalog, analyze=True)
@@ -156,11 +161,18 @@ class Database:
             self.catalog.drop_index(statement.name)
             return Result(status="DROP INDEX")
         if isinstance(statement, n.Analyze):
-            raise SqlError("Arcanum doesn't support ANALYZE yet")
+            if statement.table is not None:
+                tables = [binder.table(statement.table)]
+            else:
+                tables = list(self.catalog.tables.values())
+            for table in tables:
+                self.catalog.analyze(table)
+            return Result(status="ANALYZE")
         raise SqlError(f"Arcanum doesn't support {type(statement).__name__} yet")
 
     def _insert(self, binder, statement):
         table, positions, source = binder.bind_insert(statement)
+        source = self._plan(source)
         # Read every source row first, so INSERT ... SELECT from the same table never sees its own inserts.
         rows = list(run(source, Context(self.catalog)))
         defaults = [c.default for c in table.columns]
@@ -171,10 +183,19 @@ class Database:
             self.catalog.insert_row(table, self.catalog.check_row(table, row))
         return Result(rowcount=len(rows), status=f"INSERT {len(rows)}")
 
+    def _plan(self, plan):
+        return Optimizer().optimize(plan) if self.optimize else plan
+
     def _matching_rows(self, ctx, table, where):
-        predicate = ctx.compile(where) if where is not None else None
-        return [(key, row) for key, row in self.catalog.scan(table)
-                if predicate is None or predicate(row, ()) is True]
+        """(key, row) of every row the WHERE clause selects, through an index when one helps."""
+        scan, conditions = TableScan(table, []), [where] if where is not None else []
+        if self.optimize and where is not None:
+            optimizer = Optimizer()
+            optimizer.optimize_expr(where)
+            scan, conditions = optimizer.access_path(scan, _conjuncts(where))
+        pairs = index_scan_pairs(scan, ctx) if isinstance(scan, IndexScan) else self.catalog.scan(table)
+        checks = [ctx.compile(c) for c in conditions]
+        return [(key, row) for key, row in pairs if all(check(row, ()) is True for check in checks)]
 
     def _update(self, binder, statement):
         table, where, assignments = binder.bind_update(statement)
@@ -201,3 +222,9 @@ class Database:
         for key, row in targets:
             self.catalog.delete_row(table, key, row)
         return Result(rowcount=len(targets), status=f"DELETE {len(targets)}")
+
+
+def _conjuncts(e):
+    if getattr(e, "op", None) == "AND":
+        return _conjuncts(e.args[0]) + _conjuncts(e.args[1])
+    return [e]

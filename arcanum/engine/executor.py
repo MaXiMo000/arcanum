@@ -16,9 +16,10 @@ import time
 from collections import Counter
 
 from ..errors import ExecutionError
+from ..storage import encode
 from . import plan as p
 from .expr import (
-    FUNCTIONS, Col, Const, Op, Outer, SubqueryExpr, cast, check_int, divide, like, modulo,
+    FUNCTIONS, REAL, Col, Const, Op, Outer, SubqueryExpr, cast, check_int, divide, like, modulo,
     to_text,
 )
 
@@ -283,6 +284,48 @@ def _table_scan(plan, ctx, outer):
         yield row
 
 
+def _index_scan(plan, ctx, outer):
+    for _, row in index_scan_pairs(plan, ctx, outer):
+        yield row
+
+
+# Byte strings that sort just after a prefix's matches: every encoded value starts with a tag
+# byte from 0x01 to 0x04, so no key continues a prefix with 0xFF, and a NULL is exactly 0x01.
+_AFTER_ALL = b"\xff"
+_AFTER_NULL = b"\x01\xff"
+
+
+def index_scan_pairs(plan, ctx, outer=()):
+    """Yield (table key, row) for an IndexScan by turning its bounds into an encoded key range."""
+    types = [plan.table.columns[i].type for i in plan.key_columns]
+
+    def value(expr, position):
+        v = ctx.compile(expr)((), outer)
+        if v is not None and types[position] == REAL and not isinstance(v, float):
+            v = float(v)  # stored REAL values are floats, and the encoding keeps the two apart
+        return v
+
+    eq = [value(e, i) for i, e in enumerate(plan.eq)]
+    if None in eq:
+        return  # col = NULL is never true
+    prefix = encode(eq)
+    position = len(eq)
+    lo, hi, hi_inclusive = prefix or None, (prefix + _AFTER_ALL) if prefix else None, False
+    if plan.lo is not None:
+        v = value(plan.lo[0], position)
+        if v is None:
+            return
+        lo = encode(eq + [v]) + (b"" if plan.lo[1] else _AFTER_ALL)
+    elif plan.hi is not None:
+        lo = prefix + _AFTER_NULL  # an upper bound alone must still skip NULLs
+    if plan.hi is not None:
+        v = value(plan.hi[0], position)
+        if v is None:
+            return
+        hi = encode(eq + [v]) + (_AFTER_ALL if plan.hi[1] else b"")
+    yield from ctx.catalog.scan_range(plan.table, plan.index, lo, hi, hi_inclusive)
+
+
 def _work_table_scan(plan, ctx, outer):
     yield from ctx.work_tables[plan.cte_id]
 
@@ -311,6 +354,7 @@ def _join(plan, ctx, outer):
 
     The right input is materialised (and hashed on its keys); the left input
     streams. RIGHT and FULL joins remember which right rows found a partner.
+    SEMI and ANTI joins emit each left row at most once, without right columns.
     """
     right_rows = list(run(plan.right, ctx, outer))
     residual = ctx.compile(plan.residual) if plan.residual is not None else None
@@ -322,10 +366,22 @@ def _join(plan, ctx, outer):
             key = tuple(f(r, outer) for f in right_keys)
             if None not in key:  # NULL never equals anything, so it can never match
                 buckets.setdefault(key, []).append(j)
+    every_right = range(len(right_rows))
+    if plan.kind in ("SEMI", "ANTI"):
+        want_match = plan.kind == "SEMI"
+        for left in run(plan.left, ctx, outer):
+            if left_keys:
+                key = tuple(f(left, outer) for f in left_keys)
+                candidates = () if None in key else buckets.get(key, ())
+            else:
+                candidates = every_right
+            found = any(residual is None or residual(left + right_rows[j], outer) is True for j in candidates)
+            if found == want_match:
+                yield left
+        return
     keep_left = plan.kind in ("LEFT", "FULL")
     matched = set() if plan.kind in ("RIGHT", "FULL") else None
     right_nulls = (None,) * len(plan.right.columns)
-    every_right = range(len(right_rows))
     for left in run(plan.left, ctx, outer):
         if left_keys:
             key = tuple(f(left, outer) for f in left_keys)
@@ -466,7 +522,7 @@ def _recursive_cte(plan, ctx, outer):
 
 
 _RUNNERS = {
-    p.OneRow: _one_row, p.TableScan: _table_scan, p.WorkTableScan: _work_table_scan, p.Values: _values,
+    p.OneRow: _one_row, p.TableScan: _table_scan, p.IndexScan: _index_scan, p.WorkTableScan: _work_table_scan, p.Values: _values,
     p.Filter: _filter, p.Project: _project, p.Join: _join, p.Aggregate: _aggregate, p.Window: _window,
     p.Sort: _sort, p.Limit: _limit, p.Distinct: _distinct, p.SetOp: _set_op, p.RecursiveCTE: _recursive_cte,
 }

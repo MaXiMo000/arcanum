@@ -6,7 +6,9 @@ queries. Results are compared as multisets unless the query's ORDER BY fixes
 the row order completely.
 
 Arcanum runs with tiny B+tree nodes (max_keys=4) so every query also
-exercises multi-level trees.
+exercises multi-level trees. Every test runs three times: with the optimizer
+off, on plain tables, and with secondary indexes and ANALYZE statistics, so the
+optimizer's rewrites, index scans and cost-based join orders are all checked.
 """
 
 import random
@@ -58,9 +60,21 @@ def _data():
     return rows
 
 
-@pytest.fixture(scope="module")
-def engines(tmp_path_factory):
-    db = Database(tmp_path_factory.mktemp("diff") / "arcanum.db", max_keys=4)
+INDEXES = """
+CREATE INDEX emp_dept ON emp (dept);
+CREATE INDEX emp_manager ON emp (manager_id);
+CREATE INDEX emp_hired_salary ON emp (hired, salary);
+CREATE INDEX sales_emp ON sales (emp_id);
+CREATE INDEX sales_day ON sales (day, amount);
+CREATE INDEX tags_emp ON tags (emp_id);
+ANALYZE;
+"""
+
+
+@pytest.fixture(scope="module", params=["unoptimized", "plain", "indexed"])
+def engines(request, tmp_path_factory):
+    db = Database(tmp_path_factory.mktemp("diff") / "arcanum.db", max_keys=4,
+                  optimize=request.param != "unoptimized")
     lite = sqlite3.connect(":memory:")
     lite.execute("PRAGMA case_sensitive_like = ON")
     db.execute_script(SCHEMA)
@@ -71,6 +85,8 @@ def engines(tmp_path_factory):
                 "(" + ", ".join(map(_literal, row)) + ")" for row in rows[start:start + 50])
             db.execute(sql)
             lite.execute(sql)
+    if request.param == "indexed":
+        db.execute_script(INDEXES)
     for name in ("emp", "dept", "sales"):
         db.catalog.btree(db.catalog.tables[name].root).verify()
     yield db, lite
@@ -199,6 +215,28 @@ CORPUS = [
     ("SELECT dept, sum(salary), rank() OVER (ORDER BY sum(salary) DESC) FROM emp GROUP BY dept", False),
     ("SELECT * FROM (SELECT id, dept, rank() OVER (PARTITION BY dept ORDER BY salary DESC, id) AS r FROM emp) x WHERE r <= 2", False),
     ("SELECT id, row_number() OVER (ORDER BY salary DESC, id) AS rn FROM emp ORDER BY rn LIMIT 5", True),
+    # shapes the optimizer rewrites: index ranges, correlated lookups, comma joins, pushdown
+    ("SELECT id FROM emp WHERE id >= 40 AND id < 47", False),
+    ("SELECT id FROM emp WHERE id > 115 OR id < 3", False),
+    ("SELECT id FROM emp WHERE manager_id < 4", False),
+    ("SELECT id FROM emp WHERE manager_id = 1 AND id > 50", False),
+    ("SELECT id FROM emp WHERE hired = 2015 AND salary >= 100", False),
+    ("SELECT id FROM emp WHERE hired = 2015 AND salary < 100.5", False),
+    ("SELECT id FROM emp WHERE salary > 199 AND salary <= 200", False),
+    ("SELECT id FROM sales WHERE day = 7 AND amount > 300", False),
+    ("SELECT id FROM sales WHERE day BETWEEN 5 AND 6", False),
+    ("SELECT id FROM emp WHERE dept = NULL", False),
+    ("SELECT id, (SELECT count(*) FROM sales s WHERE s.emp_id = e.id AND s.day > 10) FROM emp e", False),
+    ("SELECT e.id, s.id, d.name FROM sales s, emp e, dept d WHERE s.emp_id = e.id AND e.dept = d.name "
+     "AND d.floor > 2 AND s.amount > 100", False),
+    ("SELECT e.id, t.tag, s.id FROM tags t JOIN emp e ON e.id = t.emp_id JOIN sales s ON s.emp_id = e.id "
+     "JOIN dept d ON d.name = e.dept WHERE d.budget IS NOT NULL AND t.tag = 'lead'", False),
+    ("SELECT d.name, x.c FROM dept d JOIN (SELECT dept, count(*) AS c FROM emp GROUP BY dept) x "
+     "ON x.dept = d.name WHERE x.dept = 'eng'", False),
+    ("SELECT id FROM emp e WHERE e.dept IN (SELECT d.name FROM dept d WHERE d.floor = e.hired % 9)", False),
+    ("SELECT id FROM emp e WHERE NOT EXISTS (SELECT 1 FROM sales s WHERE s.emp_id = e.id AND s.amount > e.salary)", False),
+    ("SELECT x.id FROM (SELECT id, salary FROM emp UNION ALL SELECT id, amount FROM sales) x WHERE x.id < 5", False),
+    ("DELETE FROM tags WHERE emp_id = -1", False),
 ]
 
 

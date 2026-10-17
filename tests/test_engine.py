@@ -156,12 +156,17 @@ def test_runtime_errors(db):
 
 
 def test_explain_and_explain_analyze(db):
-    plan = [line for (line,) in rows(db, "EXPLAIN SELECT email FROM users u WHERE EXISTS "
-                                         "(SELECT 1 FROM users v WHERE v.id = u.id + 1) ORDER BY email")]
+    sql = ("EXPLAIN SELECT email FROM users u WHERE EXISTS "
+           "(SELECT 1 FROM users v WHERE v.id = u.id + 1) ORDER BY email")
+    plan = [line for (line,) in rows(db, sql)]
     assert plan[0].startswith("Sort")
-    assert any("SubPlan (exists, correlated)" in line for line in plan)
+    assert any("HashJoin SEMI on (id + 1) = id" in line for line in plan)  # decorrelated
+    db.optimize = False
+    assert any("SubPlan (exists, correlated)" in line for (line,) in rows(db, sql))
+    db.optimize = True
     analyzed = rows(db, "EXPLAIN ANALYZE SELECT * FROM users WHERE id > 1")
-    assert "rows=2" in analyzed[0][0]
+    assert "IndexScan users using primary key (id > 1)" in analyzed[1][0]
+    assert "rows=2" in analyzed[0][0] and "rows=2" in analyzed[1][0]
 
 
 def test_events_show_the_engine_working(db):

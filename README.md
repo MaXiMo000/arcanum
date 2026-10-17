@@ -1,10 +1,10 @@
 # Arcanum
 
 A relational database written from scratch in Python, built so you can watch it work.
-No SQLite or Postgres underneath: Arcanum has its own pager, B+tree, SQL parser, binder and
-query executor, write-ahead log and crash recovery, and, as it grows, its own cost-based
-optimizer. Every internal step emits an event, so a UI can show pages loading, nodes
-splitting and rows flowing through a query plan in real time.
+No SQLite or Postgres underneath: Arcanum has its own pager, B+tree, SQL parser, binder,
+cost-based optimizer, query executor, write-ahead log and crash recovery. Every internal step
+emits an event, so a UI can show pages loading, nodes splitting and rows flowing through a
+query plan in real time.
 
 ## Quick start
 
@@ -37,12 +37,19 @@ with Database("company.db") as db:
     """).rows
     # [(0, 1), (1, 2), (2, 1)]
 
-    for (line,) in db.execute("EXPLAIN SELECT dept, avg(salary) FROM emp WHERE salary > 100 GROUP BY dept").rows:
+    # Who manages someone? The correlated EXISTS becomes a single semi join.
+    db.execute("CREATE INDEX emp_manager ON emp (manager_id)")
+    db.execute("ANALYZE")
+    sql = "SELECT name FROM emp e WHERE EXISTS (SELECT 1 FROM emp r WHERE r.manager_id = e.id) AND id < 3"
+    db.execute(sql).rows
+    # [('Ada',)]
+    for (line,) in db.execute("EXPLAIN " + sql).rows:
         print(line)
-    # Project dept, avg(salary) AS avg
-    #   -> HashAggregate group by dept compute avg(salary)
-    #     -> Filter (salary > 100)
-    #       -> TableScan emp
+    # Project name  (est=1)
+    #   -> HashJoin SEMI on id = manager_id  (est=1)
+    #     -> Filter (id < 3)  (est=2)
+    #       -> TableScan emp  (est=4)
+    #     -> TableScan emp  (est=4)
 ```
 
 ## Status
@@ -58,8 +65,9 @@ with Database("company.db") as db:
 | Executor: iterator-model operators, hash join, hash aggregate, window functions, recursive CTEs | done |
 | Atomic statements, `BEGIN` / `COMMIT` / `ROLLBACK`, `EXPLAIN [ANALYZE]` | done |
 | Write-ahead log, checkpoints and crash recovery | done |
-| Cost-based optimizer: index scans, statistics, join ordering, subquery decorrelation | next |
-| API with live event stream, 3D visualizer | planned |
+| Cost-based optimizer: index scans, statistics, join ordering, subquery decorrelation | done |
+| API with live event stream | next |
+| 3D visualizer | planned |
 
 ## SQL support
 
@@ -75,7 +83,7 @@ with Database("company.db") as db:
 - Aggregates `count`, `sum`, `avg`, `min` and `max` (with `DISTINCT`)
 - Functions `abs`, `round`, `length`, `lower`, `upper`, `trim`, `ltrim`, `rtrim`, `replace`, `substr`,
   `coalesce`, `ifnull` and `nullif`; `CASE`, `CAST`, `BETWEEN`, `LIKE`, `IN`, `IS [NOT] NULL` and `||`
-- `BEGIN`, `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]`
+- `BEGIN`, `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]`, `ANALYZE [table]`
 
 ### Semantics
 
@@ -92,6 +100,29 @@ Errors point at the exact spot:
 >>> db.execute("SELECT * FROM users WHERE id = 'one'")
 SqlError: line 1, col 30: cannot compare INTEGER with TEXT
 ```
+
+## Query optimizer
+
+The binder's plan is correct but naive; the optimizer rewrites it into a cheaper equivalent:
+
+1. **Decorrelation.** A correlated `EXISTS`, `NOT EXISTS` or `IN` in `WHERE` re-runs its subquery for
+   every row. When the correlation is through equalities, it becomes a semi or anti hash join that reads
+   the subquery's tables once.
+2. **Predicate pushdown.** Conditions move down through joins, projections, aggregates (when they only
+   test grouping keys), sorts and set operations, so rows are discarded as early as possible. Equalities
+   between the two sides of an inner join become hash join keys, so `FROM a, b WHERE a.x = b.y` is a
+   hash join, not a cross product.
+3. **Access paths.** A filter on a table becomes an index scan when the primary key or an index matches
+   a prefix of equalities, optionally followed by a range, and the cost model says that beats a full scan.
+   Bounds can come from an enclosing query, so a correlated subquery looks its rows up through an index.
+   `UPDATE` and `DELETE` find their rows the same way.
+4. **Join ordering.** A cluster of inner joins is re-planned by dynamic programming over subsets of
+   tables (the System R approach), choosing the order and each hash join's build side by estimated cost.
+
+`ANALYZE` collects the statistics behind the estimates: row counts, distinct values, NULL counts,
+most common values and equi-depth histograms. `EXPLAIN` shows the estimated rows of every operator and
+`EXPLAIN ANALYZE` adds the real counts and timings. `Database(path, optimize=False)` runs the
+unoptimized plans, for comparison.
 
 ## Durability and crash recovery
 
@@ -128,7 +159,10 @@ python -m pytest
 
 - **Differential testing against SQLite.** The same data is loaded into Arcanum and SQLite, and a corpus
   of joins, subqueries, CTEs, window functions and set operations, plus hundreds of randomly generated
-  queries, must return identical results.
+  queries, must return identical results. Everything runs three times: with the optimizer off, on plain
+  tables, and with secondary indexes and statistics, so every rewrite and access path is checked.
+- **Optimizer tests** check the plans themselves: point lookups read a root-to-leaf path instead of the
+  whole table, index scans are chosen only when selective, and subqueries become semi and anti joins.
 - **Crash testing.** A simulated file system loses power at a random file operation, then keeps a random
   subset of the unsynced writes (disks reorder them), tearing some of them. Across hundreds of crash
   points in a workload of transactions, failing statements, rollbacks and checkpoints, including crashes
@@ -141,18 +175,19 @@ python -m pytest
 ## How a query runs
 
 ```
-SQL text -> lexer -> parser -> syntax tree -> binder -> query plan -> executor -> rows
-                                                 |                       |
-                                         catalog (schemas)     B+trees <- pager <- file
+SQL text -> lexer -> parser -> syntax tree -> binder -> optimizer -> plan -> executor -> rows
+                                                 |                               |
+                                         catalog (schemas, stats)    B+trees <- pager <- file
 ```
 
 1. The **parser** builds a syntax tree, recording where each name appears for error messages.
 2. The **binder** resolves every table and column through nested scopes, checks types and builds a
    plan in SQL's logical order: `FROM`, `WHERE`, `GROUP BY`, `HAVING`, window functions, the select list,
    `DISTINCT`, `ORDER BY`, `LIMIT`.
-3. The **executor** turns each plan node into a generator that pulls rows from its inputs on demand,
+3. The **optimizer** rewrites that plan using statistics (see above).
+4. The **executor** turns each plan node into a generator that pulls rows from its inputs on demand,
    so `LIMIT` and `EXISTS` stop work early. Equality joins use a hash join.
-4. **Storage**: tables are B+trees keyed by primary key (or a hidden row id); indexes are B+trees keyed
+5. **Storage**: tables are B+trees keyed by primary key (or a hidden row id); indexes are B+trees keyed
    by the indexed values. Keys use an order-preserving byte encoding, so the tree compares raw bytes.
 
 ## Project layout
@@ -173,10 +208,11 @@ arcanum/
     nodes.py       syntax tree
   engine/
     database.py    Database: statements, transactions
-    catalog.py     schemas and row storage
+    catalog.py     schemas, row storage and ANALYZE statistics
     binder.py      name resolution and type checking
     expr.py        typed expressions, operators and functions
     plan.py        plan nodes and EXPLAIN output
+    optimizer.py   decorrelation, pushdown, access paths, join ordering, estimates
     executor.py    iterator-model operators
 tests/
 ```

@@ -9,8 +9,14 @@ Storage layout:
     table  key = primary key values (or a hidden row id), value = the whole row
     index  key = indexed values + the row's table key, value = empty
 Both use storage.codec, so byte order is SQL order.
+
+ANALYZE stores statistics as catalog entries of kind "stats", one per column
+plus one for the row count, so each stays well under the B+tree's entry size.
 """
 
+import json
+from bisect import bisect_left
+from collections import Counter
 from dataclasses import dataclass, field
 
 from ..errors import ConstraintError, ExecutionError, SqlError
@@ -21,6 +27,9 @@ from ..storage.btree import MAX_ENTRY
 from .expr import BOOLEAN, REAL, assignable, literal_type, to_text
 
 CATALOG_ROOT = 1
+HISTOGRAM_BUCKETS = 16
+HISTOGRAM_TEXT = 32  # text histogram bounds keep this many characters; enough to estimate ranges
+COMMON_VALUES = 8  # most common values kept per column, so skewed equalities are estimated well
 
 
 @dataclass
@@ -49,12 +58,59 @@ class TableSchema:
     root: int
     sql: str
     indexes: list = field(default_factory=list)
+    stats: object = None  # TableStats after ANALYZE
 
     def column(self, name):
         for i, c in enumerate(self.columns):
             if c.name == name:
                 return i
         return None
+
+
+@dataclass
+class ColumnStats:
+    distinct: int
+    nulls: int
+    bounds: list  # equi-depth histogram: sorted values splitting the non-NULL values into equal-sized buckets
+    common: list = field(default_factory=list)  # [[value, fraction of all rows]] for the most common values
+
+    def fraction_equal(self, value, rows):
+        """Estimated fraction of all rows equal to value."""
+        if not rows:
+            return 0.0
+        for common, fraction in self.common:
+            if common == value and type(common) is type(value):
+                return fraction
+        others = self.distinct - len(self.common)
+        if others <= 0:
+            return 0.0  # every value is a common value, and this is not one of them
+        remaining = 1 - self.nulls / rows - sum(fraction for _, fraction in self.common)
+        return max(remaining, 0.0) / others
+
+    def fraction_below(self, value, rows):
+        """Estimated fraction of all rows whose value is < value (NULLs are never counted)."""
+        if not self.bounds or rows == 0:
+            return 0.0
+        non_null = (rows - self.nulls) / rows
+        try:
+            position = bisect_left(self.bounds, value)
+        except TypeError:
+            return 1 / 3
+        if position == 0:
+            return 0.0
+        if position >= len(self.bounds):
+            return non_null
+        low, high = self.bounds[position - 1], self.bounds[position]
+        within = 0.5
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and high != low:
+            within = (value - low) / (high - low)
+        return non_null * (position - 1 + within) / (len(self.bounds) - 1)
+
+
+@dataclass
+class TableStats:
+    rows: int
+    columns: list  # ColumnStats per column
 
 
 class Catalog:
@@ -71,6 +127,7 @@ class Catalog:
         """Rebuild the in-memory schema from the catalog tree (after open or rollback)."""
         self.tables, self.indexes, self._next_rowid = {}, {}, {}
         entries = [decode(value) for _, value in self.tree.scan()]
+        stats = {}
         for kind, name, sql, root in entries:
             if kind == "table":
                 self.tables[name] = _table_from_ast(parse(sql), root, sql)
@@ -81,6 +138,11 @@ class Catalog:
                 index = IndexSchema(name, table.name, [table.column(c) for c in stmt.columns], stmt.unique, root, sql)
                 table.indexes.append(index)
                 self.indexes[name] = index
+            elif kind == "stats":
+                stats.setdefault(name, {})[root] = json.loads(sql)  # root holds the column (-1 = row count)
+        for name, parts in stats.items():
+            table = self.tables[name]
+            table.stats = TableStats(parts[-1]["rows"], [ColumnStats(**parts[i]) for i in range(len(table.columns))])
 
     def btree(self, root):
         return BTree(self.pager, root, self.max_keys)
@@ -130,6 +192,8 @@ class Catalog:
             del self.indexes[index.name]
         self.btree(table.root).drop()
         self.tree.delete(encode((name,)))
+        for column in range(-1, len(table.columns)):
+            self.tree.delete(encode((name, "stats", column)))
         self._next_rowid.pop(name, None)
 
     def drop_index(self, name):
@@ -149,18 +213,48 @@ class Catalog:
 
     # ---- rows --------------------------------------------------------------------
 
+    def analyze(self, table):
+        """Collect row and column statistics for the optimizer and store them in the catalog."""
+        rows = [row for _, row in self.scan(table)]
+        columns = []
+        for i in range(len(table.columns)):
+            values = sorted(row[i] for row in rows if row[i] is not None)
+            if values:
+                step = (len(values) - 1) / HISTOGRAM_BUCKETS
+                bounds = [values[round(b * step)] for b in range(HISTOGRAM_BUCKETS + 1)]
+                bounds = [b[:HISTOGRAM_TEXT] if isinstance(b, str) else b for b in bounds]
+            else:
+                bounds = []
+            common = [[v, n / len(rows)] for v, n in Counter(values).most_common(COMMON_VALUES)
+                      if not isinstance(v, str) or len(v) <= HISTOGRAM_TEXT]
+            columns.append(ColumnStats(len(set(values)), len(rows) - len(values), bounds, common))
+        table.stats = TableStats(len(rows), columns)
+        parts = [(-1, {"rows": len(rows)})] + [(i, vars(c)) for i, c in enumerate(columns)]
+        for column, data in parts:
+            self.tree.insert(encode((table.name, "stats", column)),
+                             encode(("stats", table.name, json.dumps(data), column)), replace=True)
+
     def scan(self, table):
         """Yield (key, row) for every row, in primary key order."""
-        booleans = [i for i, c in enumerate(table.columns) if c.type == BOOLEAN]
         for key, value in self.btree(table.root).scan():
-            row = decode(value)
-            if booleans:
-                row = list(row)
-                for i in booleans:
-                    if row[i] is not None:
-                        row[i] = bool(row[i])
-                row = tuple(row)
-            yield key, row
+            yield key, self._row(table, value)
+
+    def scan_range(self, table, index, lo=None, hi=None, hi_inclusive=False):
+        """Yield (table key, row) for rows whose key in `index` (None = primary key) is in [lo, hi)."""
+        if index is None:
+            for key, value in self.btree(table.root).scan(lo, hi, hi_inclusive=hi_inclusive):
+                yield key, self._row(table, value)
+            return
+        tree, width = self.btree(table.root), len(index.columns)
+        for entry, _ in self.btree(index.root).scan(lo, hi, hi_inclusive=hi_inclusive):
+            key = encode(decode(entry)[width:])  # an index entry ends with the row's table key
+            yield key, self._row(table, tree.get(key))
+
+    def _row(self, table, value):
+        row = decode(value)
+        if any(c.type == BOOLEAN for c in table.columns):
+            row = tuple(bool(v) if v is not None and c.type == BOOLEAN else v for v, c in zip(row, table.columns))
+        return row
 
     def check_row(self, table, row):
         """Apply NOT NULL and store REAL columns as floats. Returns the row to store."""
