@@ -239,6 +239,23 @@ class Pager:
             raise CorruptDatabaseError(f"page {page_id} is truncated")
         return data
 
+    def peek(self, page_id):
+        """A page's bytes without touching LRU order, stats or events (for inspection)."""
+        self._check(page_id)
+        return self._current(page_id)
+
+    def cached_pages(self):
+        """[(page id, dirty)] in the pool, least recently used first."""
+        return [(page_id, entry[1]) for page_id, entry in self._pool.items()]
+
+    def free_pages(self):
+        """Page ids on the free list, in list order."""
+        pages, page_id = [], self.free_head
+        while page_id and len(pages) < self.page_count:
+            pages.append(page_id)
+            page_id = _NEXT_FREE.unpack_from(self._current(page_id))[0]
+        return pages
+
     def _current(self, page_id):
         """A page's bytes without touching LRU order, stats or events."""
         entry = self._pool.get(page_id)

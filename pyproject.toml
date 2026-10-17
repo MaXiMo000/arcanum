@@ -13,7 +13,8 @@ license-files = ["LICENSE"]
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+server = ["fastapi>=0.110", "uvicorn>=0.29"]
+dev = ["pytest>=8", "httpx>=0.27", "arcanum-db[server]"]
 
 [tool.setuptools.packages.find]
 include = ["arcanum*"]

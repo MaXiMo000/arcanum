@@ -277,8 +277,28 @@ class BTree:
                 return min(max(m, lo), hi)
         return hi
 
+    def dump(self, limit=None):
+        """Every node, breadth first, read without touching the cache order, stats or events.
+
+        Returns [{"page", "leaf", "keys", "children", "next"}] with raw keys; at
+        most `limit` nodes. Used to draw the tree.
+        """
+        nodes, queue = [], [self.root]
+        while queue and (limit is None or len(nodes) < limit):
+            node = self._parse(queue.pop(0), self.pager.peek)
+            nodes.append({"page": node.page, "leaf": node.leaf, "keys": node.keys,
+                          "children": [] if node.leaf else node.children, "next": node.next_leaf})
+            if not node.leaf:
+                queue.extend(node.children)
+        return nodes
+
     def _load(self, page):
-        data = self.pager.read(page)
+        node = self._parse(page, self.pager.read)
+        self.events.emit("node_visit", page=page, leaf=node.leaf)
+        return node
+
+    def _parse(self, page, read):
+        data = read(page)
         kind, count, link = _NODE.unpack_from(data)
         if kind not in (LEAF, INTERNAL):
             raise CorruptDatabaseError(f"page {page} is not a B+tree node")
@@ -295,7 +315,6 @@ class BTree:
             else:
                 children.append(_U32.unpack_from(data, pos)[0])
                 pos += 4
-        self.events.emit("node_visit", page=page, leaf=kind == LEAF)
         if kind == LEAF:
             return Node(page, True, keys, values, next_leaf=link)
         return Node(page, False, keys, children=children)

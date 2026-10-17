@@ -10,7 +10,7 @@ from .binder import Binder
 from .catalog import Catalog
 from .executor import SORT_MEMORY_ROWS, Context, index_scan_pairs, run
 from .optimizer import Optimizer
-from .plan import IndexScan, TableScan, explain
+from .plan import IndexScan, TableScan, explain, plan_tree
 
 _WRITES = (n.Insert, n.Update, n.Delete, n.CreateTable, n.DropTable, n.CreateIndex, n.DropIndex, n.Analyze)
 
@@ -21,6 +21,7 @@ class Result:
     rows: list = field(default_factory=list)
     rowcount: int = -1  # rows changed by INSERT, UPDATE or DELETE
     status: str = ""  # e.g. "INSERT 3", "CREATE TABLE"
+    plan: dict | None = None  # the query plan as a tree (see plan.plan_tree), when traced
 
 
 class Database:
@@ -53,17 +54,21 @@ class Database:
         """How many committed log frames were replayed when this database was opened."""
         return self.pager.recovered_frames
 
-    def execute(self, sql):
-        """Run one statement and return its Result."""
+    def execute(self, sql, trace=False):
+        """Run one statement and return its Result.
+
+        trace=True also returns the plan of a query or EXPLAIN as a tree, with
+        each operator's actual rows and time.
+        """
         statements = parse_statements(sql)
         if len(statements) != 1:
             raise SqlError(f"execute() runs exactly one statement, got {len(statements)}; use execute_script()")
         statement, text = statements[0]
-        return self._execute(statement, text, sql)
+        return self._execute(statement, text, sql, trace)
 
-    def execute_script(self, sql):
+    def execute_script(self, sql, trace=False):
         """Run several semicolon-separated statements; returns one Result per statement."""
-        return [self._execute(statement, text, sql) for statement, text in parse_statements(sql)]
+        return [self._execute(statement, text, sql, trace) for statement, text in parse_statements(sql)]
 
     def close(self):
         if self.in_transaction:
@@ -79,7 +84,7 @@ class Database:
 
     # ---- statement dispatch ---------------------------------------------------------
 
-    def _execute(self, statement, text, sql):
+    def _execute(self, statement, text, sql, trace=False):
         if isinstance(statement, n.Begin):
             if self.in_transaction:
                 raise SqlError("a transaction is already in progress")
@@ -101,7 +106,7 @@ class Database:
 
         self.pager.savepoint()
         try:
-            result = self._run(statement, text, sql)
+            result = self._run(statement, text, sql, trace)
         except BaseException:
             self.pager.rollback()
             self.catalog.reload()
@@ -115,12 +120,14 @@ class Database:
         if not self.in_transaction:
             raise SqlError("there is no transaction in progress")
 
-    def _run(self, statement, text, sql):
+    def _run(self, statement, text, sql, trace=False):
         binder = Binder(self.catalog, sql)
         if isinstance(statement, n.Query):
             plan = self._plan(binder.bind_query(statement))
-            rows = list(run(plan, self._context()))
-            return Result([c.name for c in plan.columns], rows, status=f"SELECT {len(rows)}")
+            ctx = self._context(analyze=trace)
+            rows = list(run(plan, ctx))
+            return Result([c.name for c in plan.columns], rows, status=f"SELECT {len(rows)}",
+                          plan=plan_tree(plan, ctx.stats) if trace else None)
         if isinstance(statement, n.Explain):
             if not isinstance(statement.statement, n.Query):
                 raise SqlError("Arcanum doesn't support EXPLAIN for statements other than queries yet")
@@ -131,7 +138,8 @@ class Database:
                 for _ in run(plan, ctx):
                     pass
                 stats = ctx.stats
-            return Result(["plan"], [(line,) for line in explain(plan, stats)], status="EXPLAIN")
+            return Result(["plan"], [(line,) for line in explain(plan, stats)], status="EXPLAIN",
+                          plan=plan_tree(plan, stats) if trace else None)
         if isinstance(statement, n.Insert):
             return self._insert(binder, statement)
         if isinstance(statement, n.Update):

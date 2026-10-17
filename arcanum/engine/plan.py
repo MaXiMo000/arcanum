@@ -234,6 +234,27 @@ def describe(node):
     return type(node).__name__
 
 
+def plan_tree(plan, stats=None):
+    """The plan as nested dicts for a UI: label, operator, estimate, and actual rows and time if traced."""
+    counter = iter(range(1_000_000))
+
+    def visit(node):
+        entry = {"id": next(counter), "operator": type(node).__name__, "label": describe(node),
+                 "est_rows": getattr(node, "est_rows", None), "children": [], "subplans": []}
+        if stats is not None:
+            rows, seconds = stats.get(id(node), (0, 0.0))
+            entry["rows"], entry["ms"] = rows, round(seconds * 1000, 3)
+        for e in expressions(node):
+            for sub in walk(e):
+                if isinstance(sub, SubqueryExpr):
+                    entry["subplans"].append({"kind": sub.kind.lower(), "correlated": sub.correlated,
+                                              "plan": visit(sub.plan)})
+        entry["children"] = [visit(child) for child in inputs(node)]
+        return entry
+
+    return visit(plan)
+
+
 def explain(plan, stats=None):
     """Render the plan as indented lines. stats maps id(node) -> (rows, seconds) for EXPLAIN ANALYZE."""
     lines = []

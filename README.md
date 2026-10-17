@@ -66,8 +66,8 @@ with Database("company.db") as db:
 | Atomic statements, `BEGIN` / `COMMIT` / `ROLLBACK`, `EXPLAIN [ANALYZE]` | done |
 | Write-ahead log, checkpoints and crash recovery | done |
 | Cost-based optimizer: index scans, statistics, join ordering, subquery decorrelation | done |
-| API with live event stream | next |
-| 3D visualizer | planned |
+| HTTP / WebSocket API: sessions, live event stream, crash demo | done |
+| 3D visualizer | next |
 
 ## SQL support
 
@@ -146,9 +146,37 @@ Arcanum keeps a write-ahead log next to the database file (`<name>-wal`):
 A crash at any moment therefore leaves either the state before a transaction or the state after it,
 never a mix.
 
+## API server
+
+The server gives every visitor an isolated database, seeded with sample `customers` and `orders`, and
+streams what the engine does as it does it.
+
+```bash
+pip install -e ".[server]"
+python -m arcanum.server
+```
+
+| Endpoint | |
+|---|---|
+| `POST /sessions` | Create a session with its own database. Returns its `id`. |
+| `POST /sessions/{id}/query` | Run SQL (`{"sql": "..."}`; several statements allowed). Each result has `columns`, `rows`, `status` and the executed `plan` as a tree with estimated and actual rows per operator. |
+| `GET /sessions/{id}/state` | Every B+tree (nodes, keys, children), the buffer pool (cached and dirty pages) and the log, for drawing the database. |
+| `POST /sessions/{id}/crash` | Pull the plug: kill the engine process, by default in the middle of a stream of write transactions, then restart it. The reply compares the rows acknowledged before the crash with the rows after recovery. |
+| `WS /sessions/{id}/events` | Live engine events in batches: `page_read`, `page_write`, `cache_evict`, `node_visit`, `node_split`, `node_merge`, `root_grow`, `wal_append`, `commit`, `checkpoint`, `sort_spill`, `crash`, `recovery`, `recovered`. |
+| `DELETE /sessions/{id}` | Close the session and delete its files. |
+| `GET /health` | Liveness. |
+
+Errors are JSON: `{"error": {"type": "SqlError", "message": "column nope does not exist", "line": 1, "column": 8}}`.
+
+Each session's database runs in its own worker process. That is what lets the crash demo kill the
+engine for real, and what keeps one visitor's runaway query from affecting anyone else: a statement that
+outlives the time limit has its worker stopped and restarted, and the database recovers from its log
+like after any crash. Sessions, statement time, database size, returned rows and SQL length are all
+limited; see [`.env.example`](.env.example) for the settings.
+
 ## Setup
 
-Requires Python 3.11 or newer. The engine has no runtime dependencies.
+Requires Python 3.11 or newer. The engine itself has no dependencies; the API server uses FastAPI.
 
 ```bash
 pip install -e ".[dev]"
@@ -174,6 +202,8 @@ python -m pytest
   plus the transaction that was committing. Another test kills a real process mid-write.
 - **B+tree model testing.** Thousands of random inserts and deletes are checked against a plain
   dictionary, verifying every structural invariant (key order, key bounds, balanced depth, leaf chain).
+- **API tests** run real worker processes: queries and plans, structured errors, the event stream,
+  repeated mid-write crashes, runaway-query timeouts, the size cap and session limits.
 - Tests for constraints, transactions, atomic statements, persistence across reopen, and error messages.
 
 ## How a query runs
@@ -219,6 +249,10 @@ arcanum/
     expr.py        typed expressions, operators and functions
     plan.py        plan nodes and EXPLAIN output
     optimizer.py   decorrelation, pushdown, access paths, join ordering, estimates
-    executor.py    iterator-model operators
+    executor.py    iterator-model operators, external sort
+  server/
+    app.py         FastAPI routes and WebSocket
+    sessions.py    session and worker-process management, crash demo
+    worker.py      the engine process behind each session
 tests/
 ```
