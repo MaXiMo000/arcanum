@@ -1,6 +1,33 @@
 // Example queries; each one makes a different part of the engine visible.
 export const EXAMPLES: { label: string; hint: string; sql: string }[] = [
   {
+    label: "Advisor: slow scan",
+    hint: "A full scan the advisor fixes with an index; apply it and compare",
+    sql: "SELECT id, status FROM orders WHERE amount BETWEEN 100 AND 130;",
+  },
+  {
+    label: "Doctor: typos",
+    hint: "Three mistakes; the doctor fixes them one at a time",
+    sql: "SELCT name, citty FROM customer WHERE id = 3;",
+  },
+  {
+    label: "EXPLAIN ANALYZE",
+    hint: "The plan with actual rows and time per operator",
+    sql: `EXPLAIN ANALYZE SELECT c.name, o.amount
+FROM customers c JOIN orders o ON o.customer_id = c.id
+WHERE o.amount > 400;`,
+  },
+  {
+    label: "Index Only Scan",
+    hint: "Everything the query reads is in the index",
+    sql: "SELECT id, customer_id FROM orders WHERE customer_id = 5;",
+  },
+  {
+    label: "Traps",
+    hint: "= NULL and a missing join condition",
+    sql: "SELECT * FROM customers WHERE city = NULL;\nSELECT count(*) FROM customers, orders;",
+  },
+  {
     label: "Point lookup",
     hint: "One root-to-leaf path through the primary key",
     sql: "SELECT * FROM customers WHERE id = 7;",

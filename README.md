@@ -66,9 +66,10 @@ with Database("company.db") as db:
 | Atomic statements, `BEGIN` / `COMMIT` / `ROLLBACK`, `EXPLAIN [ANALYZE]` | done |
 | Write-ahead log, checkpoints and crash recovery | done |
 | Cost-based optimizer: index scans, statistics, join ordering, subquery decorrelation | done |
+| Index-only scans | done |
+| Query advisor and error doctor | done |
 | HTTP / WebSocket API: sessions, live event stream, crash demo | done |
-| 2D visualizer: B+trees, pages, log, plans, crash demo | done |
-| 3D crystal vault | done |
+| Web UI: guided course, playground, plan flow, advisor, 2D and 3D views, crash demo | done |
 
 ## SQL support
 
@@ -122,6 +123,34 @@ The binder's plan is correct but naive; the optimizer rewrites it into a cheaper
    `UPDATE` and `DELETE` find their rows the same way.
 4. **Join ordering.** A cluster of inner joins is re-planned by dynamic programming over subsets of
    tables (the System R approach), choosing the order and each hash join's build side by estimated cost.
+5. **Index-only scans.** The columns each operator reads are pushed down from the root. A scan through
+   a secondary index whose entries already hold all of them (an entry is the index columns plus the
+   primary key) builds its rows from the index alone and never reads the table: `IndexOnlyScan` in
+   `EXPLAIN`.
+
+## Query advisor and error doctor
+
+Every traced statement (`Database.execute(sql, trace=True)`, which the API server uses) comes back with
+`advice`: findings read from the final plan, the actual row count of every operator and the statement
+itself. Each finding has a level (`warn`, `tip`, `good`), the plan operator it is about and, where the
+remedy is clear, a fix: a statement to run first or the statement rewritten.
+
+| Finding | Fix |
+|---|---|
+| A full scan keeps a small share of a large table | `CREATE INDEX` on the filtered columns, extended to cover the other columns read when that makes the query index-only; suggested only when the estimated pages beat the scan |
+| An index exists but the optimizer, without statistics, chose a scan | `ANALYZE` |
+| Rows fetched one by one through an index for one or two missing columns | a covering index |
+| Estimates far from the actual rows, or statistics out of date | `ANALYZE` |
+| `= NULL` / `!= NULL` | rewritten to `IS [NOT] NULL` |
+| `UNION` where `UNION ALL` may do | rewritten |
+| Cartesian products, non-equality nested loops, correlated subqueries that still run per row, a column hidden inside an expression, leading-wildcard `LIKE`, `NOT IN (subquery)` and its NULL trap, `HAVING` without aggregates, large `OFFSET`, sorts that spill, `UPDATE` / `DELETE` without `WHERE` | explained |
+
+A failed statement gets a diagnosis from the error doctor (`engine/doctor.py`): misspelled tables,
+columns, functions, types and keywords (`SELCT`, `FORM`, `WHRE`), text in double quotes, a missing or
+trailing comma, `==`, unclosed quotes and parentheses, a missing `FROM`, curly quotes pasted from a
+document, a column missing from `GROUP BY`. It returns a plain explanation, the characters at fault and,
+when the intent is clear, the corrected SQL. In a script, the statements before the failing one have
+already run, so the server also returns what to run now: the corrected script from the failing statement on.
 
 `ANALYZE` collects the statistics behind the estimates: row counts, distinct values, NULL counts,
 most common values and equi-depth histograms. `EXPLAIN` shows the estimated rows of every operator and
@@ -167,6 +196,26 @@ A crash at any moment therefore leaves either the state before a transaction or 
 never a mix.
 
 ## Web UI
+
+Two modes share one screen: the database in the middle, an inspector on the right.
+
+- **Learn**: nine short lessons (B+trees, growth and merges, indexes, the buffer pool, the optimizer, the
+  query advisor, transactions, the log, crash recovery). Every step runs real SQL on your own database and
+  checks what the engine actually did (nodes visited, pages read, splits, log frames) before moving on.
+- **Play**: an editor with syntax highlighting, name completion and errors underlined, example queries,
+  and challenges judged from what the engine really did.
+
+The inspector explains every statement:
+
+- **What happened**: the run as plain sentences, each with the reason it matters.
+- **Plan flow**: the plan as a diagram under PostgreSQL's operator names (Seq Scan, Index Only Scan, Hash
+  Semi Join, HashAggregate...). Rows flow up edges drawn to scale, each operator shows actual and
+  estimated rows (flagged when they differ tenfold), and a bar shows its own share of the time. Click an
+  operator for what it does; expand to full screen.
+- **Advisor**: a health grade and the findings above. One click applies a fix and measures the statement
+  before and after: pages read, tree nodes visited, time and access path.
+- **Doctor**: on an error, the explanation, the change as a diff, and a button that applies it and runs.
+- Results, the page map, the write-ahead log and the raw event stream.
 
 The 2D view shows the engine working as you run SQL:
 
@@ -344,7 +393,9 @@ arcanum/
     binder.py      name resolution and type checking
     expr.py        typed expressions, operators and functions
     plan.py        plan nodes and EXPLAIN output
-    optimizer.py   decorrelation, pushdown, access paths, join ordering, estimates
+    optimizer.py   decorrelation, pushdown, access paths, join ordering, index-only scans, estimates
+    advisor.py     findings and fixes from a finished plan
+    doctor.py      diagnoses and corrections for failed statements
     executor.py    iterator-model operators, external sort
   server/
     app.py         FastAPI routes and WebSocket
@@ -355,7 +406,35 @@ web/
     App.tsx        session, layout, crash demo
     feed.ts        WebSocket event stream and playback
     layout.ts      B+tree layout
-    components/    tree, pages, log, events, query console, plan, crash dialog
+    components/    shell, inspector, tree, pages, log, events, results, crash dialog
+    learn/         lessons, challenges, progress, editor
+    flow/          the plan flow diagram and operator names
+    advisor/       advisor findings and before/after comparison
+    explain/       plain-language account of a run
     vault/         the 3D view: crystal tree, page floor, log river, camera and glow
 tests/
 ```
+
+## Roadmap
+
+Arcanum aims to be the clearest way to see how a database works from the inside. Next:
+
+- **MVCC and concurrent sessions**: snapshot isolation with row versions, two sessions side by side, and
+  the version chains drawn in the tree.
+- **Lock manager and deadlock visualizer**: lock queues per row and table, a waits-for graph, and the
+  victim the detector picks.
+- **An LSM-tree engine beside the B+tree**: memtable, flushes and compaction, with the same workload
+  replayed on both to compare write and read amplification.
+- **Time travel**: a scrubber over a statement's event stream to step backwards and forwards through
+  every page read, split and log append.
+- **Replication**: a Raft-replicated log across three engines, with leader election, network partitions
+  and catch-up you can trigger.
+- **Buffer pool policies**: LRU, Clock and 2Q on the same workload, with their hit rates over time.
+- **Overflow pages** for rows larger than a page, and **TOAST-style** compression.
+- **Merge join and sort-order awareness**: indexes that satisfy `ORDER BY`, and an optimizer that costs
+  index-only scans when choosing access paths.
+- **More advisor rules**: unused and duplicate indexes, an index advisor over a whole workload, and
+  rewrites for `OR` across indexed columns.
+- **Sharing**: permalinks to a database snapshot and a query, CSV import, and a classroom mode where a
+  teacher's statements appear live on every student's screen.
+- **Benchmarks**: a TPC-H-style dataset generator and a mode that charts a query's cost as the data grows.

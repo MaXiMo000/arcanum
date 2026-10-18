@@ -13,6 +13,25 @@ export interface PlanNode {
   subplans: { kind: string; correlated: boolean; plan: PlanNode }[];
 }
 
+/** A statement to run first (CREATE INDEX, ANALYZE), or the statement rewritten. */
+export interface AdviceFix {
+  kind: "run" | "rewrite";
+  sql: string;
+  label: string;
+  original?: string;
+}
+
+/** One finding of the query advisor (arcanum/engine/advisor.py). */
+export interface Advice {
+  level: "warn" | "tip" | "good";
+  code: string;
+  title: string;
+  detail: string;
+  /** The plan node it is about. */
+  node: number | null;
+  fix: AdviceFix | null;
+}
+
 export interface QueryResult {
   columns: string[];
   rows: Value[][];
@@ -21,6 +40,43 @@ export interface QueryResult {
   rowcount: number;
   status: string;
   plan: PlanNode | null;
+  advice: Advice[];
+  /** The statement's own text within the script. */
+  statement: string;
+}
+
+/** What the engine did for one request (counted exactly on the server). */
+export interface QueryStats {
+  elapsed_ms: number;
+  cache_hits: number;
+  disk_reads: number;
+  nodes_visited: number;
+  pages_written: number;
+  pages_allocated: number;
+  pages_freed: number;
+  evictions: number;
+  splits: number;
+  merges: number;
+  root_grew: number;
+  root_shrank: number;
+  log_frames: number;
+  commits: number;
+  checkpoints: number;
+  rollbacks: number;
+  sort_spills: number;
+}
+
+/** The error doctor's diagnosis (arcanum/engine/doctor.py). */
+export interface Doctor {
+  hint: string;
+  /** The whole script, corrected. */
+  fix: string | null;
+  fix_label: string | null;
+  /** The corrected script from the failing statement on: what to run now. */
+  rerun?: string;
+  /** Characters at fault, as offsets into the script. */
+  pos: number | null;
+  end: number | null;
 }
 
 export interface ApiErrorBody {
@@ -28,6 +84,9 @@ export interface ApiErrorBody {
   message: string;
   line?: number;
   column?: number;
+  /** Statements before the failing one, which did run. */
+  completed?: number;
+  doctor?: Doctor;
 }
 
 export interface TreeNode {
@@ -142,7 +201,8 @@ const sessionPath = (id: string) => `/sessions/${encodeURIComponent(id)}`;
 
 export const api = {
   createSession: () => call<SessionInfo>("POST", "/sessions"),
-  query: (id: string, sql: string) => call<{ results: QueryResult[] }>("POST", `${sessionPath(id)}/query`, { sql }),
+  query: (id: string, sql: string) =>
+    call<{ results: QueryResult[]; stats: QueryStats }>("POST", `${sessionPath(id)}/query`, { sql }),
   state: (id: string) => call<EngineState>("GET", `${sessionPath(id)}/state`),
   crash: (id: string, duringWrite: boolean) =>
     call<CrashSummary>("POST", `${sessionPath(id)}/crash`, { during_write: duringWrite }),
