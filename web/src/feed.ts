@@ -6,6 +6,9 @@ import { describeEvent, type Tone } from "./events";
 
 export type Speed = "instant" | "normal" | "slow";
 const EVENTS_PER_SECOND: Record<Exclude<Speed, "instant">, number> = { normal: 120, slow: 4 };
+// At normal speed a long backlog (a bulk insert, the crash demo) is played faster, so the view never
+// trails the engine by more than about this many seconds. Slow motion stays slow.
+const NORMAL_CATCH_UP_SECONDS = 3;
 export const FLASH_MS: Record<Speed, number> = { instant: 500, normal: 700, slow: 1800 };
 const MAX_QUEUE = 50_000;
 const MAX_LOG = 300;
@@ -46,7 +49,7 @@ export interface Counters {
   checkpoints: number;
 }
 
-interface FeedState {
+export interface FeedState {
   nodeFlash: Map<number, Flash>;
   pageFlash: Map<number, Flash>;
   wal: WalFrame[];
@@ -177,7 +180,11 @@ export function useEngineFeed(sessionId: string | null, onSessionGone: () => voi
         while (queue.current.length) apply(queue.current.shift()!);
         budget = 0;
       } else {
-        budget = Math.min(budget + ((now - last) / 1000) * EVENTS_PER_SECOND[current], 500);
+        const rate =
+          current === "normal"
+            ? Math.max(EVENTS_PER_SECOND.normal, queue.current.length / NORMAL_CATCH_UP_SECONDS)
+            : EVENTS_PER_SECOND[current];
+        budget = Math.min(budget + ((now - last) / 1000) * rate, Math.max(500, rate));
         while (budget >= 1 && queue.current.length) {
           apply(queue.current.shift()!);
           budget -= 1;

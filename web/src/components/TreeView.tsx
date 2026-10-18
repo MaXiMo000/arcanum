@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Tree } from "../api";
 import type { Flash } from "../feed";
 import { NODE_HEIGHT, layoutTree } from "../layout";
+import { TreeCaption, TreeTabs, pickTree, visibleKeyColumns } from "./TreeTabs";
 
 interface Props {
   trees: Tree[];
@@ -19,7 +20,7 @@ export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs }: Prop
   const scroller = useRef<HTMLDivElement>(null);
   const [available, setAvailable] = useState(800);
   const rootCentreRef = useRef(0);
-  const tree = trees.find((t) => t.name === selected) ?? trees.find((t) => t.kind === "table") ?? trees[0];
+  const tree = pickTree(trees, selected);
   const hasTree = tree !== undefined;
 
   useEffect(() => {
@@ -31,9 +32,7 @@ export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs }: Prop
     return () => observer.disconnect();
   }, [hasTree]);
 
-
-  const tableKey = tree?.kind === "index" ? trees.find((t) => t.name === tree.table)?.key_columns.length ?? 0 : 0;
-  const visibleColumns = tree ? Math.max(1, tree.key_columns.length - tableKey) : 1;
+  const visibleColumns = tree ? visibleKeyColumns(trees, tree) : 1;
   const layout = useMemo(() => (tree ? layoutTree(tree, visibleColumns) : null), [tree, visibleColumns]);
 
   // When the tree is wider than the panel, keep its root in view: scroll to centre it whenever the
@@ -47,36 +46,18 @@ export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs }: Prop
   if (!tree || !layout) return <section className="panel tree-panel" aria-label="B+tree" />;
 
   const now = performance.now();
-  const leaves = tree.nodes.filter((n) => n.leaf);
   const levels = Math.max(...layout.nodes.map((p) => p.depth)) + 1;
-  const keys = leaves.reduce((sum, n) => sum + n.keys.length, 0);
   const margin = MARGIN;
   const fullWidth = layout.width + margin * 2;
   // Fit shrinks wide trees, but never below the size where keys stay readable; past that it scrolls.
   const scale = zoom === "fit" ? Math.min(1.25, Math.max(0.5, (available - 4) / fullWidth)) : zoom;
   const root = layout.nodes.find((p) => p.node.page === tree.root);
-  const rootCentre = root ? (root.x + root.width / 2 + margin) * scale : 0;
-  rootCentreRef.current = rootCentre;
+  rootCentreRef.current = root ? (root.x + root.width / 2 + margin) * scale : 0;
 
   return (
     <section className="panel tree-panel" aria-label="B+tree">
       <header className="panel-head">
-        <div className="tabs" role="tablist" aria-label="Trees">
-          {trees
-            .filter((t) => t.kind !== "catalog")
-            .map((t) => (
-              <button
-                key={t.name}
-                role="tab"
-                aria-selected={t.name === tree.name}
-                className={`tab ${t.name === tree.name ? "active" : ""}`}
-                onClick={() => onSelect(t.name)}
-              >
-                {t.name}
-                <span className="tab-kind">{t.kind === "index" ? "index" : "table"}</span>
-              </button>
-            ))}
-        </div>
+        <TreeTabs trees={trees} current={tree} onSelect={onSelect} />
         <div className="zoom" role="group" aria-label="Zoom">
           <button className={`chip ${zoom === "fit" ? "active" : ""}`} onClick={() => setZoom("fit")}>
             Fit
@@ -88,11 +69,7 @@ export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs }: Prop
           ))}
         </div>
       </header>
-      <p className="tree-caption">
-        <strong>{tree.name}</strong> keyed by <code>{tree.key_columns.slice(0, visibleColumns).join(", ")}</code> ·{" "}
-        {levels} {levels === 1 ? "level" : "levels"} · {tree.nodes.length} nodes · {leaves.length} leaves · {keys} keys
-        {tree.truncated && " · showing the first nodes only"}
-      </p>
+      <TreeCaption tree={tree} visibleColumns={visibleColumns} levels={levels} />
       <div className="tree-scroll" ref={scroller}>
         <svg
           className="tree-svg"

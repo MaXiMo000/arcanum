@@ -1,6 +1,10 @@
 import type { Connection, Speed } from "../feed";
 
+export type View = "2d" | "3d";
+
 interface Props {
+  view: View;
+  onView: (view: View) => void;
   speed: Speed;
   onSpeed: (speed: Speed) => void;
   connection: Connection;
@@ -17,7 +21,7 @@ const SPEEDS: { value: Speed; label: string; hint: string }[] = [
   { value: "slow", label: "Slow motion", hint: "Replay a few events per second" },
 ];
 
-export function Header({ speed, onSpeed, connection, inTransaction, onCrash, crashDisabled, theme, onTheme }: Props) {
+export function Header({ view, onView, speed, onSpeed, connection, inTransaction, onCrash, crashDisabled, theme, onTheme }: Props) {
   return (
     <header className="app-header">
       <div className="brand">
@@ -45,6 +49,20 @@ export function Header({ speed, onSpeed, connection, inTransaction, onCrash, cra
             transaction open
           </span>
         )}
+        <div className="segmented" role="radiogroup" aria-label="View">
+          {(["2d", "3d"] as const).map((v) => (
+            <button
+              key={v}
+              role="radio"
+              aria-checked={view === v}
+              aria-label={v === "2d" ? "2D view" : "3D view"}
+              className={view === v ? "active" : ""}
+              onClick={() => onView(v)}
+            >
+              {v.toUpperCase()}
+            </button>
+          ))}
+        </div>
         <div className="segmented" role="radiogroup" aria-label="Playback speed">
           {SPEEDS.map((s) => (
             <button

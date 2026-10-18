@@ -19,6 +19,9 @@ export default defineConfig(({ mode }) => {
     build: {
       sourcemap: false,
       assetsInlineLimit: 0, // keep every asset a separate file, so the strict CSP needs no data: scripts
+      // The 3D view is one lazily loaded chunk of about 1 MB (three.js cannot be tree-shaken under
+      // React Three Fiber); the main bundle stays small.
+      chunkSizeWarningLimit: 1100,
     },
   };
 });

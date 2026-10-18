@@ -68,7 +68,7 @@ with Database("company.db") as db:
 | Cost-based optimizer: index scans, statistics, join ordering, subquery decorrelation | done |
 | HTTP / WebSocket API: sessions, live event stream, crash demo | done |
 | 2D visualizer: B+trees, pages, log, plans, crash demo | done |
-| 3D visualizer | next |
+| 3D crystal vault | done |
 
 ## SQL support
 
@@ -182,6 +182,14 @@ The 2D view shows the engine working as you run SQL:
   replay the log, with a check that every acknowledged row came back.
 - Playback at full speed, normal speed or slow motion, a light and a dark theme, and a layout that works
   down to phone width.
+
+Switch to **3D** for the crystal vault: the selected tree hangs like a chandelier of glowing crystals
+(the root at the centre, each level on a wider ring, keys in order around it), a query's descent sends
+sparks from node to node, splits flare, the pages of the file form a floor that lights up as they are read
+and written, and the write-ahead log spirals down beside it until a checkpoint pours it into the floor.
+Pulling the plug blows the crystals apart until recovery reassembles them. Hover anything for its page and
+keys; drag to orbit. The 3D view is a separate download (three.js), fetched only when it is first opened,
+and falls back to 2D where WebGL is unavailable.
 
 Run it in development (two terminals):
 
@@ -320,5 +328,6 @@ web/
     feed.ts        WebSocket event stream and playback
     layout.ts      B+tree layout
     components/    tree, pages, log, events, query console, plan, crash dialog
+    vault/         the 3D view: crystal tree, page floor, log river, camera and glow
 tests/
 ```

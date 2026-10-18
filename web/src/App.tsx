@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, type CrashSummary, type EngineState } from "./api";
 import { CrashOverlay } from "./components/CrashOverlay";
 import { EventLog } from "./components/EventLog";
-import { Header } from "./components/Header";
+import { Header, type View } from "./components/Header";
 import { PageMap } from "./components/PageMap";
 import { QueryPanel } from "./components/QueryPanel";
 import { TreeView } from "./components/TreeView";
@@ -11,6 +11,10 @@ import { FLASH_MS, useEngineFeed } from "./feed";
 
 const SESSION_KEY = "arcanum.session";
 const THEME_KEY = "arcanum.theme";
+const VIEW_KEY = "arcanum.view";
+
+// The 3D view (three.js) is a separate download, fetched the first time someone opens it.
+const Vault = lazy(() => import("./vault/Vault"));
 
 function readStorage(storage: () => Storage, key: string): string | null {
   try {
@@ -29,6 +33,11 @@ function writeStorage(storage: () => Storage, key: string, value: string | null)
   }
 }
 
+/** The tree shown until the viewer picks one; fixed once, so tables created later do not steal the view. */
+function firstTable(state: EngineState): string | null {
+  return state.trees.find((t) => t.kind === "table")?.name ?? null;
+}
+
 const session = () => window.sessionStorage;
 const local = () => window.localStorage;
 
@@ -36,10 +45,11 @@ export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [state, setState] = useState<EngineState | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
-  const [selectedTree, setSelectedTree] = useState<string | null>(null); // null: the first table
+  const [selectedTree, setSelectedTree] = useState<string | null>(null); // set to the first table on load
   const [crashOpen, setCrashOpen] = useState(false);
   const [crashSummary, setCrashSummary] = useState<CrashSummary | null>(null);
   const [crashError, setCrashError] = useState<string | null>(null);
+  const [view, setView] = useState<View>(() => (readStorage(local, VIEW_KEY) === "3d" ? "3d" : "2d"));
   const [theme, setTheme] = useState<"light" | "dark">(() => {
     const saved = readStorage(local, THEME_KEY);
     if (saved === "light" || saved === "dark") return saved;
@@ -90,6 +100,7 @@ export default function App() {
         idRef.current = saved;
         setSessionId(saved);
         setState(current);
+        setSelectedTree((name) => name ?? firstTable(current));
         return;
       } catch (e) {
         if (!(e instanceof ApiError) || e.status !== 404) {
@@ -103,7 +114,9 @@ export default function App() {
       writeStorage(session, SESSION_KEY, created.id);
       idRef.current = created.id;
       setSessionId(created.id);
-      setState(await api.state(created.id));
+      const fresh = await api.state(created.id);
+      setState(fresh);
+      setSelectedTree((name) => name ?? firstTable(fresh));
     } catch (e) {
       setStartError(e instanceof ApiError ? e.message : "the server cannot be reached");
     }
@@ -117,6 +130,9 @@ export default function App() {
     document.documentElement.dataset.theme = theme;
     writeStorage(local, THEME_KEY, theme);
   }, [theme]);
+
+  useEffect(() => writeStorage(local, VIEW_KEY, view), [view]);
+  const use2d = useCallback(() => setView("2d"), []);
 
   const onSessionGone = useCallback(() => {
     writeStorage(session, SESSION_KEY, null);
@@ -199,6 +215,8 @@ export default function App() {
   return (
     <>
       <Header
+        view={view}
+        onView={setView}
         speed={speed}
         onSpeed={setSpeed}
         connection={connection}
@@ -213,7 +231,20 @@ export default function App() {
           <QueryPanel disabled={!state} maxSqlBytes={state?.limits.max_sql_bytes ?? null} onRun={runQuery} />
         </div>
         <div className="column center">
-          {state ? (
+          {state && view === "3d" ? (
+            <Suspense fallback={<section className="panel tree-panel loading">Loading the 3D view…</section>}>
+              <Vault
+                trees={state.trees}
+                selected={selectedTree}
+                onSelect={setSelectedTree}
+                feed={feed}
+                flashMs={flashMs}
+                state={state}
+                owners={owners}
+                onUnavailable={use2d}
+              />
+            </Suspense>
+          ) : state ? (
             <TreeView
               trees={state.trees}
               selected={selectedTree}

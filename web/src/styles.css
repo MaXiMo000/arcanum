@@ -1113,3 +1113,43 @@ td.null {
     transition-duration: 1ms !important;
   }
 }
+
+/* ---- 3D vault ------------------------------------------------------------------------------- */
+
+.vault-stage {
+  position: relative;
+  height: min(72vh, 680px);
+  min-height: 360px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #060912; /* the vault is dark in both themes, so its glow reads */
+  touch-action: none; /* drags orbit the camera instead of scrolling the page */
+}
+
+.vault-tooltip {
+  position: absolute;
+  z-index: 2;
+  max-width: 320px;
+  padding: 6px 9px;
+  border-radius: 7px;
+  background: rgb(10 14 24 / 92%);
+  border: 1px solid rgb(255 255 255 / 14%);
+  color: #e8ecf5;
+  font: 12px/1.4 var(--mono);
+  pointer-events: none;
+  overflow-wrap: anywhere;
+}
+
+.vault-hint {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  margin: 0;
+  color: rgb(220 228 245 / 55%);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.vault-panel > p {
+  margin: 0 0 10px;
+}
