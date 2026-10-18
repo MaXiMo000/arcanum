@@ -18,3 +18,7 @@ dist/
 
 # Write-ahead logs of databases left open by a crash
 *.db-wal
+
+# Web UI build output and dependencies
+web/node_modules/
+web/dist/

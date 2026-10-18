@@ -67,6 +67,7 @@ with Database("company.db") as db:
 | Write-ahead log, checkpoints and crash recovery | done |
 | Cost-based optimizer: index scans, statistics, join ordering, subquery decorrelation | done |
 | HTTP / WebSocket API: sessions, live event stream, crash demo | done |
+| 2D visualizer: B+trees, pages, log, plans, crash demo | done |
 | 3D visualizer | next |
 
 ## SQL support
@@ -145,6 +146,43 @@ Arcanum keeps a write-ahead log next to the database file (`<name>-wal`):
 
 A crash at any moment therefore leaves either the state before a transaction or the state after it,
 never a mix.
+
+## Web UI
+
+The 2D view shows the engine working as you run SQL:
+
+- **B+trees** of every table and index: nodes light up as a query visits them and slide into place
+  when they split or merge.
+- **Pages**: every page of the file, coloured by the tree that owns it, marked when it is in the buffer
+  pool or changed but not yet written, and flashing on each cache hit, disk read and write.
+- **Write-ahead log**: frames appear as they are appended, turn solid when the log is fsynced, and clear
+  at each checkpoint.
+- **Query plans** with the optimizer's estimated rows next to the real ones, results, and SQL errors
+  pointing at the exact column.
+- **Pull the plug**: watch committed transactions stream in, the engine get killed mid-write, and recovery
+  replay the log, with a check that every acknowledged row came back.
+- Playback at full speed, normal speed or slow motion, a light and a dark theme, and a layout that works
+  down to phone width.
+
+Run it in development (two terminals):
+
+```bash
+python -m arcanum.server
+```
+
+```bash
+cd web && npm install && npm run dev
+```
+
+Then open http://localhost:5173. For production, build once and let the API server serve it from the same
+origin at http://127.0.0.1:8000:
+
+```bash
+cd web && npm ci && npm run build
+```
+
+The UI has no runtime dependencies beyond React, loads nothing from other origins, and runs under a strict
+Content Security Policy.
 
 ## API server
 
@@ -257,5 +295,11 @@ arcanum/
     app.py         FastAPI routes and WebSocket
     sessions.py    session and worker-process management, crash demo
     worker.py      the engine process behind each session
+web/
+  src/
+    App.tsx        session, layout, crash demo
+    feed.ts        WebSocket event stream and playback
+    layout.ts      B+tree layout
+    components/    tree, pages, log, events, query console, plan, crash dialog
 tests/
 ```
