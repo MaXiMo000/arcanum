@@ -8,6 +8,7 @@ any crash, so committed data survives.
 """
 
 import asyncio
+import contextlib
 import json
 import multiprocessing
 import os
@@ -21,6 +22,12 @@ from pathlib import Path
 from .worker import MAX_MESSAGE_BYTES, receive, send, worker_main
 
 STARTUP_TIMEOUT = 60
+# The crash demo commits batches of rows and pulls the plug after a random number of them,
+# a few milliseconds into the next transaction.
+CRASH_ROWS_PER_BATCH = 25
+CRASH_COMMITS_BEFORE_KILL = (2, 6)
+CRASH_DELAY_SECONDS = 0.01
+CRASH_MAX_BATCHES = 1000
 SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{24}$")  # secrets.token_urlsafe(18)
 SESSION_FILE = re.compile(r"^[A-Za-z0-9_-]{24}\.db(-wal)?$")
 
@@ -108,9 +115,9 @@ class Session:
             send(self.conn, message)
             if self.conn.poll(timeout):
                 return receive(self.conn)
-        except (EOFError, OSError, ValueError):
+        except (EOFError, OSError, ValueError) as e:
             self.restart("worker_lost")
-            raise SessionError(500, "WorkerLost", "the database worker stopped unexpectedly and was restarted")
+            raise SessionError(500, "WorkerLost", "the database worker stopped unexpectedly and was restarted") from e
         self.restart("timeout")
         raise SessionError(408, "QueryTimeout",
                            f"the statement ran longer than {timeout:g} seconds and was stopped; "
@@ -147,7 +154,7 @@ class Session:
     async def _slot(self):
         try:
             await asyncio.wait_for(self.slots.acquire(), self.settings.queue_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise SessionError(503, "ServerBusy", "the server is busy; try again shortly") from None
 
     async def request(self, message, timeout=None):
@@ -170,11 +177,11 @@ class Session:
                 self.slots.release()
 
     def _crash(self, during_write):
-        rows_per_batch, committed = 25, None
+        rows_per_batch, committed = CRASH_ROWS_PER_BATCH, None
         if during_write:
             # Let a few transactions commit, then kill the worker while it is inside the next one.
-            target = random.randint(2, 6)
-            send(self.conn, {"op": "workload", "batches": 1000, "rows_per_batch": rows_per_batch})
+            target = random.randint(*CRASH_COMMITS_BEFORE_KILL)
+            send(self.conn, {"op": "workload", "batches": CRASH_MAX_BATCHES, "rows_per_batch": rows_per_batch})
             while committed is None or committed["committed_batches"] < target:
                 if not self.conn.poll(self.settings.query_timeout):
                     break
@@ -182,7 +189,7 @@ class Session:
                 if not message.get("progress"):
                     break  # the workload stopped (for example, the database is full)
                 committed = message
-            time.sleep(random.uniform(0, 0.01))
+            time.sleep(random.uniform(0, CRASH_DELAY_SECONDS))
         self.broadcast([{"kind": "crash", "during_write": during_write}])
         self.kill()
         self.start()  # opening the database replays the log
@@ -263,10 +270,8 @@ class SessionManager:
             subscriber.close()
         await session.close()
         for suffix in ("", "-wal"):
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.remove(f"{session.path}{suffix}")
-            except FileNotFoundError:
-                pass
 
     async def reap(self, force_oldest=False):
         """Close sessions idle longer than the TTL; optionally also the least recently used one."""

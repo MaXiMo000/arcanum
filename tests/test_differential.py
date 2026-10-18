@@ -43,7 +43,10 @@ def _literal(v):
 
 def _data():
     r = random.Random(2024)
-    maybe = lambda value, p=0.15: None if r.random() < p else value  # noqa: E731
+
+    def maybe(value, p=0.15):
+        return None if r.random() < p else value
+
     rows = {"dept": [], "emp": [], "sales": [], "tags": []}
     for d in DEPTS:
         rows["dept"].append((d, maybe(r.randrange(50, 500) * 1000), maybe(r.randint(1, 9))))

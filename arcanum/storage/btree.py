@@ -20,6 +20,7 @@ Node page layout (little-endian):
 
 import struct
 from bisect import bisect_left, bisect_right
+from itertools import pairwise
 
 from .pager import PAGE_SIZE, CorruptDatabaseError
 
@@ -34,12 +35,35 @@ CAPACITY = PAGE_SIZE - _NODE.size
 MAX_ENTRY = CAPACITY // 4
 
 
+def _decode_node(page, data):
+    """(leaf, keys, values, children, next leaf) of a node page, as tuples."""
+    kind, count, link = _NODE.unpack_from(data)
+    if kind not in (LEAF, INTERNAL):
+        raise CorruptDatabaseError(f"page {page} is not a B+tree node")
+    keys, values, children = [], [], [link]
+    pos = _NODE.size
+    for _ in range(count):
+        (key_len,) = _U16.unpack_from(data, pos)
+        keys.append(data[pos + 2:pos + 2 + key_len])
+        pos += 2 + key_len
+        if kind == LEAF:
+            (value_len,) = _U16.unpack_from(data, pos)
+            values.append(data[pos + 2:pos + 2 + value_len])
+            pos += 2 + value_len
+        else:
+            children.append(_U32.unpack_from(data, pos)[0])
+            pos += 4
+    if kind == LEAF:
+        return True, tuple(keys), tuple(values), (), link
+    return False, tuple(keys), (), tuple(children), 0
+
+
 class DuplicateKeyError(KeyError):
     pass
 
 
 class Node:
-    __slots__ = ("page", "leaf", "keys", "values", "children", "next_leaf")
+    __slots__ = ("children", "keys", "leaf", "next_leaf", "page", "values")
 
     def __init__(self, page, leaf, keys=None, values=None, children=None, next_leaf=0):
         self.page = page
@@ -51,7 +75,7 @@ class Node:
 
     def entry_sizes(self):
         if self.leaf:
-            return [4 + len(k) + len(v) for k, v in zip(self.keys, self.values)]
+            return [4 + len(k) + len(v) for k, v in zip(self.keys, self.values, strict=True)]
         return [6 + len(k) for k in self.keys]
 
     def size(self):
@@ -100,7 +124,7 @@ class BTree:
             node = self._load(node.children[0 if lo is None else bisect_right(node.keys, lo)])
         i = 0 if lo is None else (bisect_left if lo_inclusive else bisect_right)(node.keys, lo)
         while True:
-            for key, value in zip(node.keys[i:], node.values[i:]):
+            for key, value in zip(node.keys[i:], node.values[i:], strict=True):
                 if hi is not None and (key > hi or (key == hi and not hi_inclusive)):
                     return
                 yield key, value
@@ -227,7 +251,7 @@ class BTree:
             merged = Node(left.page, True, left.keys + right.keys, left.values + right.values,
                           next_leaf=right.next_leaf)
         else:
-            merged = Node(left.page, False, left.keys + [parent.keys[s]] + right.keys,
+            merged = Node(left.page, False, [*left.keys, parent.keys[s], *right.keys],
                           children=left.children + right.children)
         if self._fits(merged):
             del parent.keys[s], parent.children[s + 1]
@@ -299,36 +323,33 @@ class BTree:
 
     def _parse(self, page, read):
         data = read(page)
-        kind, count, link = _NODE.unpack_from(data)
-        if kind not in (LEAF, INTERNAL):
-            raise CorruptDatabaseError(f"page {page} is not a B+tree node")
-        keys, values, children = [], [], [link]
-        pos = _NODE.size
-        for _ in range(count):
-            (key_len,) = _U16.unpack_from(data, pos)
-            keys.append(data[pos + 2:pos + 2 + key_len])
-            pos += 2 + key_len
-            if kind == LEAF:
-                (value_len,) = _U16.unpack_from(data, pos)
-                values.append(data[pos + 2:pos + 2 + value_len])
-                pos += 2 + value_len
-            else:
-                children.append(_U32.unpack_from(data, pos)[0])
-                pos += 4
-        if kind == LEAF:
-            return Node(page, True, keys, values, next_leaf=link)
-        return Node(page, False, keys, children=children)
+        cached = self.pager.decoded.get(page)
+        if cached is not None and cached[0] is data:
+            leaf, keys, values, children, link = cached[1]
+        else:
+            leaf, keys, values, children, link = _decode_node(page, data)
+            self.pager.decoded[page] = (data, (leaf, keys, values, children, link))
+        # Callers change nodes in place, so each gets its own lists; copying is far cheaper than decoding.
+        if leaf:
+            return Node(page, True, list(keys), list(values), next_leaf=link)
+        return Node(page, False, list(keys), children=list(children))
 
     def _store(self, node):
         if node.leaf:
             parts = [_NODE.pack(LEAF, len(node.keys), node.next_leaf)]
-            for key, value in zip(node.keys, node.values):
+            for key, value in zip(node.keys, node.values, strict=True):
                 parts += (_U16.pack(len(key)), key, _U16.pack(len(value)), value)
         else:
             parts = [_NODE.pack(INTERNAL, len(node.keys), node.children[0])]
-            for key, child in zip(node.keys, node.children[1:]):
+            for key, child in zip(node.keys, node.children[1:], strict=True):
                 parts += (_U16.pack(len(key)), key, _U32.pack(child))
-        self.pager.write(node.page, b"".join(parts))
+        stored = self.pager.write(node.page, b"".join(parts))
+        # The node is already decoded: record it, so the next visit skips decoding the bytes just written.
+        if node.leaf:
+            decoded = (True, tuple(node.keys), tuple(node.values), (), node.next_leaf)
+        else:
+            decoded = (False, tuple(node.keys), (), tuple(node.children), 0)
+        self.pager.decoded[node.page] = (stored, decoded)
 
     # ---- checking ------------------------------------------------------------
 
@@ -347,7 +368,7 @@ class BTree:
         def walk(page, lo, hi, depth):
             node = self._load(page)
             keys = node.keys
-            expect(all(a < b for a, b in zip(keys, keys[1:])), f"page {page}: keys not strictly increasing")
+            expect(all(a < b for a, b in pairwise(keys)), f"page {page}: keys not strictly increasing")
             expect(all((lo is None or k >= lo) and (hi is None or k < hi) for k in keys),
                    f"page {page}: key outside the range its parent allows")
             expect(self._fits(node), f"page {page}: node is over capacity")
@@ -362,7 +383,7 @@ class BTree:
 
         walk(self.root, None, None, 0)
         expect(len({depth for _, depth in leaves}) == 1, "leaves are at different depths")
-        for (a, _), (b, _) in zip(leaves, leaves[1:]):
+        for (a, _), (b, _) in pairwise(leaves):
             expect(a.next_leaf == b.page, f"leaf {a.page} links to {a.next_leaf}, expected {b.page}")
         expect(leaves[-1][0].next_leaf == 0, "last leaf links to another page")
         return sum(len(node.keys) for node, _ in leaves)

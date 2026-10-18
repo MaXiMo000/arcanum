@@ -61,7 +61,7 @@ SELECT n, a FROM fib;`,
   {
     label: "Delete new rows",
     hint: "Leaves empty out and merge",
-    sql: "DELETE FROM customers WHERE id > 24;",
+    sql: "DELETE FROM customers WHERE name LIKE 'New customer %';",
   },
   {
     label: "Rolled-back transaction",

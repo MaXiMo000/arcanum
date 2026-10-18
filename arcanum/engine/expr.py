@@ -20,7 +20,7 @@ def unify(a, b):
     """The common type of two types, or None if they cannot be mixed."""
     if a == NULL:
         return b
-    if b == NULL or a == b:
+    if b in (NULL, a):
         return a
     if a in NUMERIC and b in NUMERIC:
         return REAL
@@ -151,6 +151,21 @@ def contains(e, cls):
     return any(isinstance(node, cls) for node in walk(e))
 
 
+def conjuncts(e):
+    """The conditions of an AND chain, left to right."""
+    if isinstance(e, Op) and e.op == "AND":
+        return conjuncts(e.args[0]) + conjuncts(e.args[1])
+    return [e]
+
+
+def and_all(conditions):
+    """Join conditions with AND; None for no conditions."""
+    result = None
+    for c in conditions:
+        result = c if result is None else Op("AND", (result, c), BOOLEAN)
+    return result
+
+
 def shift(e, offset):
     """Move every Col reference by offset (used when rows are concatenated in joins)."""
     if isinstance(e, Col):
@@ -214,7 +229,7 @@ def format_expr(e):
     if e.op == "CAST":
         return f"CAST({args[0]} AS {e.type})"
     if e.op == "CASE":
-        whens = " ".join(f"WHEN {c} THEN {r}" for c, r in zip(args[:-1:2], args[1:-1:2]))
+        whens = " ".join(f"WHEN {c} THEN {r}" for c, r in zip(args[:-1:2], args[1:-1:2], strict=True))
         return f"CASE {whens} ELSE {args[-1]} END"
     return f"{e.op.lower()}({', '.join(args)})"
 

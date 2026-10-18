@@ -6,7 +6,7 @@ import { PlanView } from "./PlanView";
 
 interface Props {
   disabled: boolean;
-  maxSqlBytes: number;
+  maxSqlBytes: number | null;
   onRun: (sql: string) => Promise<QueryResult[]>;
 }
 
@@ -19,7 +19,7 @@ export function QueryPanel({ disabled, maxSqlBytes, onRun }: Props) {
   const [running, setRunning] = useState(false);
   const [elapsed, setElapsed] = useState<number | null>(null);
   const editor = useRef<HTMLTextAreaElement>(null);
-  const tooLong = new TextEncoder().encode(sql).length > maxSqlBytes;
+  const tooLong = maxSqlBytes !== null && new TextEncoder().encode(sql).length > maxSqlBytes;
 
   const run = async () => {
     if (running || disabled || tooLong || !sql.trim()) return;
@@ -97,7 +97,7 @@ export function QueryPanel({ disabled, maxSqlBytes, onRun }: Props) {
         </button>
         <span className="muted small" aria-live="polite">
           {tooLong
-            ? `SQL is limited to ${maxSqlBytes.toLocaleString()} bytes`
+            ? `SQL is limited to ${maxSqlBytes?.toLocaleString()} bytes`
             : elapsed !== null && !running
               ? `${elapsed.toFixed(0)} ms round trip`
               : ""}

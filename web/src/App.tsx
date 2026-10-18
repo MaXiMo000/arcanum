@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, type CrashSummary, type EngineState, type SessionInfo } from "./api";
+import { api, ApiError, type CrashSummary, type EngineState } from "./api";
 import { CrashOverlay } from "./components/CrashOverlay";
 import { EventLog } from "./components/EventLog";
 import { Header } from "./components/Header";
@@ -34,10 +34,9 @@ const local = () => window.localStorage;
 
 export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [limits, setLimits] = useState<SessionInfo["limits"] | null>(null);
   const [state, setState] = useState<EngineState | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
-  const [selectedTree, setSelectedTree] = useState("customers");
+  const [selectedTree, setSelectedTree] = useState<string | null>(null); // null: the first table
   const [crashOpen, setCrashOpen] = useState(false);
   const [crashSummary, setCrashSummary] = useState<CrashSummary | null>(null);
   const [crashError, setCrashError] = useState<string | null>(null);
@@ -104,7 +103,6 @@ export default function App() {
       writeStorage(session, SESSION_KEY, created.id);
       idRef.current = created.id;
       setSessionId(created.id);
-      setLimits(created.limits);
       setState(await api.state(created.id));
     } catch (e) {
       setStartError(e instanceof ApiError ? e.message : "the server cannot be reached");
@@ -212,7 +210,7 @@ export default function App() {
       />
       <main className="workspace">
         <div className="column left">
-          <QueryPanel disabled={!sessionId} maxSqlBytes={limits?.max_sql_bytes ?? 20_000} onRun={runQuery} />
+          <QueryPanel disabled={!state} maxSqlBytes={state?.limits.max_sql_bytes ?? null} onRun={runQuery} />
         </div>
         <div className="column center">
           {state ? (

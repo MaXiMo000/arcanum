@@ -54,6 +54,13 @@ export interface TableInfo {
   rows: number | null;
 }
 
+export interface Limits {
+  query_timeout: number;
+  max_rows: number;
+  max_pages: number;
+  max_sql_bytes: number;
+}
+
 export interface EngineState {
   tables: TableInfo[];
   trees: Tree[];
@@ -68,6 +75,7 @@ export interface EngineState {
   };
   wal: { committed_frames: number; uncommitted: boolean };
   in_transaction: boolean;
+  limits: Limits;
 }
 
 export interface EngineEvent {
@@ -91,7 +99,7 @@ export interface SessionInfo {
   id: string;
   recovered_frames: number;
   tables: TableInfo[];
-  limits: { query_timeout: number; max_rows: number; max_pages: number; max_sql_bytes: number };
+  limits: Limits;
 }
 
 export class ApiError extends Error {

@@ -21,3 +21,19 @@ include = ["arcanum*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "B", "SIM", "PERF", "UP", "C4", "RUF", "PIE", "RET", "ARG", "PL", "I"]
+ignore = [
+    "E501",     # long lines are allowed where breaking them hurts readability
+    "PLR2004",  # small literal constants (page sizes, byte markers) read better inline
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917",  # dispatchers and constructors are long by nature
+    "PLW2901",  # rebinding a loop variable is deliberate in a few parsing loops
+    "ARG001", "ARG002", "ARG005",  # operator and handler signatures are uniform even when a part is unused
+    "SIM115",   # files and temporary files that outlive one block are closed explicitly
+    "RUF001", "RUF002", "RUF003",  # typographic characters in user-facing text
+]

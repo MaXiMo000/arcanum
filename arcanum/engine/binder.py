@@ -19,10 +19,37 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 from ..errors import SqlError
 from ..sql import nodes as n
 from . import plan as p
+from .executor import evaluate_constant
 from .expr import (
-    AGGREGATES, BOOLEAN, FUNCTIONS, INTEGER, NULL, NUMERIC, RANKING, REAL, TEXT, WINDOW_ONLY,
-    AggCall, Col, Const, Op, SubqueryExpr, WindowCall, assignable, children, column_indexes, contains,
-    format_expr, literal_type, map_children, shift, to_outer, unify, walk,
+    AGGREGATES,
+    BOOLEAN,
+    FUNCTIONS,
+    INTEGER,
+    NULL,
+    NUMERIC,
+    RANKING,
+    REAL,
+    TEXT,
+    WINDOW_ONLY,
+    AggCall,
+    Col,
+    Const,
+    Op,
+    SubqueryExpr,
+    WindowCall,
+    and_all,
+    assignable,
+    children,
+    column_indexes,
+    conjuncts,
+    contains,
+    format_expr,
+    literal_type,
+    map_children,
+    shift,
+    to_outer,
+    unify,
+    walk,
 )
 
 _COMPARISONS = {"=", "!=", "<", "<=", ">", ">="}
@@ -82,7 +109,7 @@ class Binder:
         source = self.query(Level(), stmt.source)
         if len(source.columns) != len(positions):
             raise self.error(f"INSERT has {len(positions)} target columns but the values have {len(source.columns)}")
-        for pos, column in zip(positions, source.columns):
+        for pos, column in zip(positions, source.columns, strict=True):
             target = table.columns[pos]
             if not assignable(column.type, target.type):
                 raise self.error(f"column {target.name} is {target.type} but the value is {column.type}")
@@ -168,7 +195,7 @@ class Binder:
             raise self.error(f"each side of {body.op} must have the same number of columns "
                              f"({len(left.columns)} vs {len(right.columns)})")
         columns = []
-        for a, b in zip(left.columns, right.columns):
+        for a, b in zip(left.columns, right.columns, strict=True):
             t = unify(a.type, b.type)
             if t is None:
                 raise self.error(f"{body.op} cannot combine {a.type} and {b.type} in column {a.name}")
@@ -200,8 +227,6 @@ class Binder:
         return p.Limit(plan, count, skip or 0, plan.columns)
 
     def constant_int(self, node, clause):
-        from .executor import evaluate_constant
-
         e = self.expr(Level(), node)
         if any(isinstance(x, (Col, SubqueryExpr, AggCall, WindowCall)) for x in walk(e)) or e.type not in (INTEGER, NULL):
             raise self.error(f"{clause} must be a constant integer", node)
@@ -227,7 +252,7 @@ class Binder:
             return list(columns)
         if len(cte.columns) != len(columns):
             raise self.error(f"CTE {cte.name} names {len(cte.columns)} columns but its query returns {len(columns)}")
-        return [p.Column(name, c.type) for name, c in zip(cte.columns, columns)]
+        return [p.Column(name, c.type) for name, c in zip(cte.columns, columns, strict=True)]
 
     def recursive_cte(self, level, cte):
         q, body = cte.query, cte.query.body
@@ -243,7 +268,7 @@ class Binder:
         recursive = self.set_body(self.derived_level(level), body.right)
         if len(recursive.columns) != len(columns):
             raise self.error(f"the two parts of recursive CTE {cte.name} return different numbers of columns")
-        for a, b in zip(columns, recursive.columns):
+        for a, b in zip(columns, recursive.columns, strict=True):
             if not assignable(b.type, a.type):
                 raise self.error(f"column {a.name} of recursive CTE {cte.name} is {a.type} in the anchor "
                                  f"but {b.type} in the recursive part")
@@ -277,7 +302,10 @@ class Binder:
         order_exprs = [k for k, _, _ in order if not isinstance(k, int)]
         if groups or having is not None or any(contains(e, AggCall) for e in exprs + order_exprs):
             aggs = []
-            rewrite = lambda e: self.rewrite_grouped(e, groups, aggs)  # noqa: E731
+
+            def rewrite(e):
+                return self.rewrite_grouped(e, groups, aggs)
+
             exprs = [rewrite(e) for e in exprs]
             order = [(k if isinstance(k, int) else rewrite(k), d, nf) for k, d, nf in order]
             having = rewrite(having) if having is not None else None
@@ -297,11 +325,14 @@ class Binder:
         if calls:
             base = len(plan.columns)
             plan = p.Window(plan, calls, plan.columns + [p.Column(format_expr(c), c.type) for c in calls])
-            replace_calls = lambda e: _replace_windows(e, calls, base)  # noqa: E731
+
+            def replace_calls(e):
+                return _replace_windows(e, calls, base)
+
             exprs = [replace_calls(e) for e in exprs]
             order = [(k if isinstance(k, int) else replace_calls(k), d, nf) for k, d, nf in order]
 
-        columns = [p.Column(name, e.type) for e, (_, name) in zip(exprs, items)]
+        columns = [p.Column(name, e.type) for e, (_, name) in zip(exprs, items, strict=True)]
         hidden, keys = [], []
         for k, desc, nulls_first in order:
             if not isinstance(k, int):
@@ -423,22 +454,23 @@ class Binder:
                 rights = [e for e in right_entries if e.name == name and e.unqualified]
                 if len(lefts) != 1 or len(rights) != 1:
                     raise self.error(f"column {name} in USING must appear exactly once on each side of the join")
-                l, r = lefts[0], rights[0]
-                t = self.comparable(l.expr, r.expr, None)
-                conditions.append(Op("=", (l.expr, r.expr), BOOLEAN))
-                merged = {"RIGHT": r.expr, "FULL": Op("COALESCE", (l.expr, r.expr), t)}.get(item.kind, l.expr)
-                li = next(i for i, e in enumerate(entries) if e is l)
-                entries[li] = replace(l, star=False, unqualified=False)
+                left_entry, right_entry = lefts[0], rights[0]
+                t = self.comparable(left_entry.expr, right_entry.expr, None)
+                conditions.append(Op("=", (left_entry.expr, right_entry.expr), BOOLEAN))
+                merged = {"RIGHT": right_entry.expr,
+                          "FULL": Op("COALESCE", (left_entry.expr, right_entry.expr), t)}.get(item.kind, left_entry.expr)
+                li = next(i for i, e in enumerate(entries) if e is left_entry)
+                entries[li] = replace(left_entry, star=False, unqualified=False)
                 entries.insert(li, Entry(None, name, t, merged))
-                ri = next(i for i, e in enumerate(entries) if e is r)
-                entries[ri] = replace(r, star=False, unqualified=False)
+                ri = next(i for i, e in enumerate(entries) if e is right_entry)
+                entries[ri] = replace(right_entry, star=False, unqualified=False)
         elif item.on is not None:
             saved, level.entries = level.entries, entries
             conditions.append(self.condition(level, item.on, "ON"))
             level.entries = saved
 
         left_keys, right_keys, residual = [], [], []
-        for c in (part for cond in conditions for part in _conjuncts(cond)):
+        for c in (part for cond in conditions for part in conjuncts(cond)):
             if isinstance(c, Op) and c.op == "=" and not any(isinstance(x, SubqueryExpr) for x in walk(c)):
                 a, b = c.args
                 ia, ib = column_indexes(a), column_indexes(b)
@@ -451,7 +483,7 @@ class Binder:
                     right_keys.append(shift(a, -width))
                     continue
             residual.append(c)
-        plan = p.Join(item.kind, left, right, left_keys, right_keys, _and_all(residual), left.columns + right.columns)
+        plan = p.Join(item.kind, left, right, left_keys, right_keys, and_all(residual), left.columns + right.columns)
         return plan, entries
 
     # ---- expressions -----------------------------------------------------------------
@@ -572,7 +604,7 @@ class Binder:
     def _bind_InList(self, level, node):
         needle = self.expr(level, node.expr)
         items = [self.expr(level, item) for item in node.items]
-        for item, item_node in zip(items, node.items):
+        for item, item_node in zip(items, node.items, strict=True):
             self.comparable(needle, item, item_node)
         result = Op("IN", (needle, *items), BOOLEAN)
         return Op("NOT", (result,), BOOLEAN) if node.negated else result
@@ -644,7 +676,7 @@ class Binder:
             if not args or (name == "IFNULL" and len(args) != 2):
                 raise self.error(f"{name.lower()} needs {'two arguments' if name == 'IFNULL' else 'arguments'}", node)
             t = NULL
-            for a, a_node in zip(args, node.args):
+            for a, a_node in zip(args, node.args, strict=True):
                 t = unify(t, a.type)
                 if t is None:
                     raise self.error(f"{name.lower()} arguments mix incompatible types", a_node)
@@ -739,26 +771,13 @@ def _matches(signature, types):
     if len(signature) != len(types):
         return False
     allowed = {"N": NUMERIC, "I": (INTEGER,), "T": (TEXT,)}
-    return all(t == NULL or c == "A" or t in allowed[c] for c, t in zip(signature, types))
+    return all(t == NULL or c == "A" or t in allowed[c] for c, t in zip(signature, types, strict=True))
 
 
 def _replace_windows(e, calls, base):
     if isinstance(e, WindowCall):
         return Col(base + calls.index(e), e.type, format_expr(e))
     return map_children(e, lambda c: _replace_windows(c, calls, base))
-
-
-def _conjuncts(e):
-    if isinstance(e, Op) and e.op == "AND":
-        return _conjuncts(e.args[0]) + _conjuncts(e.args[1])
-    return [e]
-
-
-def _and_all(conditions):
-    result = None
-    for c in conditions:
-        result = c if result is None else Op("AND", (result, c), BOOLEAN)
-    return result
 
 
 def _default_name(node):

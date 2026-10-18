@@ -39,7 +39,9 @@ def test_range_scans(pager):
     tree = BTree.create(pager, max_keys=4)
     for n in random.Random(1).sample(range(200), 200):
         tree.insert(key(n), b"")
-    keys = lambda **kw: [k for k, _ in tree.scan(**kw)]
+    def keys(**kw):
+        return [k for k, _ in tree.scan(**kw)]
+
     assert keys() == [key(n) for n in range(200)]
     assert keys(lo=key(10), hi=key(15)) == [key(n) for n in range(10, 15)]
     assert keys(lo=key(10), hi=key(15), lo_inclusive=False, hi_inclusive=True) == [key(n) for n in range(11, 16)]
@@ -111,3 +113,17 @@ def test_rejects_oversized_entries(pager):
     tree = BTree.create(pager)
     with pytest.raises(ValueError):
         tree.insert(key(1), b"x" * 2000)
+
+
+def test_cached_nodes_never_outlive_a_rollback(pager):
+    tree = BTree.create(pager, max_keys=4)
+    for n in range(40):
+        tree.insert(key(n), b"before")
+    pager.commit()
+    pager.savepoint()
+    for n in range(40, 120):
+        tree.insert(key(n), b"inside")  # splits nodes that are in the decoded-node cache
+    tree.insert(key(5), b"changed", replace=True)
+    pager.rollback()
+    assert tree.verify() == 40
+    assert tree.get(key(5)) == b"before" and tree.get(key(80)) is None

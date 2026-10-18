@@ -18,6 +18,7 @@ import json
 from bisect import bisect_left
 from collections import Counter
 from dataclasses import dataclass, field
+from functools import cached_property
 
 from ..errors import ConstraintError, ExecutionError, SqlError
 from ..sql import nodes as n
@@ -59,6 +60,11 @@ class TableSchema:
     sql: str
     indexes: list = field(default_factory=list)
     stats: object = None  # TableStats after ANALYZE
+
+    @cached_property
+    def booleans(self):
+        """Positions of BOOLEAN columns, whose stored integers are returned as True/False."""
+        return frozenset(i for i, c in enumerate(self.columns) if c.type == BOOLEAN)
 
     def column(self, name):
         for i, c in enumerate(self.columns):
@@ -117,9 +123,8 @@ class Catalog:
     def __init__(self, pager, max_keys=None):
         self.pager = pager
         self.max_keys = max_keys
-        if pager.page_count == 1:
-            if BTree.create(pager).root != CATALOG_ROOT:
-                raise AssertionError("the catalog must be the first tree in a new database")
+        if pager.page_count == 1 and BTree.create(pager).root != CATALOG_ROOT:
+            raise AssertionError("the catalog must be the first tree in a new database")
         self.tree = BTree(pager, CATALOG_ROOT)
         self.reload()
 
@@ -252,14 +257,14 @@ class Catalog:
 
     def _row(self, table, value):
         row = decode(value)
-        if any(c.type == BOOLEAN for c in table.columns):
-            row = tuple(bool(v) if v is not None and c.type == BOOLEAN else v for v, c in zip(row, table.columns))
+        if table.booleans:
+            row = tuple(bool(v) if v is not None and i in table.booleans else v for i, v in enumerate(row))
         return row
 
     def check_row(self, table, row):
         """Apply NOT NULL and store REAL columns as floats. Returns the row to store."""
         out = []
-        for column, value in zip(table.columns, row):
+        for column, value in zip(table.columns, row, strict=True):
             if value is None:
                 if column.not_null:
                     raise ConstraintError(f"NULL value in column {column.name} of table {table.name} violates NOT NULL")

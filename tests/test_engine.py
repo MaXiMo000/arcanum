@@ -1,6 +1,7 @@
 import pytest
 
 from arcanum import ConstraintError, Database, ExecutionError, SqlError
+from arcanum.storage import decode
 
 
 @pytest.fixture
@@ -72,7 +73,6 @@ def test_indexes_follow_updates_and_deletes(db):
     db.execute("UPDATE users SET age = id * 10")
     db.execute("DELETE FROM users WHERE id = 2")
     index = db.catalog.indexes["users_age"]
-    from arcanum.storage import decode
     entries = [decode(k) for k, _ in db.catalog.btree(index.root).scan()]
     assert entries == [(10, 1), (30, 3)]
     with pytest.raises(ConstraintError):

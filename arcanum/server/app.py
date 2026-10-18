@@ -217,6 +217,9 @@ def create_app(settings=None):
     async def health():
         return {"status": "ok"}
 
+    limits = {"query_timeout": settings.query_timeout, "max_rows": settings.max_rows,
+              "max_pages": settings.max_pages, "max_sql_bytes": settings.max_sql_bytes}
+
     @app.post("/sessions", status_code=201)
     async def create_session(request: Request):
         client = _client(request)
@@ -225,8 +228,7 @@ def create_app(settings=None):
         session = await manager.create(client)
         state = await session.request({"op": "state", "node_limit": 1})
         return {"id": session.id, "recovered_frames": session.recovered_frames, "tables": state["tables"],
-                "limits": {"query_timeout": settings.query_timeout, "max_rows": settings.max_rows,
-                           "max_pages": settings.max_pages, "max_sql_bytes": settings.max_sql_bytes}}
+                "limits": limits}
 
     @app.delete("/sessions/{session_id}", status_code=204)
     async def delete_session(session_id: str):
@@ -247,14 +249,15 @@ def create_app(settings=None):
     async def state(session_id: str):
         reply = await manager.get(session_id).request({"op": "state"})
         reply.pop("ok")
-        return reply
+        return {**reply, "limits": limits}
 
     @app.post("/sessions/{session_id}/crash")
-    async def crash(session_id: str, request: Request, body: CrashRequest = CrashRequest()):
+    async def crash(session_id: str, request: Request, body: CrashRequest | None = None):
         session = manager.get(session_id)
-        if not limiter.allow(_client(request), "crash", settings.crashes_per_minute / 60, 3):
+        burst = max(1, settings.crashes_per_minute // 2)
+        if not limiter.allow(_client(request), "crash", settings.crashes_per_minute / 60, burst):
             return _error(429, "RateLimited", "the crash demo is limited; wait a few seconds", {"Retry-After": "10"})
-        return await session.crash(body.during_write)
+        return await session.crash(body.during_write if body is not None else True)
 
     @app.websocket("/sessions/{session_id}/events")
     async def events(websocket: WebSocket, session_id: str):

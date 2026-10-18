@@ -16,7 +16,7 @@ import sys
 from ..engine import Database, QueryLimits
 from ..errors import ArcanumError, ConstraintError, ExecutionError, SqlError
 from ..events import EventBus
-from ..storage import decode
+from ..storage import PAGE_SIZE, decode
 
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 log = logging.getLogger("arcanum.server.worker")
@@ -105,7 +105,7 @@ def error_json(e):
 def _limit_memory(megabytes):
     """Cap the worker's address space where the OS supports it (Linux and other POSIX systems)."""
     try:
-        import resource
+        import resource  # noqa: PLC0415 (POSIX only, so imported where it is used)
     except ImportError:
         return  # Windows: the per-statement row and spill budgets still apply
     limit = megabytes * 1024 * 1024
@@ -156,12 +156,11 @@ def worker_main(path, conn, event_conn, options):
 
 
 def _query(db, message, conn):
-    results = []
-    for result in db.execute_script(message["sql"], trace=True, max_rows=message["max_rows"]):
-        results.append({"columns": result.columns, "rows": [list(r) for r in result.rows],
-                        "truncated": result.row_total > len(result.rows), "row_total": result.row_total,
-                        "rowcount": result.rowcount, "status": result.status, "plan": result.plan})
-    return {"ok": True, "results": results}
+    results = db.execute_script(message["sql"], trace=True, max_rows=message["max_rows"])
+    return {"ok": True, "results": [
+        {"columns": r.columns, "rows": [list(row) for row in r.rows], "truncated": r.row_total > len(r.rows),
+         "row_total": r.row_total, "rowcount": r.rowcount, "status": r.status, "plan": r.plan}
+        for r in results]}
 
 
 def _state(db, message, conn):
@@ -180,13 +179,12 @@ def _state(db, message, conn):
     for table in catalog.tables.values():
         key = [table.columns[i].name for i in table.primary_key] or ["rowid"]
         trees.append(tree("table", table.name, table.root, key))
-        for index in table.indexes:
-            trees.append(tree("index", index.name, index.root, [table.columns[i].name for i in index.columns] + key,
-                              table.name))
+        trees.extend(tree("index", index.name, index.root, [table.columns[i].name for i in index.columns] + key,
+                          table.name) for index in table.indexes)
     tables = [{"name": t.name, "columns": [{"name": c.name, "type": c.type} for c in t.columns],
                "rows": t.stats.rows if t.stats else None} for t in catalog.tables.values()]
     return {"ok": True, "tables": tables, "trees": trees, "pager": {
-        "page_size": 4096, "page_count": pager.page_count, "max_pages": pager.max_pages,
+        "page_size": PAGE_SIZE, "page_count": pager.page_count, "max_pages": pager.max_pages,
         "pool_size": pager.pool_size, "cached": [{"page": p, "dirty": d} for p, d in pager.cached_pages()],
         "free": pager.free_pages(), "stats": dict(pager.stats)},
         "wal": {"committed_frames": pager.wal.committed_frames, "uncommitted": pager.wal.has_uncommitted},

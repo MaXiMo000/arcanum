@@ -52,6 +52,10 @@ class Pager:
         self.stats = {"hits": 0, "misses": 0, "evictions": 0, "disk_reads": 0, "wal_frames": 0, "checkpoints": 0}
         self.recovered_frames = 0  # committed frames replayed from the log when the file was opened
         self._pool = OrderedDict()  # page id -> [data, dirty], least recently used first
+        # Decoded forms of cached pages, for the B+tree: page id -> (the exact bytes object decoded,
+        # result). A page's bytes object is replaced on every write, so an identity check is enough to
+        # know an entry is current; entries leave with their page so this stays as small as the pool.
+        self.decoded = {}
         self._savepoints = []  # [(original page images, page_count, free_head)], innermost last
         self._closed = False
         self._file = self.fs.open(self.path)
@@ -91,6 +95,7 @@ class Pager:
         return data
 
     def write(self, page_id, data):
+        """Replace a page's contents; returns the stored (padded, immutable) bytes."""
         self._check(page_id)
         if len(data) > PAGE_SIZE:
             raise ValueError(f"page {page_id}: {len(data)} bytes does not fit in a {PAGE_SIZE}-byte page")
@@ -98,8 +103,10 @@ class Pager:
             originals, page_count, _ = self._savepoints[-1]
             if page_id < page_count and page_id not in originals:
                 originals[page_id] = self._current(page_id)
-        self._put(page_id, bytes(data).ljust(PAGE_SIZE, b"\x00"), dirty=True)
+        stored = bytes(data).ljust(PAGE_SIZE, b"\x00")
+        self._put(page_id, stored, dirty=True)
         self.events.emit("page_write", page=page_id)
+        return stored
 
     def allocate(self) -> int:
         """Return a zeroed page, reusing a freed one when possible."""
@@ -148,6 +155,7 @@ class Pager:
         # the savepoint no longer exist at all.
         for page_id in [p for p in self._pool if p >= page_count or p in originals]:
             del self._pool[page_id]
+            self.decoded.pop(page_id, None)
         self.page_count, self.free_head = page_count, free_head
         outermost = not self._savepoints
         if outermost:
@@ -223,6 +231,7 @@ class Pager:
         self._pool.move_to_end(page_id)
         while len(self._pool) > self.pool_size:
             victim, (victim_data, victim_dirty) = self._pool.popitem(last=False)
+            self.decoded.pop(victim, None)
             if victim_dirty:
                 self.wal.append(victim, victim_data)  # uncommitted until the next commit frame
                 self.stats["wal_frames"] += 1

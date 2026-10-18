@@ -207,10 +207,10 @@ def describe(node):
     if isinstance(node, Project):
         return "Project " + ", ".join(
             format_expr(e) if format_expr(e) == c.name else f"{format_expr(e)} AS {c.name}"
-            for e, c in zip(node.exprs, node.columns))
+            for e, c in zip(node.exprs, node.columns, strict=True))
     if isinstance(node, Join):
         if node.left_keys:
-            on = ", ".join(f"{format_expr(a)} = {format_expr(b)}" for a, b in zip(node.left_keys, node.right_keys))
+            on = ", ".join(f"{format_expr(a)} = {format_expr(b)}" for a, b in zip(node.left_keys, node.right_keys, strict=True))
             text = f"HashJoin {node.kind} on {on}"
         else:
             text = f"NestedLoopJoin {node.kind}"

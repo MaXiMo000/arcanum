@@ -5,7 +5,7 @@ import { NODE_HEIGHT, layoutTree } from "../layout";
 
 interface Props {
   trees: Tree[];
-  selected: string;
+  selected: string | null;
   onSelect: (name: string) => void;
   nodeFlash: Map<number, Flash>;
   flashMs: number;

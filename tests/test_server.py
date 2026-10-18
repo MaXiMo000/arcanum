@@ -7,16 +7,16 @@ import pytest
 pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
 
-from fastapi.testclient import TestClient  # noqa: E402
-from starlette.websockets import WebSocketDisconnect  # noqa: E402
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
-from arcanum.server.app import Settings, create_app  # noqa: E402
-from arcanum.server.worker import error_json  # noqa: E402
-from arcanum.storage import CorruptDatabaseError  # noqa: E402
+from arcanum.server.app import Settings, create_app
+from arcanum.server.worker import error_json
+from arcanum.storage import CorruptDatabaseError
 
-GENEROUS = dict(query_timeout=3, max_sessions=2, max_sessions_per_client=5, max_rows=5, max_pages=300,
-                max_sql_bytes=2000, rate_per_second=1000, rate_burst=1000, sessions_per_minute=1000,
-                crashes_per_minute=1000)
+GENEROUS = {"query_timeout": 3, "max_sessions": 2, "max_sessions_per_client": 5, "max_rows": 5, "max_pages": 300,
+                "max_sql_bytes": 2000, "rate_per_second": 1000, "rate_burst": 1000, "sessions_per_minute": 1000,
+                "crashes_per_minute": 1000}
 
 
 @pytest.fixture
@@ -250,15 +250,15 @@ def test_responses_carry_security_headers_and_no_docs(client):
 def test_websockets_check_origin_and_are_capped(make_client):
     client = make_client(max_websockets_per_session=1)
     session = new_session(client)
-    with pytest.raises(WebSocketDisconnect) as refused:
-        with client.websocket_connect(f"/sessions/{session}/events", headers={"origin": "https://evil.example"}):
-            pass
+    events = f"/sessions/{session}/events"
+    with pytest.raises(WebSocketDisconnect) as refused, \
+            client.websocket_connect(events, headers={"origin": "https://evil.example"}):
+        pass
     assert refused.value.code == 4403
-    with client.websocket_connect(f"/sessions/{session}/events", headers={"origin": "http://localhost:5173"}) as ws:
+    with client.websocket_connect(events, headers={"origin": "http://localhost:5173"}) as ws:
         ws.receive_json()
-        with pytest.raises(WebSocketDisconnect) as capped:
-            with client.websocket_connect(f"/sessions/{session}/events"):
-                pass
+        with pytest.raises(WebSocketDisconnect) as capped, client.websocket_connect(events):
+            pass
         assert capped.value.code == 4429
 
 

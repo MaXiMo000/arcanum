@@ -30,8 +30,22 @@ from dataclasses import replace
 
 from . import plan as p
 from .expr import (
-    BOOLEAN, INTEGER, NULL, REAL, Col, Const, Op, Outer, SubqueryExpr, column_indexes, format_expr, map_children,
-    shift, walk,
+    BOOLEAN,
+    INTEGER,
+    NULL,
+    REAL,
+    Col,
+    Const,
+    Op,
+    Outer,
+    SubqueryExpr,
+    and_all,
+    column_indexes,
+    conjuncts,
+    format_expr,
+    map_children,
+    shift,
+    walk,
 )
 
 DEFAULT_ROWS = 1000
@@ -98,7 +112,7 @@ class Optimizer:
             return None
         conditions = []
         if isinstance(plan, p.Filter):
-            conditions = _conjuncts(plan.predicate)
+            conditions = conjuncts(plan.predicate)
             plan = plan.input
         if _reaches_outside(plan) or (inner_value is not None and _has_outer_or_subquery(inner_value)):
             return None
@@ -126,8 +140,8 @@ class Optimizer:
             right_keys.append(inner_value)
         if not left_keys:
             return None
-        right = p.Filter(plan, _and_all(local), plan.columns) if local else plan
-        return p.Join("ANTI" if negated else "SEMI", left, right, left_keys, right_keys, _and_all(residual),
+        right = p.Filter(plan, and_all(local), plan.columns) if local else plan
+        return p.Join("ANTI" if negated else "SEMI", left, right, left_keys, right_keys, and_all(residual),
                       left.columns)
 
     def attach_scalars(self, source, e):
@@ -151,7 +165,7 @@ class Optimizer:
         value, aggregate = plan.exprs[0], plan.input
         inner, conditions = aggregate.input, []
         if isinstance(inner, p.Filter):
-            conditions, inner = _conjuncts(inner.predicate), inner.input
+            conditions, inner = conjuncts(inner.predicate), inner.input
         if (_reaches_outside(inner) or _has_outer_or_subquery(value)
                 or any(_has_outer_or_subquery(a) for a in aggregate.aggs)):
             return None
@@ -170,7 +184,7 @@ class Optimizer:
             right_keys.append(key[1])
         if not left_keys or not self.join_beats_lookups(source, inner, right_keys[0]):
             return None
-        grouped_input = p.Filter(inner, _and_all(local), inner.columns) if local else inner
+        grouped_input = p.Filter(inner, and_all(local), inner.columns) if local else inner
         k, width = len(right_keys), len(source.columns)
         grouped = p.Aggregate(grouped_input, right_keys, list(aggregate.aggs),
                               [p.Column(format_expr(g), g.type) for g in right_keys] + list(aggregate.columns))
@@ -201,7 +215,7 @@ class Optimizer:
         """Return node with the conjuncts `preds` applied as deep inside it as is correct."""
         if isinstance(node, p.Filter):
             source, remaining = node.input, []
-            for c in _conjuncts(node.predicate):
+            for c in conjuncts(node.predicate):
                 joined = self.semi_join(source, c)
                 if joined is not None:
                     source = joined
@@ -261,7 +275,7 @@ class Optimizer:
                 join_conditions.append(c)
             else:
                 keep.append(c)
-        for c in _conjuncts(node.residual) if node.residual is not None else []:  # the join's own ON conditions
+        for c in conjuncts(node.residual) if node.residual is not None else []:  # the join's own ON conditions
             side = _side(c, width)
             if not _movable(c):
                 join_conditions.append(c)
@@ -284,7 +298,7 @@ class Optimizer:
         if kind == "CROSS" and (left_keys or residual):
             kind = "INNER"
         join = replace(node, kind=kind, left=self.push(node.left, left_preds), right=self.push(node.right, right_preds),
-                       left_keys=left_keys, right_keys=right_keys, residual=_and_all(residual))
+                       left_keys=left_keys, right_keys=right_keys, residual=and_all(residual))
         return self.wrap(join, keep)
 
     def wrap(self, node, preds):
@@ -294,7 +308,7 @@ class Optimizer:
             node, preds = self.access_path(node, preds)
             if not preds:
                 return node
-        return p.Filter(node, _and_all(preds), node.columns)
+        return p.Filter(node, and_all(preds), node.columns)
 
     # ---- 3. access paths -------------------------------------------------------------
 
@@ -393,7 +407,7 @@ class Optimizer:
             for k in range(len(plan.columns)):
                 owner[offset + k] = r
         masks = [_mask(c, owner) for c in conditions]
-        leftover = [c for c, m in zip(conditions, masks) if bin(m).count("1") <= 1]
+        leftover = [c for c, m in zip(conditions, masks, strict=True) if bin(m).count("1") <= 1]
         selectivity = [self.join_selectivity(c, relations, owner) for c in conditions]
         rows, cost, choice = {}, {}, {}
         for r, (plan, _) in enumerate(relations):
@@ -406,7 +420,7 @@ class Optimizer:
             for r in range(n):
                 if subset >> r & 1:
                     product *= rows[1 << r]
-            for m, s in zip(masks, selectivity):
+            for m, s in zip(masks, selectivity, strict=True):
                 if m and m & subset == m and bin(m).count("1") > 1:
                     product *= s
             rows[subset] = max(product, 1.0)
@@ -448,7 +462,7 @@ class Optimizer:
                     right_keys.append(_remap(sides[1], right_pos))
                 else:
                     residual.append(_remap(c, both_pos))
-            join = p.Join("INNER", left, right, left_keys, right_keys, _and_all(residual), left.columns + right.columns)
+            join = p.Join("INNER", left, right, left_keys, right_keys, and_all(residual), left.columns + right.columns)
             join.est_rows = rows[subset]
             return join, left_layout + right_layout
 
@@ -457,7 +471,7 @@ class Optimizer:
             position = {g: k for k, g in enumerate(layout)}
             plan = p.Project(plan, [Col(position[g], c.type, c.name) for g, c in enumerate(columns)], columns)
         if leftover:
-            plan = p.Filter(plan, _and_all(leftover), columns)
+            plan = p.Filter(plan, and_all(leftover), columns)
         return plan
 
     def join_selectivity(self, c, relations, owner):
@@ -600,7 +614,7 @@ class Optimizer:
                 return max(left * 0.5, 1.0)
             fraction = 1.0
             width = len(node.left.columns)
-            for lk, rk in zip(node.left_keys, node.right_keys):
+            for lk, rk in zip(node.left_keys, node.right_keys, strict=True):
                 distinct = [d for d in (self.distinct_values(node.left, lk.index) if isinstance(lk, Col) else None,
                                         self.distinct_values(node.right, rk.index) if isinstance(rk, Col) else None) if d]
                 fraction /= max(distinct) if distinct else max(min(left, right), 1.0)
@@ -623,19 +637,6 @@ class Optimizer:
 
 
 # ---- helpers ---------------------------------------------------------------------------------
-
-
-def _conjuncts(e):
-    if isinstance(e, Op) and e.op == "AND":
-        return _conjuncts(e.args[0]) + _conjuncts(e.args[1])
-    return [e]
-
-
-def _and_all(conditions):
-    result = None
-    for c in conditions:
-        result = c if result is None else Op("AND", (result, c), BOOLEAN)
-    return result
 
 
 def _has_subquery(e):
@@ -750,12 +751,12 @@ def _flatten(node, offset, relations, conditions):
     """Collect the tables and conditions of a cluster of inner joins, in one global column numbering."""
     if isinstance(node, p.Join) and node.kind == "INNER":
         width = len(node.left.columns)
-        for lk, rk in zip(node.left_keys, node.right_keys):
+        for lk, rk in zip(node.left_keys, node.right_keys, strict=True):
             conditions.append(Op("=", (shift(lk, offset), shift(rk, offset + width)), BOOLEAN))
         if node.residual is not None:
             if not _movable(node.residual):
                 return False
-            conditions.extend(shift(c, offset) for c in _conjuncts(node.residual))
+            conditions.extend(shift(c, offset) for c in conjuncts(node.residual))
         return _flatten(node.left, offset, relations, conditions) and \
             _flatten(node.right, offset + width, relations, conditions)
     relations.append((node, offset))

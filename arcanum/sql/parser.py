@@ -6,18 +6,13 @@ Expression precedence, loosest first:
 Set operations: INTERSECT binds tighter than UNION and EXCEPT, as in standard SQL.
 """
 
-from . import nodes as n
 from ..errors import SqlError
+from . import nodes as n
 from .lexer import EOF, FLOAT, INT, OP, QUOTED, STRING, WORD, tokenize
 
 # Words that are never a bare name. Other keywords (KEY, INDEX, ROWS, FIRST, ...)
 # only mean something in one spot, so they stay usable as table and column names.
-RESERVED = frozenset("""
-    ALL AND AS ASC BETWEEN BY CASE CAST CROSS DESC DISTINCT ELSE END EXCEPT EXISTS
-    FALSE FROM FULL GROUP HAVING IN INNER INTERSECT IS JOIN LATERAL LEFT LIKE LIMIT
-    NATURAL NOT NULL OFFSET ON OR ORDER OUTER OVER RIGHT SELECT SET THEN TRUE UNION
-    USING VALUES WHEN WHERE WINDOW WITH
-""".split())
+RESERVED = frozenset(["ALL", "AND", "AS", "ASC", "BETWEEN", "BY", "CASE", "CAST", "CROSS", "DESC", "DISTINCT", "ELSE", "END", "EXCEPT", "EXISTS", "FALSE", "FROM", "FULL", "GROUP", "HAVING", "IN", "INNER", "INTERSECT", "IS", "JOIN", "LATERAL", "LEFT", "LIKE", "LIMIT", "NATURAL", "NOT", "NULL", "OFFSET", "ON", "OR", "ORDER", "OUTER", "OVER", "RIGHT", "SELECT", "SET", "THEN", "TRUE", "UNION", "USING", "VALUES", "WHEN", "WHERE", "WINDOW", "WITH"])
 
 TYPES = {
     "INTEGER": "INTEGER", "INT": "INTEGER", "BIGINT": "INTEGER", "SMALLINT": "INTEGER",
@@ -304,7 +299,7 @@ class _Parser:
             raise self.error(f"expected a type ({supported}), got {self.describe()}")
         self.advance()
         if self.accept_op("("):  # VARCHAR(255) and similar: the size is accepted and ignored
-            self.comma_list(lambda: self.expect_int())
+            self.comma_list(self.expect_int)
             self.expect_op(")")
         return TYPES[tok.value.upper()]
 

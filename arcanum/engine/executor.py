@@ -23,9 +23,22 @@ from ..errors import ExecutionError
 from ..storage import decode, encode
 from . import plan as p
 from .expr import (
-    BOOLEAN, FUNCTIONS, REAL, Col, Const, Op, Outer, SubqueryExpr, cast, check_int, divide, like, modulo,
+    BOOLEAN,
+    FUNCTIONS,
+    REAL,
+    Col,
+    Const,
+    Op,
+    Outer,
+    SubqueryExpr,
+    cast,
+    check_int,
+    divide,
+    like,
+    modulo,
     to_text,
 )
+
 
 @dataclass(frozen=True)
 class QueryLimits:
@@ -184,7 +197,7 @@ def _compile(e, ctx):
     if op == "IN":
         return _compile_in(e, fns)
     if op == "CASE":
-        pairs = list(zip(fns[:-1:2], fns[1:-1:2]))
+        pairs = list(zip(fns[:-1:2], fns[1:-1:2], strict=True))
         default = fns[-1]
 
         def case(row, outer):
@@ -252,7 +265,7 @@ def _compile_subquery(e, ctx):
     needle = ctx.compile(e.arg) if e.arg is not None else None
 
     def rows(row, outer):
-        return run(plan, ctx, outer + (row,))
+        return run(plan, ctx, (*outer, row))
 
     if e.kind == "EXISTS":
         if e.correlated:
@@ -352,7 +365,7 @@ def index_scan_pairs(plan, ctx, outer=()):
     position = len(eq)
     if plan.points is not None:
         # One point lookup per distinct non-NULL value, in key order so the rows come out sorted.
-        keys = {encode(eq + [v]) for v in (value(e, position) for e in plan.points) if v is not None}
+        keys = {encode([*eq, v]) for v in (value(e, position) for e in plan.points) if v is not None}
         for key in sorted(keys):
             yield from ctx.catalog.scan_range(plan.table, plan.index, key, key + _AFTER_ALL)
         return
@@ -361,14 +374,14 @@ def index_scan_pairs(plan, ctx, outer=()):
         v = value(plan.lo[0], position)
         if v is None:
             return
-        lo = encode(eq + [v]) + (b"" if plan.lo[1] else _AFTER_ALL)
+        lo = encode([*eq, v]) + (b"" if plan.lo[1] else _AFTER_ALL)
     elif plan.hi is not None:
         lo = prefix + _AFTER_NULL  # an upper bound alone must still skip NULLs
     if plan.hi is not None:
         v = value(plan.hi[0], position)
         if v is None:
             return
-        hi = encode(eq + [v]) + (_AFTER_ALL if plan.hi[1] else b"")
+        hi = encode([*eq, v]) + (_AFTER_ALL if plan.hi[1] else b"")
     yield from ctx.catalog.scan_range(plan.table, plan.index, lo, hi, hi_inclusive)
 
 
@@ -464,7 +477,7 @@ def _aggregate(plan, ctx, outer):
         if accumulators is None:
             ctx.hold()
             accumulators = groups[key] = [make_accumulator(a.name, a.distinct) for a in plan.aggs]
-        for acc, f in zip(accumulators, arg_fns):
+        for acc, f in zip(accumulators, arg_fns, strict=True):
             acc.add(f(row, outer) if f is not None else 1)  # COUNT(*) counts a non-NULL 1 per row
     if not groups and not plan.groups:  # aggregates over no rows still produce one row
         groups[()] = [make_accumulator(a.name, a.distinct) for a in plan.aggs]
@@ -490,13 +503,13 @@ def _window(plan, ctx, outer):
         for i, r in enumerate(rows):
             partitions.setdefault(tuple(f(r, outer) for f in partition_fns), []).append(i)
         for members in partitions.values():
-            members = sort_items(members, lambda i: order_keys[i], directions)
+            members = sort_items(members, order_keys.__getitem__, directions)
             peers = _peer_groups([order_keys[i] for i in members])
             for k in call_indexes:
                 values = _window_values(plan.calls[k], members, rows, peers, bool(order), frame, ctx, outer)
-                for i, v in zip(members, values):
+                for i, v in zip(members, values, strict=True):
                     extra[i][k] = v
-    for row, values in zip(rows, extra):
+    for row, values in zip(rows, extra, strict=True):
         yield row + tuple(values)
 
 
@@ -551,7 +564,7 @@ def sort_key(values, directions, types):
     every non-NULL value.
     """
     parts = []
-    for v, (desc, nulls_first), t in zip(values, directions, types):
+    for v, (desc, nulls_first), t in zip(values, directions, types, strict=True):
         if nulls_first is None:
             nulls_first = not desc
         if v is None:

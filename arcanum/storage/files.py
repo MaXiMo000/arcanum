@@ -4,6 +4,7 @@ The pager and write-ahead log only use these operations, so tests can swap in
 a file system that simulates power loss (see tests/crashfs.py).
 """
 
+import contextlib
 import os
 
 
@@ -40,7 +41,5 @@ class OsFileSystem:
         return OsFile(path)
 
     def remove(self, path):
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.remove(path)
-        except FileNotFoundError:
-            pass

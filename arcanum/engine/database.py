@@ -9,6 +9,7 @@ from ..storage import Pager
 from .binder import Binder
 from .catalog import Catalog
 from .executor import Context, QueryLimits, index_scan_pairs, run
+from .expr import conjuncts
 from .optimizer import Optimizer
 from .plan import IndexScan, TableScan, explain, plan_tree
 
@@ -198,7 +199,7 @@ class Database:
         defaults = [c.default for c in table.columns]
         for values in rows:
             row = list(defaults)
-            for pos, value in zip(positions, values):
+            for pos, value in zip(positions, values, strict=True):
                 row[pos] = value
             self.catalog.insert_row(table, self.catalog.check_row(table, row))
         return Result(rowcount=len(rows), status=f"INSERT {len(rows)}")
@@ -215,7 +216,7 @@ class Database:
         if self.optimize and where is not None:
             optimizer = Optimizer()
             optimizer.optimize_expr(where)
-            scan, conditions = optimizer.access_path(scan, _conjuncts(where))
+            scan, conditions = optimizer.access_path(scan, conjuncts(where))
         pairs = index_scan_pairs(scan, ctx) if isinstance(scan, IndexScan) else self.catalog.scan(table)
         checks = [ctx.compile(c) for c in conditions]
         matches = []
@@ -231,7 +232,7 @@ class Database:
         targets = self._matching_rows(ctx, table, where)
         compiled = [(pos, ctx.compile(e)) for pos, e in assignments]
         updated = []
-        for key, row in targets:
+        for _, row in targets:
             new = list(row)
             for pos, f in compiled:
                 new[pos] = f(row, ())
@@ -240,7 +241,7 @@ class Database:
         # between rows (UPDATE t SET id = id + 1) is not mistaken for a duplicate.
         for key, row in targets:
             self.catalog.delete_row(table, key, row)
-        for (key, _), row in zip(targets, updated):
+        for (key, _), row in zip(targets, updated, strict=True):
             self.catalog.insert_row(table, row, None if table.primary_key else key)
         return Result(rowcount=len(targets), status=f"UPDATE {len(targets)}")
 
@@ -252,7 +253,3 @@ class Database:
         return Result(rowcount=len(targets), status=f"DELETE {len(targets)}")
 
 
-def _conjuncts(e):
-    if getattr(e, "op", None) == "AND":
-        return _conjuncts(e.args[0]) + _conjuncts(e.args[1])
-    return [e]
