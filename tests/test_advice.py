@@ -58,8 +58,12 @@ def test_a_missing_index_fix_makes_the_query_cheaper(db):
 
 def test_missing_index_advice_covers_the_columns_read(db):
     sql = "SELECT id, b FROM t WHERE c > 2990"
-    fix = hints(db, sql)["missing-index"]["fix"]["sql"]
+    hint = hints(db, sql)["missing-index"]
+    fix = hint["fix"]["sql"]
     assert fix == "CREATE INDEX t_c_b ON t (c, b)"
+    # The optimizer was asked what the index would cost before suggesting it.
+    estimate = hint["estimate"]
+    assert estimate["path"] == "Index Only Scan using t_c_b" and estimate["after"] < estimate["before"] == 2000
     before = db.execute(sql, trace=True)
     db.execute(fix)
     after = db.execute(sql, trace=True)
@@ -75,8 +79,8 @@ def test_rewrites_keep_the_statement_and_fix_it(db):
 
 def test_hints_point_at_plan_nodes_and_unanalyzed_tables_get_analyze(tmp_path):
     with Database(tmp_path / "t.db") as db:
-        db.execute_script("CREATE TABLE r (id INTEGER PRIMARY KEY, v INTEGER); CREATE INDEX r_v ON r (v);")
-        db.execute("INSERT INTO r SELECT n, n % 400 FROM (WITH RECURSIVE s(n) AS "
+        db.execute_script("CREATE TABLE r (id INTEGER PRIMARY KEY, v INTEGER, w TEXT); CREATE INDEX r_v ON r (v);")
+        db.execute("INSERT INTO r SELECT n, n % 400, 'w' FROM (WITH RECURSIVE s(n) AS "
                    "(SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 1200) SELECT n FROM s) AS q")
         result = db.execute("SELECT * FROM r WHERE v > 397", trace=True)
         found = {h["code"]: h for h in result.advice}

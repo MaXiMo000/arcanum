@@ -24,6 +24,14 @@ Passes, in order:
    hold every column the query reads skips the table lookup per row
    (mark_index_only, run on the final plan).
 
+Given a list as `trace`, the optimizer records each decision there (a dict
+with phase, title, detail, the plan node it produced and, for access paths and
+join orders, every candidate with its estimated cost), so a UI can show why
+the plan looks the way it does. Costs are in "row visits": a full scan costs
+one per row, an index scan a descent plus one per match (four for a secondary
+index, which also descends the table), a hash join reads both inputs and a
+nested loop pairs them all.
+
 Estimates use ANALYZE statistics when present (row counts, distinct counts,
 NULL counts, equi-depth histograms) and fixed guesses otherwise.
 """
@@ -67,14 +75,26 @@ def optimize(plan):
 
 
 class Optimizer:
-    def __init__(self):
+    def __init__(self, trace=None):
         self._done = {}  # id(original plan) -> (original, optimized); keeps shared CTE plans consistent
         self._estimates = {}
+        self.trace = trace  # a list to record decisions in, or None
+
+    def note(self, phase, title, detail="", node=None, candidates=None):
+        if self.trace is not None:
+            self.trace.append({"phase": phase, "title": title, "detail": detail, "node": node,
+                               "candidates": candidates or []})
 
     def optimize(self, plan):
         entry = self._done.get(id(plan))
         if entry is not None:
             return entry[1]
+        if not self._done:
+            # Before choosing access paths, learn which columns each table scan must produce, so an
+            # index holding all of them is costed as an index-only scan (no table descent per match).
+            for scan, columns in _needed_columns(plan).values():
+                if isinstance(scan, p.TableScan):
+                    scan.reads = tuple(sorted(columns))
         result = self.reorder(self.push(plan, []))
         self.annotate(result)
         self._done[id(plan)] = (plan, result)
@@ -141,11 +161,19 @@ class Optimizer:
                 return None
             left_keys.append(sub.arg)
             right_keys.append(inner_value)
+        what = f"{'NOT ' if negated else ''}{sub.kind}"
         if not left_keys:
+            self.note("rewrite", f"{what} subquery kept as a SubPlan",
+                      "Its correlation is not an equality, so no hash table can match rows: it runs once per outer row.")
             return None
         right = p.Filter(plan, and_all(local), plan.columns) if local else plan
-        return p.Join("ANTI" if negated else "SEMI", left, right, left_keys, right_keys, and_all(residual),
+        join = p.Join("ANTI" if negated else "SEMI", left, right, left_keys, right_keys, and_all(residual),
                       left.columns)
+        keys = ", ".join(f"{format_expr(a)} = {format_expr(b)}" for a, b in zip(left_keys, right_keys, strict=True))
+        self.note("rewrite", f"{what} subquery became a hash {'anti' if negated else 'semi'} join",
+                  f"Matched on {keys}. The subquery's rows are read once and hashed, instead of the subquery "
+                  "running again for every outer row (PostgreSQL makes the same rewrite: pull_up_sublinks).")
+        return join
 
     def attach_scalars(self, source, e):
         """Replace correlated scalar aggregate subqueries in e by LEFT JOINs onto source.
@@ -185,8 +213,15 @@ class Optimizer:
                 return None
             left_keys.append(_outer_to_col(key[0]))
             right_keys.append(key[1])
-        if not left_keys or not self.join_beats_lookups(source, inner, right_keys[0]):
+        if not left_keys:
             return None
+        if not self.join_beats_lookups(source, inner, right_keys[0]):
+            self.note("rewrite", "Scalar subquery kept as a per-row lookup",
+                      "An index lookup for each outer row is estimated cheaper than grouping the whole inner table once.")
+            return None
+        self.note("rewrite", "Scalar aggregate subquery became a LEFT JOIN to a grouped table",
+                  "The inner table is grouped once by the correlated column and joined, instead of aggregating it "
+                  "again for every outer row; rows without a match get the aggregate over no rows (0 for count).")
         grouped_input = p.Filter(inner, and_all(local), inner.columns) if local else inner
         k, width = len(right_keys), len(source.columns)
         grouped = p.Aggregate(grouped_input, right_keys, list(aggregate.aggs),
@@ -250,6 +285,9 @@ class Optimizer:
                 cols = column_indexes(c)
                 if _movable(c) and all(i < len(node.groups) for i in cols):
                     down.append(_substitute(c, node.groups))
+                    self.note("pushdown", f"{format_expr(c)} moved below the aggregate",
+                              "It only tests grouping columns, so whole groups can be dropped before any rows are "
+                              "aggregated, as if it had been written in WHERE.")
                 else:
                     keep.append(c)
             return self.wrap(replace(node, input=self.push(node.input, down)), keep)
@@ -272,8 +310,12 @@ class Optimizer:
                 keep.append(c)
             elif side in "LN" and kind in ("INNER", "CROSS", "LEFT", "SEMI", "ANTI"):
                 left_preds.append(c)
+                self.note("pushdown", f"{format_expr(c)} pushed below the join",
+                          f"It only reads {_relation_name(node.left)}, so it filters that input before the join.")
             elif side == "R" and kind in ("INNER", "CROSS", "RIGHT"):
                 right_preds.append(shift(c, -width))
+                self.note("pushdown", f"{format_expr(c)} pushed below the join",
+                          f"It only reads {_relation_name(node.right)}, so it filters that input before the join.")
             elif side == "B" and inner:
                 join_conditions.append(c)
             else:
@@ -296,6 +338,10 @@ class Optimizer:
             if key is not None:
                 left_keys.append(key[0])
                 right_keys.append(key[1])
+                if kind in ("INNER", "CROSS"):
+                    self.note("pushdown", f"{format_expr(c)} became a hash join key",
+                              "An equality between the two sides lets the join hash one input and probe it with the "
+                              "other, instead of comparing every pair.")
             else:
                 residual.append(c)
         if kind == "CROSS" and (left_keys or residual):
@@ -322,9 +368,17 @@ class Optimizer:
         table = scan.table
         rows = self.table_rows(table)
         best_cost, best = rows, (scan, preds)
+        kept = rows
+        for c in preds:
+            kept *= self.selectivity(c, scan)
+        candidates = [{"path": f"Seq Scan on {table.name}", "rows": max(kept, 1.0), "cost": rows,
+                       "why": f"reads all {rows:,.0f} rows and tests each one"}]
         options = [(None, table.primary_key)] if table.primary_key else []
         options += [(index, index.columns) for index in table.indexes]
         for index, key_columns in options:
+            covering = (index is not None and scan.reads is not None
+                        and set(scan.reads) <= set(index.columns) | set(table.primary_key))
+            name = f"Index {'Only ' if covering else ''}Scan using {index.name if index is not None else 'primary key'}"
             used, eq, lo, hi, points, fraction = set(), [], None, None, None, 1.0
             for column in key_columns:
                 match = self.find_bound(table, preds, column, ("=",), used)
@@ -351,15 +405,32 @@ class Optimizer:
                         fraction *= self.selectivity(preds[i], scan)
                 break
             if not used:
+                lead = table.columns[key_columns[0]].name
+                candidates.append({"path": name, "rows": None, "cost": None,
+                                   "why": f"not usable: no condition on {lead}, the column it is sorted by first"})
                 continue
             estimate = rows * fraction
             if len(eq) == len(key_columns) and (index is None or index.unique):
                 estimate = min(estimate, 1.0)
-            cost = math.log2(rows + 2) + estimate * (1 if index is None else SECONDARY_LOOKUP_COST)
+            per_match = 1 if index is None or covering else SECONDARY_LOOKUP_COST
+            cost = math.log2(rows + 2) + estimate * per_match
+            conditions = " AND ".join(format_expr(preds[i]) for i in sorted(used))
+            candidates.append({"path": name, "rows": estimate, "cost": cost,
+                               "why": f"Index Cond: {conditions}; one descent (~{math.log2(rows + 2):.1f}) plus "
+                                      f"{estimate:,.1f} matches x {per_match}"
+                                      + (" (each also descends the table)" if index is not None and not covering
+                                         else " (no table lookups: every column needed is in the index)"
+                                         if covering else "")})
             if cost < best_cost:
-                node = p.IndexScan(table, index, eq, lo, hi, scan.columns, points)
+                node = p.IndexScan(table, index, eq, lo, hi, scan.columns, points, index_only=covering)
                 node.est_rows = estimate
                 best_cost, best = cost, (node, [c for i, c in enumerate(preds) if i not in used])
+        for candidate in candidates:
+            candidate["chosen"] = candidate["cost"] == best_cost and not any(c.get("chosen") for c in candidates)
+        chosen = next(c for c in candidates if c["chosen"])
+        self.note("access", f"{table.name}: {chosen['path'].split(' on ')[0].split(' using ')[0]} chosen",
+                  f"{len(candidates)} access paths considered for {', '.join(format_expr(c) for c in preds)}.",
+                  best[0], candidates)
         return best
 
     def find_in_list(self, table, preds, column, used):
@@ -416,6 +487,8 @@ class Optimizer:
         for r, (plan, _) in enumerate(relations):
             rows[1 << r] = cost[1 << r] = self.estimate(plan)
         full = (1 << n) - 1
+        names = [_relation_name(plan) for plan, _ in relations]
+        considered, finals = 0, []
         for subset in sorted(range(1, full + 1), key=lambda m: bin(m).count("1")):
             if subset in rows:
                 continue
@@ -439,6 +512,9 @@ class Optimizer:
                             hashed = any(_equi_between(conditions[ci], owner, part, other) for ci in applicable)
                             work = (rows[part] + 2 * rows[other]) if hashed else rows[part] * rows[other]
                             total = cost[part] + cost[other] + work + rows[subset]
+                            considered += 1
+                            if subset == full:
+                                finals.append((total, part, other, hashed))
                             if best is None or total < best[0]:
                                 best = (total, part, other, applicable)
                     part = (part - 1) & subset
@@ -470,6 +546,21 @@ class Optimizer:
             return join, left_layout + right_layout
 
         plan, layout = build(full)
+
+        def label(mask):
+            parts = [names[r] for r in range(n) if mask >> r & 1]
+            return parts[0] if len(parts) == 1 else "(" + " ⋈ ".join(parts) + ")"
+
+        finals.sort(key=lambda f: f[0])
+        best_total = cost[full]
+        self.note("join", f"Join order for {n} tables: {label(choice[full][0])} ⋈ {label(choice[full][1])}",
+                  f"Dynamic programming over every subset of tables (as PostgreSQL's standard planner does) "
+                  f"costed {considered} ways to join two parts. Shown: the best ways to make the last join.",
+                  plan, [{"path": f"{label(part)} ⋈ {label(other)}", "rows": rows[full], "cost": total,
+                          "chosen": total == best_total and part == choice[full][0],
+                          "why": (f"Hash Join: build a hash table on {label(other)}, probe it with {label(part)}"
+                                  if hashed else f"Nested Loop: pair every row of {label(part)} with {label(other)}")}
+                         for total, part, other, hashed in finals[:6]])
         if layout != list(range(len(columns))):
             position = {g: k for k, g in enumerate(layout)}
             plan = p.Project(plan, [Col(position[g], c.type, c.name) for g, c in enumerate(columns)], columns)
@@ -637,21 +728,61 @@ class Optimizer:
         node.est_rows = self.estimate(node)
         for child in p.inputs(node):
             self.annotate(child)
+        node.est_cost = self.cost(node)
+
+    def cost(self, node):
+        """Estimated row visits of node and everything below it (see the module docstring)."""
+        below = sum(getattr(child, "est_cost", None) or self.estimate(child) for child in p.inputs(node))
+        rows = self.estimate(node)
+        if isinstance(node, p.TableScan):
+            return self.table_rows(node.table)
+        if isinstance(node, p.IndexScan):
+            per_match = 1 if node.index is None or node.index_only else SECONDARY_LOOKUP_COST
+            return math.log2(self.table_rows(node.table) + 2) + rows * per_match
+        if isinstance(node, p.Join):
+            left, right = self.estimate(node.left), self.estimate(node.right)
+            return below + (left + 2 * right if node.left_keys else left * right) + rows
+        if isinstance(node, p.Sort):
+            return below + rows * math.log2(rows + 2)
+        if isinstance(node, (p.Aggregate, p.Window, p.Distinct, p.SetOp)):
+            return below + sum(self.estimate(child) for child in p.inputs(node))
+        return below
 
 
 # ---- 5. index-only scans ---------------------------------------------------------------------
 
 
-def mark_index_only(plan):
+def mark_index_only(plan, trace=None):
     """Set index_only on each secondary IndexScan whose index entries hold every column read above it,
     and record on each TableScan the columns read above it.
 
     An index entry is the index columns followed by the row's primary key, so a
-    scan that needs nothing else can build its rows from the index alone. The
-    columns each node needs are pushed down from the root; a plan shared by
-    several readers (a CTE) gets the union of what they need.
+    scan that needs nothing else can build its rows from the index alone.
     """
-    needed = {}  # id(scan) -> (scan, column positions)
+    for scan, columns in _needed_columns(plan).values():
+        if isinstance(scan, p.TableScan):
+            scan.reads = tuple(sorted(columns))  # what an index would need to cover (the advisor uses it)
+        elif scan.index is not None:
+            scan.uncovered = tuple(sorted(columns - set(scan.index.columns) - set(scan.table.primary_key)))
+            scan.index_only = not scan.uncovered
+            if trace is not None:
+                names = ", ".join(scan.table.columns[c].name for c in sorted(columns)) or "no columns"
+                missing = ", ".join(scan.table.columns[c].name for c in scan.uncovered)
+                trace.append({"phase": "index-only", "node": scan, "candidates": [],
+                              "title": f"{scan.index.name}: {'Index Only Scan' if scan.index_only else 'Index Scan'}",
+                              "detail": f"The query reads {names} from {scan.table.name}. " + (
+                                  "All of it is in the index entries (index columns plus the primary key), so "
+                                  "the table is never read." if scan.index_only else
+                                  f"{missing} {'is' if len(scan.uncovered) == 1 else 'are'} not in the index, "
+                                  "so each match also descends the table to fetch the row.")})
+    return plan
+
+
+def _needed_columns(plan):
+    """id(scan) -> (scan, column positions read above it) for every table and index scan, subqueries
+    included. Required columns are pushed down from the root; a plan shared by several readers (a CTE)
+    gets the union of what they need."""
+    needed = {}
 
     def subplans(exprs):
         found = False
@@ -663,12 +794,9 @@ def mark_index_only(plan):
         return found
 
     def visit(node, req):  # req: output positions read above node, or None for all of them
-        if isinstance(node, p.TableScan):
-            entry = needed.setdefault(id(node), (node, set()))
-            entry[1].update(range(len(node.columns)) if req is None else req)
-            return
-        if isinstance(node, p.IndexScan):
-            subplans(node.eq + (node.points or []) + [b[0] for b in (node.lo, node.hi) if b is not None])
+        if isinstance(node, (p.TableScan, p.IndexScan)):
+            if isinstance(node, p.IndexScan):
+                subplans(node.eq + (node.points or []) + [b[0] for b in (node.lo, node.hi) if b is not None])
             entry = needed.setdefault(id(node), (node, set()))
             entry[1].update(range(len(node.columns)) if req is None else req)
             return
@@ -702,13 +830,7 @@ def mark_index_only(plan):
                 visit(child, None)
 
     visit(plan, None)
-    for scan, columns in needed.values():
-        if isinstance(scan, p.TableScan):
-            scan.reads = tuple(sorted(columns))  # what an index would need to cover (the advisor uses it)
-        elif scan.index is not None:
-            scan.uncovered = tuple(sorted(columns - set(scan.index.columns) - set(scan.table.primary_key)))
-            scan.index_only = not scan.uncovered
-    return plan
+    return needed
 
 
 def _columns_of(exprs):
@@ -824,6 +946,19 @@ def _reaches_outside(plan):
             return True
         nodes.extend(p.inputs(node))
     return False
+
+
+def _relation_name(plan):
+    """The table a plan reads, for messages: its first scan's table, or its operator."""
+    stack = [plan]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (p.TableScan, p.IndexScan)):
+            return node.table.name
+        if isinstance(node, p.WorkTableScan):
+            return node.name
+        stack.extend(reversed(p.inputs(node)))
+    return type(plan).__name__
 
 
 def _flatten(node, offset, relations, conditions):

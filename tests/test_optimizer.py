@@ -54,8 +54,10 @@ def test_point_lookup_reads_a_root_to_leaf_path(db):
 
 def test_cost_model_picks_index_only_when_selective(db):
     assert "IndexOnlyScan orders using orders_status (status = 'open')" in plan(db, "SELECT id FROM orders WHERE status = 'open'")
-    # 98% of orders are closed: walking the index and fetching each row would cost more than a scan.
-    assert "TableScan orders" in plan(db, "SELECT id FROM orders WHERE status = 'closed'")
+    # 98% of orders are closed: walking the index and fetching each row would cost more than a scan...
+    assert "TableScan orders" in plan(db, "SELECT id, total FROM orders WHERE status = 'closed'")
+    # ...but when the index holds every column needed there is no fetch, and reading it beats the table.
+    assert "IndexOnlyScan orders using orders_status" in plan(db, "SELECT id FROM orders WHERE status = 'closed'")
     assert "IndexScan orders using primary key (id >= 1990)" in plan(db, "SELECT id FROM orders WHERE id >= 1990")
     assert "TableScan orders" in plan(db, "SELECT id FROM orders WHERE id >= 10")
 

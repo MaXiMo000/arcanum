@@ -205,7 +205,8 @@ def _query(db, message, conn, pump):
     return {"ok": True, "stats": pump.request_stats(), "results": [
         {"columns": r.columns, "rows": [list(row) for row in r.rows], "truncated": r.row_total > len(r.rows),
          "row_total": r.row_total, "rowcount": r.rowcount, "status": r.status, "plan": r.plan,
-         "advice": r.advice, "statement": r.statement}
+         "advice": r.advice, "statement": r.statement, "planner": r.planner,
+         "planning_ms": r.planning_ms, "execution_ms": r.execution_ms}
         for r in results]}
 
 

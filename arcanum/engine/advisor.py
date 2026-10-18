@@ -12,15 +12,20 @@ otherwise. Each hint is a dict:
     fix     None, or {"kind": "run", "sql", "label"}: a statement to run first
             (CREATE INDEX, ANALYZE), or {"kind": "rewrite", "sql", "original",
             "label"}: the statement rewritten
+    estimate  for a suggested index: {"before", "after", "path"}, the optimizer's own
+            cost for the table now and with the index, which is only suggested when
+            the optimizer would choose it (a hypothetical index, as PostgreSQL's
+            hypopg extension does)
 """
 
-import math
 import re
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 
 from ..sql import nodes as n
 from . import plan as p
+from .catalog import IndexSchema
 from .expr import AGGREGATES, Col, Const, Op, SubqueryExpr, column_indexes, conjuncts, format_expr, walk
+from .optimizer import Optimizer
 
 MIN_SCAN_PAGES = 8  # a full scan of fewer leaf pages than this is cheap; not worth a hint
 ROWS_PER_PAGE = 100  # rows in a typical 4 KB leaf, when nodes are not capped by max_keys
@@ -55,12 +60,13 @@ class _Advisor:
         self.catalog, self.stats, self.ids, self.text, self.limits = catalog, stats, ids, text, limits
         self.hints, self.seen = [], set()
 
-    def add(self, level, code, title, detail, node=None, fix=None):
+    def add(self, level, code, title, detail, node=None, fix=None, estimate=None):
         if (code, title) in self.seen:
             return
         self.seen.add((code, title))
         self.hints.append({"level": level, "code": code, "title": title, "detail": detail,
-                           "node": self.ids.get(id(node)) if node is not None else None, "fix": fix})
+                           "node": self.ids.get(id(node)) if node is not None else None, "fix": fix,
+                           "estimate": estimate})
 
     def rows(self, node):
         if self.stats is not None:
@@ -162,23 +168,23 @@ class _Advisor:
             return
         # An index that also holds the other columns read answers without the table (index-only);
         # one that does not costs a table descent per match, which can lose to the scan itself.
-        per_page = self.catalog.max_keys or ROWS_PER_PAGE
-        depth = max(1, math.ceil(math.log(max(total, 2), per_page)))
         extra = [c for c in scan.reads or () if c not in wanted and c not in table.primary_key]
         covering = (scan.reads is not None and len(extra) <= MAX_COVERING_EXTRA
                     and len(wanted) + len(extra) + len(table.primary_key) < len(table.columns))  # not a copy of the table
-        if not covering and depth + kept * depth >= total / per_page:
-            return
+        columns = wanted + (extra if covering else [])
         filters = [table.columns[c].name for c in wanted]
-        names = filters + ([table.columns[c].name for c in extra] if covering else [])
+        names = [table.columns[c].name for c in columns]
         index = self.index_name(table.name, names)
+        estimate = _what_if(scan, conjuncts(node.predicate), columns, index)
+        if estimate is None:
+            return  # the optimizer would keep the scan even with this index
         how = (" Because it also holds every other column the query reads (and the primary key), the answer "
                "comes from the index alone: an Index Only Scan." if covering else "")
         self.add("warn", "missing-index", f"Seq Scan read all of {table.name} to keep {share}",
                  f"No index starts with {' or '.join(filters)}, so every row was read and tested. An index on "
                  f"({', '.join(names)}) lets the engine descend the B+tree straight to the matching rows.{how}", node,
                  {"kind": "run", "sql": f"CREATE INDEX {index} ON {table.name} ({', '.join(names)})",
-                  "label": f"Create index on {table.name} ({', '.join(names)})"})
+                  "label": f"Create index on {table.name} ({', '.join(names)})"}, estimate)
 
     def stale_stats(self, scan):
         stats = scan.table.stats
@@ -274,6 +280,21 @@ class _Advisor:
 
 
 # ---- helpers ---------------------------------------------------------------------------------
+
+
+def _what_if(scan, preds, columns, name):
+    """Ask the optimizer to plan the scan as if an index on `columns` existed. Returns the estimated
+    costs without and with it, or None if it would not choose the index."""
+    table = scan.table
+    hypothetical = IndexSchema(name, table.name, list(columns), False, -1, "")
+    candidate = p.TableScan(replace(table, indexes=[*table.indexes, hypothetical]), scan.columns, scan.reads)
+    decisions = []
+    Optimizer(decisions).access_path(candidate, list(preds))
+    options = decisions[-1]["candidates"] if decisions else []
+    chosen = next((c for c in options if c["chosen"]), None)
+    if chosen is None or not chosen["path"].endswith(f"using {name}"):
+        return None
+    return {"before": options[0]["cost"], "after": chosen["cost"], "path": chosen["path"]}
 
 
 def _plan_nodes(plan):

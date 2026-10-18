@@ -1,5 +1,6 @@
 """The public entry point: open a database file and run SQL against it."""
 
+import time
 from dataclasses import dataclass, field
 
 from ..errors import ArcanumError, SqlError
@@ -27,6 +28,9 @@ class Result:
     row_total: int = 0  # rows the query produced; more than len(rows) when max_rows cut them off
     advice: list = field(default_factory=list)  # the advisor's hints (see advisor.py), when traced
     statement: str = ""  # the statement's own text, when traced
+    planner: list = field(default_factory=list)  # the optimizer's decisions (see optimizer.py), when traced
+    planning_ms: float | None = None  # binding and optimizing, when traced
+    execution_ms: float | None = None  # running the plan, when traced
 
 
 class Database:
@@ -143,7 +147,9 @@ class Database:
     def _run(self, statement, text, sql, trace=False, max_rows=None):
         binder = Binder(self.catalog, sql)
         if isinstance(statement, n.Query):
-            plan = self._plan(binder.bind_query(statement))
+            started, decisions = time.perf_counter(), [] if trace else None
+            plan = self._plan(binder.bind_query(statement), decisions)
+            planned = time.perf_counter()
             ctx = self._context(analyze=trace)
             rows, total = [], 0
             for row in run(plan, ctx):
@@ -151,11 +157,17 @@ class Database:
                 if max_rows is None or total <= max_rows:
                     rows.append(row)
             result = Result([c.name for c in plan.columns], rows, status=f"SELECT {total}", row_total=total)
-            return self._traced(result, statement, text, plan, ctx.stats) if trace else result
+            if not trace:
+                return result
+            result.planning_ms = (planned - started) * 1000
+            result.execution_ms = (time.perf_counter() - planned) * 1000
+            return self._traced(result, statement, text, plan, ctx.stats, decisions)
         if isinstance(statement, n.Explain):
             if not isinstance(statement.statement, n.Query):
                 raise SqlError("Arcanum doesn't support EXPLAIN for statements other than queries yet")
-            plan = self._plan(binder.bind_query(statement.statement))
+            started, decisions = time.perf_counter(), [] if trace else None
+            plan = self._plan(binder.bind_query(statement.statement), decisions)
+            planned = time.perf_counter()
             stats = None
             if statement.analyze:
                 ctx = self._context(analyze=True)
@@ -163,7 +175,12 @@ class Database:
                     pass
                 stats = ctx.stats
             result = Result(["plan"], [(line,) for line in explain(plan, stats)], status="EXPLAIN")
-            return self._traced(result, statement, text, plan, stats) if trace else result
+            if not trace:
+                return result
+            result.planning_ms = (planned - started) * 1000
+            if statement.analyze:
+                result.execution_ms = (time.perf_counter() - planned) * 1000
+            return self._traced(result, statement, text, plan, stats, decisions)
         if isinstance(statement, n.Insert):
             return self._insert(binder, statement)
         if isinstance(statement, (n.Update, n.Delete)):
@@ -219,20 +236,25 @@ class Database:
             self.catalog.insert_row(table, self.catalog.check_row(table, row))
         return Result(rowcount=len(rows), status=f"INSERT {len(rows)}")
 
-    def _traced(self, result, statement, text, plan=None, stats=None):
-        """Attach the plan tree (with actual rows and time, if measured) and the advisor's hints."""
+    def _traced(self, result, statement, text, plan=None, stats=None, decisions=None):
+        """Attach the plan tree (with actual rows and time, if measured), the planner's decisions and the advisor's hints."""
         ids = {}
         result.statement = text
         if plan is not None:
             result.plan = plan_tree(plan, stats, ids)
+            result.planner = [{**d, "node": ids.get(id(d["node"])) if d["node"] is not None else None}
+                              for d in decisions or []]
         result.advice = advise(statement, text, self.catalog, plan, stats, ids, self.limits)
         return result
 
     def _context(self, analyze=False):
         return Context(self.catalog, analyze, self.limits)
 
-    def _plan(self, plan):
-        return mark_index_only(Optimizer().optimize(plan)) if self.optimize else plan
+    def _plan(self, plan, decisions=None):
+        """Optimize a bound plan; decisions, if a list, receives the optimizer's reasoning."""
+        if not self.optimize:
+            return plan
+        return mark_index_only(Optimizer(decisions).optimize(plan), decisions)
 
     def _matching_rows(self, ctx, table, where):
         """(key, row) of every row the WHERE clause selects, through an index when one helps."""

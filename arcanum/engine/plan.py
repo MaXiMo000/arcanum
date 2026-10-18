@@ -256,7 +256,8 @@ def plan_tree(plan, stats=None, ids=None):
 
     def visit(node):
         entry = {"id": ids.setdefault(id(node), next(counter)), "operator": operator(node), "label": describe(node),
-                 "est_rows": getattr(node, "est_rows", None), "children": [], "subplans": []}
+                 "est_rows": getattr(node, "est_rows", None), "est_cost": getattr(node, "est_cost", None),
+                 "children": [], "subplans": []}
         if stats is not None:
             rows, seconds = stats.get(id(node), (0, 0.0))
             entry["rows"], entry["ms"] = rows, round(seconds * 1000, 3)
