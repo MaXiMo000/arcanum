@@ -91,6 +91,9 @@ class Settings:
         values = {name: _env(f"ARCANUM_{name.upper()}", getattr(d, name), int) for name in int_fields}
         values |= {name: _env(f"ARCANUM_{name.upper()}", getattr(d, name), float) for name in float_fields}
         origins = _env("ARCANUM_ALLOWED_ORIGINS", ",".join(d.allowed_origins))
+        public_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")  # set by Render for every service
+        if public_url:
+            origins = f"{origins},{public_url}"
         return cls(data_dir=_env("ARCANUM_DATA_DIR", d.data_dir), web_dir=_env("ARCANUM_WEB_DIR", d.web_dir),
                    allowed_origins=[o.strip() for o in origins.split(",") if o.strip()],
                    enable_docs=_flag(_env("ARCANUM_ENABLE_DOCS", "0")), hsts=_flag(_env("ARCANUM_HSTS", "0")),

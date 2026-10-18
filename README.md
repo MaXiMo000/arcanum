@@ -242,6 +242,34 @@ database size, returned rows and request size. See [`.env.example`](.env.example
 [SECURITY.md](SECURITY.md) for the protections, including why a public deployment still belongs behind
 a reverse proxy or CDN.
 
+## Deploy
+
+### Render
+
+The repository is a ready [Render Blueprint](https://render.com/docs/infrastructure-as-code): in the
+Render dashboard choose **New > Blueprint**, pick this repository, and Render builds the `Dockerfile`
+and starts the service from `render.yaml`. The API and the web UI are served together from one URL.
+
+`render.yaml` sizes the limits for the free instance (512 MB): up to 8 sessions at a time, each with
+its own engine process, use under 200 MB. It also enables HSTS and trusts only Render's private proxy
+addresses for `X-Forwarded-For`, so per-client limits see each visitor's real address. Sessions live in
+the instance's temporary storage and end when it restarts, which suits a demo.
+
+### Any container host
+
+```bash
+docker build -t arcanum .
+```
+
+```bash
+docker run -p 8000:8000 arcanum
+```
+
+The image builds the web UI, installs the server, runs as an unprivileged user and reports its health
+at `/health`. It listens on `$PORT` when the platform sets one. Configure it with the variables in
+[`.env.example`](.env.example); put a reverse proxy or CDN in front of a public deployment (see
+[SECURITY.md](SECURITY.md)).
+
 ## Setup
 
 Requires Python 3.11 or newer. The engine itself has no dependencies; the API server uses FastAPI.

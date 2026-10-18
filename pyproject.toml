@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 dependencies = []
 
 [project.optional-dependencies]
-server = ["fastapi>=0.110", "uvicorn>=0.29"]
+server = ["fastapi>=0.110", "uvicorn>=0.30", "websockets>=13"]  # uvicorn needs a WebSocket library for /events
 dev = ["pytest>=8", "httpx>=0.27", "arcanum-db[server]"]
 
 [tool.setuptools.packages.find]

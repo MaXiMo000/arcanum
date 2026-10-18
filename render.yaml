@@ -1,0 +1,31 @@
+# Render blueprint: New > Blueprint, pick this repository, and Render builds the Dockerfile.
+# Limits are sized for the free instance (512 MB RAM, shared CPU); raise them on larger plans.
+services:
+  - type: web
+    name: arcanum
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Render's load balancer reaches the service from private addresses and appends the real
+      # client address to X-Forwarded-For; trusting only private ranges makes per-client limits use it.
+      - key: ARCANUM_TRUSTED_PROXIES
+        value: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+      - key: ARCANUM_HSTS
+        value: "1"
+      - key: ARCANUM_MAX_SESSIONS
+        value: "8"
+      - key: ARCANUM_MAX_SESSIONS_PER_CLIENT
+        value: "2"
+      - key: ARCANUM_MAX_CONCURRENT_QUERIES
+        value: "2"
+      - key: ARCANUM_WORKER_MEMORY_MB
+        value: "320"
+      - key: ARCANUM_MAX_PAGES
+        value: "1500"
+      - key: ARCANUM_MEMORY_ROWS
+        value: "100000"
+      - key: ARCANUM_SESSION_TTL
+        value: "900"

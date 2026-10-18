@@ -1,0 +1,16 @@
+# Only the package, its metadata and the web sources go into the image.
+.git
+.dev
+.claude
+.venv
+.pytest_cache
+.ruff_cache
+**/__pycache__
+**/*.pyc
+*.db
+*.db-wal
+tests
+web/node_modules
+web/dist
+CLAUDE.md
+CLAUDE.local.md
