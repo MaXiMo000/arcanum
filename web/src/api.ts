@@ -7,6 +7,8 @@ export interface PlanNode {
   operator: string;
   label: string;
   est_rows: number | null;
+  /** The optimizer's estimated cost of this operator and everything below it, in row visits. */
+  est_cost?: number | null;
   rows?: number;
   ms?: number;
   children: PlanNode[];
@@ -30,6 +32,18 @@ export interface Advice {
   /** The plan node it is about. */
   node: number | null;
   fix: AdviceFix | null;
+  /** For a suggested index: the optimizer's cost for the table now and with it (a hypothetical index). */
+  estimate: { before: number; after: number; path: string } | null;
+}
+
+/** One decision the optimizer recorded while planning (arcanum/engine/optimizer.py). */
+export interface PlannerDecision {
+  phase: "rewrite" | "pushdown" | "access" | "join" | "index-only";
+  title: string;
+  detail: string;
+  /** The plan node it produced, if it survived into the final plan. */
+  node: number | null;
+  candidates: { path: string; rows: number | null; cost: number | null; chosen: boolean; why: string }[];
 }
 
 export interface QueryResult {
@@ -43,6 +57,9 @@ export interface QueryResult {
   advice: Advice[];
   /** The statement's own text within the script. */
   statement: string;
+  planner: PlannerDecision[];
+  planning_ms: number | null;
+  execution_ms: number | null;
 }
 
 /** What the engine did for one request (counted exactly on the server). */

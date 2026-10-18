@@ -10,21 +10,28 @@ import type { Layout } from "../layout";
 export const PX = 0.016; // world units per layout pixel
 export const LEVEL_GAP = 2.6;
 export const TREE_TOP = 6;
-export const CRYSTAL_DEPTH = 0.62;
+export const SLAB_HEIGHT = 0.5;
+export const SLAB_DEPTH = 0.42;
 export const FLOOR_Y = -3.2;
-export const TILE_GAP = 0.36;
+export const TILE_GAP = 0.34;
 export const RIVER_RADIUS = 0.75;
 const FLAT_WIDTH = 14; // trees narrower than this stay flat, like the 2D view
 const ARC_PER_UNIT = 1 / 8; // radians of ring per world unit of flat width
 const MAX_ARC = Math.PI * 1.7; // never close the ring completely, so the key order keeps a start and end
 
 export const COLORS = {
-  background: new Color("#060912"),
-  internal: new Color("#5d7dff"),
-  leaf: new Color("#ffc65a"),
+  background: new Color("#04060f"),
+  internal: new Color("#3c5ee8"),
+  internalGlow: new Color("#2238a8"),
+  leaf: new Color("#b98522"),
+  leafGlow: new Color("#6b4708"),
+  floor: new Color("#070b19"),
+  platform: new Color("#0d1328"),
+  hover: new Color("#8fd8ff"),
   visit: new Color("#fff1a6"),
   split: new Color("#ff5fd2"),
-  edge: new Color("#2b3866"),
+  edge: new Color("#33438a"),
+  link: new Color("#7a6230"),
   edgeLit: new Color("#ffd76b"),
   spark: new Color("#fff4c4"),
   hit: new Color("#39e08c"),
@@ -55,11 +62,18 @@ export interface CrystalNode {
   length: number;
 }
 
+export interface TreeEdge {
+  from: number; // parent's position in nodes
+  to: number; // child's position in nodes
+  offset: number; // where along the parent the pointer leaves: the gap between the keys it separates
+}
+
 export interface Placement {
   nodes: CrystalNode[];
   index: Map<number, number>; // page -> position in nodes
   parent: Map<number, number>; // child page -> parent page
-  edges: [number, number][]; // node positions: parent, child
+  edges: TreeEdge[];
+  links: [number, number][]; // leaf chain: each leaf to the next, by position in nodes
   halfWidth: number; // farthest reach from the centre, sideways
   curved: boolean; // bent into a ring, so best seen from higher up
 }
@@ -91,17 +105,21 @@ export function placeTree(layout: Layout): Placement {
   });
   const index = new Map(nodes.map((n, i) => [n.page, i]));
   const parent = new Map<number, number>();
-  const edges: [number, number][] = [];
+  const edges: TreeEdge[] = [];
+  const links: [number, number][] = [];
   for (const p of layout.nodes) {
-    for (const child of p.node.children) {
+    p.node.children.forEach((child, i) => {
       const c = index.get(child);
-      if (c === undefined) continue;
+      if (c === undefined) return;
       parent.set(child, p.node.page);
-      edges.push([index.get(p.node.page)!, c]);
-    }
+      const gap = p.slots[i] ?? p.width - 8;
+      edges.push({ from: index.get(p.node.page)!, to: c, offset: (gap - p.width / 2) * PX });
+    });
+    const next = p.node.leaf && p.node.next ? index.get(p.node.next) : undefined;
+    if (next !== undefined) links.push([index.get(p.node.page)!, next]);
   }
   const halfWidth = Math.max(3, ...nodes.map((n) => Math.abs(n.x) + n.length / 2));
-  return { nodes, index, parent, edges, halfWidth, curved: arc > 0 };
+  return { nodes, index, parent, edges, links, halfWidth, curved: arc > 0 };
 }
 
 /** Where page `page` sits on the floor grid. */
@@ -112,7 +130,7 @@ export function tilePosition(page: number, columns: number, rows: number): [numb
 }
 
 export function floorShape(pageCount: number): { columns: number; rows: number } {
-  const columns = Math.max(8, Math.min(72, Math.ceil(Math.sqrt(pageCount * 2.5))));
+  const columns = Math.max(10, Math.min(48, Math.ceil(Math.sqrt(pageCount * 3))));
   return { columns, rows: Math.max(1, Math.ceil(pageCount / columns)) };
 }
 

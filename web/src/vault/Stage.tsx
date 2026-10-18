@@ -77,13 +77,13 @@ export function Rig({ bounds, fitKey, resetKey, elevation }: {
   return null;
 }
 
-/** Renders the scene through a bloom pass, so bright colours glow. Takes over R3F's render loop. */
+/** Renders the scene through a bloom pass; the high threshold keeps the glow to flashes and lit edges. Takes over R3F's render loop. */
 export function Bloom() {
   const { gl, scene, camera, size } = useThree();
   const composer = useMemo(() => {
     const c = new EffectComposer(gl);
     c.addPass(new RenderPass(scene, camera));
-    c.addPass(new UnrealBloomPass(new Vector2(size.width, size.height), 0.85, 0.55, 0.62));
+    c.addPass(new UnrealBloomPass(new Vector2(size.width, size.height), 0.62, 0.55, 0.86));
     c.addPass(new OutputPass());
     return c;
   }, [gl, scene, camera]); // size is applied by the effect below, so resizing never rebuilds the passes

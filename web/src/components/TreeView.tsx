@@ -18,7 +18,7 @@ const MARGIN = 24;
 export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs }: Props) {
   const [zoom, setZoom] = useState<number | "fit">("fit");
   const scroller = useRef<HTMLDivElement>(null);
-  const [available, setAvailable] = useState(800);
+  const [available, setAvailable] = useState({ width: 800, height: 420 });
   const rootCentreRef = useRef(0);
   const tree = pickTree(trees, selected);
   const hasTree = tree !== undefined;
@@ -26,9 +26,10 @@ export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs }: Prop
   useEffect(() => {
     const el = scroller.current;
     if (!el) return;
-    const observer = new ResizeObserver(() => setAvailable(el.clientWidth));
+    const measure = () => setAvailable({ width: el.clientWidth, height: el.clientHeight });
+    const observer = new ResizeObserver(measure);
     observer.observe(el);
-    setAvailable(el.clientWidth);
+    measure();
     return () => observer.disconnect();
   }, [hasTree]);
 
@@ -49,8 +50,11 @@ export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs }: Prop
   const levels = Math.max(...layout.nodes.map((p) => p.depth)) + 1;
   const margin = MARGIN;
   const fullWidth = layout.width + margin * 2;
-  // Fit shrinks wide trees, but never below the size where keys stay readable; past that it scrolls.
-  const scale = zoom === "fit" ? Math.min(1.25, Math.max(0.5, (available - 4) / fullWidth)) : zoom;
+  const fullHeight = layout.height + margin * 2;
+  // Fit fills the panel both ways, but never shrinks below the size where keys stay readable; past
+  // that it scrolls.
+  const fit = Math.min((available.width - 4) / fullWidth, (available.height - 4) / fullHeight, 1.8);
+  const scale = zoom === "fit" ? Math.max(0.5, fit) : zoom;
   const root = layout.nodes.find((p) => p.node.page === tree.root);
   rootCentreRef.current = root ? (root.x + root.width / 2 + margin) * scale : 0;
 
@@ -74,12 +78,27 @@ export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs }: Prop
         <svg
           className="tree-svg"
           width={fullWidth * scale}
-          height={(layout.height + margin * 2) * scale}
+          height={fullHeight * scale}
           viewBox={`${-margin} ${-margin} ${layout.width + margin * 2} ${layout.height + margin * 2}`}
           role="img"
           aria-label={`B+tree of ${tree.name} with ${tree.nodes.length} nodes`}
         >
           <defs>
+            <linearGradient id="node-internal" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" className="grad-internal-top" />
+              <stop offset="1" className="grad-internal-bottom" />
+            </linearGradient>
+            <linearGradient id="node-leaf" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" className="grad-leaf-top" />
+              <stop offset="1" className="grad-leaf-bottom" />
+            </linearGradient>
+            <filter id="node-glow" x="-30%" y="-60%" width="160%" height="220%">
+              <feGaussianBlur stdDeviation="5" result="blur" />
+              <feMerge>
+                <feMergeNode in="blur" />
+                <feMergeNode in="SourceGraphic" />
+              </feMerge>
+            </filter>
             <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
               <path d="M0 0 8 4 0 8z" className="arrow-head" />
             </marker>
@@ -105,14 +124,15 @@ export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs }: Prop
                 <title>
                   {`page ${p.node.page} · ${p.node.leaf ? "leaf" : "internal"} · ${p.node.keys.length} keys`}
                 </title>
-                <rect className={`node-box ${p.node.leaf ? "leaf" : "internal"}`} width={p.width} height={NODE_HEIGHT} rx={6} />
+                <rect className={`node-box ${p.node.leaf ? "leaf" : "internal"}`} width={p.width} height={NODE_HEIGHT} rx={9} />
                 {active && (
                   <rect
                     key={active.at}
                     className={`node-flash ${active.kind}`}
                     width={p.width}
                     height={NODE_HEIGHT}
-                    rx={6}
+                    rx={9}
+                    filter="url(#node-glow)"
                   />
                 )}
                 {p.labels.map((label, i) => {

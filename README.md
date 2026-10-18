@@ -123,10 +123,23 @@ The binder's plan is correct but naive; the optimizer rewrites it into a cheaper
    `UPDATE` and `DELETE` find their rows the same way.
 4. **Join ordering.** A cluster of inner joins is re-planned by dynamic programming over subsets of
    tables (the System R approach), choosing the order and each hash join's build side by estimated cost.
-5. **Index-only scans.** The columns each operator reads are pushed down from the root. A scan through
-   a secondary index whose entries already hold all of them (an entry is the index columns plus the
-   primary key) builds its rows from the index alone and never reads the table: `IndexOnlyScan` in
-   `EXPLAIN`.
+5. **Index-only scans.** Before choosing access paths the optimizer works out which columns each
+   table must produce. An index whose entries hold all of them (an entry is the index columns plus the
+   primary key) is costed without the table lookup per match, and the scan builds its rows from the
+   index alone: `IndexOnlyScan` in `EXPLAIN`.
+
+Costs are in row visits: a full scan costs one per row, an index scan a descent plus one per match (four
+for a secondary index that must also descend the table), a hash join reads both inputs and a nested loop
+pairs them all. Every plan node carries its estimated rows and cost.
+
+### Why the plan looks the way it does
+
+`Database.execute(sql, trace=True)` also returns `planner`: every decision the optimizer made, in order,
+with planning and execution time. Subquery rewrites (and why a subquery stayed a per-row SubPlan),
+conditions pushed below joins and aggregates, equalities turned into hash keys, every access path costed
+for each table (a sequential scan, each usable index with its estimated rows and cost, and each index that
+could not be used and why), the join orders considered with their costs, and the index-only check. Each
+decision points at the plan node it produced.
 
 ## Query advisor and error doctor
 
@@ -137,7 +150,7 @@ remedy is clear, a fix: a statement to run first or the statement rewritten.
 
 | Finding | Fix |
 |---|---|
-| A full scan keeps a small share of a large table | `CREATE INDEX` on the filtered columns, extended to cover the other columns read when that makes the query index-only; suggested only when the estimated pages beat the scan |
+| A full scan keeps a small share of a large table | `CREATE INDEX` on the filtered columns, extended to cover the other columns read when that makes the query index-only. Before suggesting it, the advisor has the optimizer plan the query as if the index existed (a hypothetical index, like PostgreSQL's hypopg) and suggests it only if the optimizer would use it, with both costs |
 | An index exists but the optimizer, without statistics, chose a scan | `ANALYZE` |
 | Rows fetched one by one through an index for one or two missing columns | a covering index |
 | Estimates far from the actual rows, or statistics out of date | `ANALYZE` |
@@ -208,10 +221,17 @@ Two modes share one screen: the database in the middle, an inspector on the righ
 The inspector explains every statement:
 
 - **What happened**: the run as plain sentences, each with the reason it matters.
-- **Plan flow**: the plan as a diagram under PostgreSQL's operator names (Seq Scan, Index Only Scan, Hash
-  Semi Join, HashAggregate...). Rows flow up edges drawn to scale, each operator shows actual and
-  estimated rows (flagged when they differ tenfold), and a bar shows its own share of the time. Click an
-  operator for what it does; expand to full screen.
+- **Plan**, three ways, shaped the way PostgreSQL presents a plan (filters folded into the scan below them
+  with "Rows Removed by Filter", a hash join's build side under a Hash node, `Index Cond`, `Hash Cond`,
+  `Group Key`, `Sort Key`, `_pkey` index names):
+  - **Flow**: operators as cards with particles streaming up edges sized by row count; actual and
+    estimated rows (flagged when tenfold apart), estimated cost, own share of the time, and advisor
+    findings on the operators they concern. Click an operator for what it does and why the planner chose
+    it: every alternative it costed, side by side.
+  - **How it was chosen**: the planner's journey phase by phase (parse and bind, subquery rewrites,
+    filter pushdown, access paths, join order, the index-only check, execution, and what could be
+    better), each with the PostgreSQL step it corresponds to.
+  - **EXPLAIN**: the plan printed as `EXPLAIN ANALYZE` would print it, with planning and execution time.
 - **Advisor**: a health grade and the findings above. One click applies a fix and measures the statement
   before and after: pages read, tree nodes visited, time and access path.
 - **Doctor**: on an error, the explanation, the change as a diff, and a button that applies it and runs.
@@ -232,10 +252,13 @@ The 2D view shows the engine working as you run SQL:
 - Playback at full speed, normal speed or slow motion, a light and a dark theme, and a layout that works
   down to phone width.
 
-Switch to **3D** for the crystal vault: the selected tree hangs like a chandelier of glowing crystals
-(the root at the centre, each level on a wider ring, keys in order around it), a query's descent sends
-sparks from node to node, splits flare, the pages of the file form a floor that lights up as they are read
-and written, and the write-ahead log spirals down beside it until a checkpoint pours it into the floor.
+Switch to **3D** for the vault: the selected tree as lit glass slabs with their keys written on their
+faces, hung from curved pointers that leave each parent from the gap between the keys they separate, with
+the leaves chained in order (a wide tree bends into a ring). A query's descent sends a comet down each
+pointer it follows and rings each node it reaches; splits flare. Under the tree, the data file is a
+platform of tiles, one per page, raised while in the buffer pool and flashing on every read and write; the
+write-ahead log spirals down beside it until a checkpoint pours it into the floor. Studio lighting,
+reflections and a restrained bloom keep the glow for what the engine is doing.
 Pulling the plug blows the crystals apart until recovery reassembles them. Hover anything for its page and
 keys; drag to orbit. The 3D view is a separate download (three.js), fetched only when it is first opened,
 and falls back to 2D where WebGL is unavailable.
@@ -431,8 +454,8 @@ Arcanum aims to be the clearest way to see how a database works from the inside.
   and catch-up you can trigger.
 - **Buffer pool policies**: LRU, Clock and 2Q on the same workload, with their hit rates over time.
 - **Overflow pages** for rows larger than a page, and **TOAST-style** compression.
-- **Merge join and sort-order awareness**: indexes that satisfy `ORDER BY`, and an optimizer that costs
-  index-only scans when choosing access paths.
+- **Merge join and sort-order awareness**: indexes that satisfy `ORDER BY`, and startup costs so
+  `LIMIT` can prefer plans that produce their first rows early.
 - **More advisor rules**: unused and duplicate indexes, an index advisor over a whole workload, and
   rewrites for `OR` across indexed columns.
 - **Sharing**: permalinks to a database snapshot and a query, CSV import, and a classroom mode where a

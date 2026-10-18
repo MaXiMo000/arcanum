@@ -1,8 +1,9 @@
 // The query advisor: what the engine thinks of the last statement, with one-click fixes and a
 // before/after measurement of each fix.
 import { useState, type CSSProperties } from "react";
-import type { Advice, AdviceFix, PlanNode, QueryResult } from "../api";
-import { operatorInfo } from "../flow/operators";
+import type { Advice, AdviceFix, QueryResult } from "../api";
+import { formatCount } from "../format";
+import { flatten, toPostgres } from "../flow/postgres";
 import { RichText } from "../learn/RichText";
 import { pagesRead, type Outcome } from "../learn/outcome";
 
@@ -93,6 +94,16 @@ export function Advisor({ outcome, comparison, onApply, busy }: Props) {
               <p>
                 <RichText text={advice.detail} />
               </p>
+              {advice.estimate && (
+                <div className="estimate" title="The optimizer planned the query as if the index existed, without creating it">
+                  <span className="muted">Planner estimate</span>
+                  <span className="estimate-cost">cost {formatCount(advice.estimate.before)}</span>
+                  <span aria-hidden="true">→</span>
+                  <span className="estimate-cost better">cost {formatCount(advice.estimate.after)}</span>
+                  <span className="better">−{Math.round((1 - advice.estimate.after / advice.estimate.before) * 100)}%</span>
+                  <span className="estimate-path">via {advice.estimate.path}</span>
+                </div>
+              )}
               {advice.fix && (
                 <div className="advice-fix">
                   {advice.fix.kind === "rewrite" && advice.fix.original ? (
@@ -114,15 +125,9 @@ export function Advisor({ outcome, comparison, onApply, busy }: Props) {
 }
 
 function scans(results: QueryResult[]): string[] {
-  const out: string[] = [];
-  const visit = (node: PlanNode) => {
-    const info = operatorInfo(node);
-    if (info.family === "scan" || info.family === "index") out.push(`${info.name} ${info.detail.split(" (")[0]}`);
-    node.children.forEach(visit);
-    node.subplans.forEach((s) => visit(s.plan));
-  };
-  results.forEach((r) => r.plan && visit(r.plan));
-  return out;
+  return results.flatMap((r) =>
+    r.plan ? flatten(toPostgres(r.plan)).filter((n) => n.family === "scan" || n.family === "index").map((n) => n.name) : [],
+  );
 }
 
 function CompareCard({ comparison }: { comparison: Comparison }) {

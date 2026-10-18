@@ -9,6 +9,7 @@ import { layoutTree } from "../layout";
 import { CrystalTree } from "./CrystalTree";
 import { LogRiver } from "./LogRiver";
 import { PageFloor, type PageInfo } from "./PageFloor";
+import { Scenery } from "./Scenery";
 import { Bloom, Rig, type Bounds } from "./Stage";
 import { COLORS, FLOOR_Y, RIVER_RADIUS, TREE_TOP, placeTree, type Motion } from "./world";
 
@@ -78,13 +79,13 @@ export default function Vault({ trees, selected, onSelect, feed, flashMs, state,
   // The scene runs from the tree's left edge to the log river beside its right edge.
   const halfWidth = placement?.halfWidth ?? 3;
   const riverX = halfWidth + 2.6;
-  const left = -halfWidth - 1;
-  const right = riverX + RIVER_RADIUS + 1;
+  const left = -halfWidth - 0.4;
+  const right = riverX + RIVER_RADIUS + 0.4;
   const bounds: Bounds = {
     centerX: (left + right) / 2,
     centerY: (TREE_TOP + FLOOR_Y) / 2,
     width: right - left,
-    height: TREE_TOP - FLOOR_Y + 3,
+    height: TREE_TOP - FLOOR_Y + 1.2,
   };
 
   const describe = useCallback(
@@ -151,14 +152,15 @@ export default function Vault({ trees, selected, onSelect, feed, flashMs, state,
           role="img"
         >
           <color attach="background" args={[COLORS.background]} />
-          <fog attach="fog" args={[COLORS.background, 40, 160]} />
+          <fog attach="fog" args={[COLORS.background, 28, 110]} />
+          <Scenery motion={motion} />
           <CrashMotion feed={feed} motion={motion} />
           <CrystalTree placement={placement} feed={feed} flashMs={flashMs} motion={motion} onHover={onNodeHover} />
-          <PageFloor pages={pages} feed={feed} flashMs={flashMs} motion={motion} onHover={onPageHover} />
+          <PageFloor pages={pages} pageSize={state.pager.page_size} feed={feed} flashMs={flashMs} motion={motion} onHover={onPageHover} />
           <LogRiver feed={feed} x={riverX} />
           <Rig
             bounds={bounds}
-            elevation={placement.curved ? 0.6 : 0.3}
+            elevation={placement.curved ? 0.55 : 0.28}
             resetKey={`${tree.name}:${frameCount}`}
             fitKey={`${levels}:${Math.round(bounds.width / 4)}`}
           />

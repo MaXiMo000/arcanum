@@ -14,7 +14,7 @@ import { WalTape } from "./WalTape";
 const TABS: { id: InspectorTab; label: string }[] = [
   { id: "explain", label: "What happened" },
   { id: "results", label: "Results" },
-  { id: "flow", label: "Plan flow" },
+  { id: "flow", label: "Plan" },
   { id: "advisor", label: "Advisor" },
   { id: "pages", label: "Pages" },
   { id: "log", label: "Log" },
@@ -61,7 +61,11 @@ export function Inspector(props: Props) {
       body = errorBox || (outcome ? <Results results={outcome.results} /> : <Empty what="results" />);
       break;
     case "flow":
-      body = outcome ? <QueryFlow key={outcome.id} results={outcome.results} /> : <Empty what="the query plan as a flow" />;
+      body = outcome ? (
+        <QueryFlow key={outcome.id} results={outcome.results} spilled={outcome.stats.sort_spills > 0} />
+      ) : (
+        <Empty what="the query plan" />
+      );
       break;
     case "advisor":
       body = errorBox || <Advisor outcome={outcome} comparison={props.comparison} onApply={props.onApply} busy={props.busy} />;
