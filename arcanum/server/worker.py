@@ -12,8 +12,11 @@ import json
 import logging
 import secrets
 import sys
+import time
+from collections import Counter
 
 from ..engine import Database, QueryLimits
+from ..engine.doctor import diagnose
 from ..errors import ArcanumError, ConstraintError, ExecutionError, SqlError
 from ..events import EventBus
 from ..storage import PAGE_SIZE, decode
@@ -57,11 +60,41 @@ class EventPump:
         self.buffer = []
         self.seq = 0
         self.count = 0
+        self.kinds = Counter()  # every event of the current request, counted even past the limit
+        self.started = time.perf_counter()
 
     def start_request(self):
         self.count = 0
+        self.kinds = Counter()
+        self.started = time.perf_counter()
+
+    def request_stats(self):
+        """What the engine did for the current request, for explanations and lesson checks."""
+        k = self.kinds
+        return {
+            "elapsed_ms": round((time.perf_counter() - self.started) * 1000, 2),
+            "cache_hits": k["read:cache"],
+            "disk_reads": k["read:disk"],
+            "nodes_visited": k["node_visit"],
+            "pages_written": k["page_write"],
+            "pages_allocated": k["page_alloc"],
+            "pages_freed": k["page_free"],
+            "evictions": k["cache_evict"],
+            "splits": k["node_split"],
+            "merges": k["node_merge"] + k["node_redistribute"],
+            "root_grew": k["root_grow"],
+            "root_shrank": k["root_shrink"],
+            "log_frames": k["wal_append"],
+            "commits": k["commit"],
+            "checkpoints": k["checkpoint"],
+            "rollbacks": k["rollback"],
+            "sort_spills": k["sort_spill"],
+        }
 
     def on_event(self, kind, data):
+        self.kinds[kind] += 1
+        if kind == "page_read":
+            self.kinds["read:cache" if data.get("source") == "cache" else "read:disk"] += 1
         self.count += 1
         if self.count > self.limit:
             if self.count == self.limit + 1:
@@ -94,6 +127,10 @@ def error_json(e):
         error = {"type": type(e).__name__, "message": getattr(e, "message", str(e))}
         if isinstance(e, SqlError) and e.line is not None:
             error.update(line=e.line, column=e.col)
+        if getattr(e, "completed", 0):
+            error["completed"] = e.completed  # statements before the failing one, which did run
+        if getattr(e, "doctor", None):
+            error["doctor"] = e.doctor
         return error
     # Anything else is a fault on our side. Keep the details (which may include file paths) in the
     # server log, and give the client only a reference to them.
@@ -143,7 +180,7 @@ def worker_main(path, conn, event_conn, options):
             return
         pump.start_request()
         try:
-            reply = handlers[message["op"]](db, message, conn)
+            reply = handlers[message["op"]](db, message, conn, pump)
         except ArcanumError as e:
             reply = {"ok": False, "error": error_json(e)}
         except Exception as e:
@@ -155,15 +192,24 @@ def worker_main(path, conn, event_conn, options):
             send(conn, {"ok": False, "error": error_json(e)})
 
 
-def _query(db, message, conn):
-    results = db.execute_script(message["sql"], trace=True, max_rows=message["max_rows"])
-    return {"ok": True, "results": [
+def _query(db, message, conn, pump):
+    try:
+        results = db.execute_script(message["sql"], trace=True, max_rows=message["max_rows"])
+    except (SqlError, ConstraintError) as e:
+        e.doctor = diagnose(e, db.catalog, message["sql"])
+        if e.doctor and e.doctor["fix"]:
+            # What to run now: the corrected script from the failing statement on, since
+            # the statements before it already ran. Every fix edits at or after that point.
+            e.doctor["rerun"] = e.doctor["fix"][getattr(e, "statement_start", 0):]
+        raise
+    return {"ok": True, "stats": pump.request_stats(), "results": [
         {"columns": r.columns, "rows": [list(row) for row in r.rows], "truncated": r.row_total > len(r.rows),
-         "row_total": r.row_total, "rowcount": r.rowcount, "status": r.status, "plan": r.plan}
+         "row_total": r.row_total, "rowcount": r.rowcount, "status": r.status, "plan": r.plan,
+         "advice": r.advice, "statement": r.statement}
         for r in results]}
 
 
-def _state(db, message, conn):
+def _state(db, message, conn, pump):
     """Everything a visualizer needs to draw the database: trees, cache and log."""
     catalog, pager = db.catalog, db.pager
     limit = message.get("node_limit", 2000)
@@ -191,7 +237,7 @@ def _state(db, message, conn):
         "in_transaction": db.in_transaction}
 
 
-def _workload(db, message, conn):
+def _workload(db, message, conn, pump):
     """Commit batches of rows until the server pulls the plug, reporting each commit as it lands."""
     db.execute(CRASH_TABLE)
     # Repeated demos must not grow the table toward the session's size limit.

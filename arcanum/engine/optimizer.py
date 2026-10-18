@@ -20,6 +20,9 @@ Passes, in order:
    programming over subsets of tables (the System R approach), choosing the
    order and the hash-build side with the lowest estimated cost. A projection
    restores the original column order.
+5. Index-only scans. A scan through a secondary index whose entries already
+   hold every column the query reads skips the table lookup per row
+   (mark_index_only, run on the final plan).
 
 Estimates use ANALYZE statistics when present (row counts, distinct counts,
 NULL counts, equi-depth histograms) and fixed guesses otherwise.
@@ -634,6 +637,82 @@ class Optimizer:
         node.est_rows = self.estimate(node)
         for child in p.inputs(node):
             self.annotate(child)
+
+
+# ---- 5. index-only scans ---------------------------------------------------------------------
+
+
+def mark_index_only(plan):
+    """Set index_only on each secondary IndexScan whose index entries hold every column read above it,
+    and record on each TableScan the columns read above it.
+
+    An index entry is the index columns followed by the row's primary key, so a
+    scan that needs nothing else can build its rows from the index alone. The
+    columns each node needs are pushed down from the root; a plan shared by
+    several readers (a CTE) gets the union of what they need.
+    """
+    needed = {}  # id(scan) -> (scan, column positions)
+
+    def subplans(exprs):
+        found = False
+        for e in exprs:
+            for x in walk(e):
+                if isinstance(x, SubqueryExpr):
+                    found = True
+                    visit(x.plan, None)
+        return found
+
+    def visit(node, req):  # req: output positions read above node, or None for all of them
+        if isinstance(node, p.TableScan):
+            entry = needed.setdefault(id(node), (node, set()))
+            entry[1].update(range(len(node.columns)) if req is None else req)
+            return
+        if isinstance(node, p.IndexScan):
+            subplans(node.eq + (node.points or []) + [b[0] for b in (node.lo, node.hi) if b is not None])
+            entry = needed.setdefault(id(node), (node, set()))
+            entry[1].update(range(len(node.columns)) if req is None else req)
+            return
+        if subplans(p.expressions(node)):
+            # A subquery may read any column of this node's row as an outer reference.
+            for child in p.inputs(node):
+                visit(child, None)
+            return
+        uses = _columns_of(p.expressions(node))
+        if isinstance(node, (p.Filter, p.Sort, p.Limit)):
+            visit(node.input, None if req is None else req | uses)
+        elif isinstance(node, p.Project):
+            visit(node.input, uses if req is None else _columns_of(node.exprs[i] for i in req))
+        elif isinstance(node, p.Aggregate):
+            visit(node.input, uses)
+        elif isinstance(node, p.Window):
+            width = len(node.input.columns)
+            visit(node.input, None if req is None else {i for i in req if i < width} | uses)
+        elif isinstance(node, p.Join) and req is not None:
+            width = len(node.left.columns)
+            left = {i for i in req if i < width} | _columns_of(node.left_keys)
+            right = {i - width for i in req if i >= width} | _columns_of(node.right_keys)
+            if node.residual is not None:
+                both = column_indexes(node.residual)
+                left |= {i for i in both if i < width}
+                right |= {i - width for i in both if i >= width}
+            visit(node.left, left)
+            visit(node.right, right)
+        else:
+            for child in p.inputs(node):
+                visit(child, None)
+
+    visit(plan, None)
+    for scan, columns in needed.values():
+        if isinstance(scan, p.TableScan):
+            scan.reads = tuple(sorted(columns))  # what an index would need to cover (the advisor uses it)
+        elif scan.index is not None:
+            scan.uncovered = tuple(sorted(columns - set(scan.index.columns) - set(scan.table.primary_key)))
+            scan.index_only = not scan.uncovered
+    return plan
+
+
+def _columns_of(exprs):
+    return set().union(*(column_indexes(e) for e in exprs))
 
 
 # ---- helpers ---------------------------------------------------------------------------------

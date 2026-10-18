@@ -53,11 +53,52 @@ def test_point_lookup_reads_a_root_to_leaf_path(db):
 
 
 def test_cost_model_picks_index_only_when_selective(db):
-    assert "IndexScan orders using orders_status (status = 'open')" in plan(db, "SELECT id FROM orders WHERE status = 'open'")
+    assert "IndexOnlyScan orders using orders_status (status = 'open')" in plan(db, "SELECT id FROM orders WHERE status = 'open'")
     # 98% of orders are closed: walking the index and fetching each row would cost more than a scan.
     assert "TableScan orders" in plan(db, "SELECT id FROM orders WHERE status = 'closed'")
     assert "IndexScan orders using primary key (id >= 1990)" in plan(db, "SELECT id FROM orders WHERE id >= 1990")
     assert "TableScan orders" in plan(db, "SELECT id FROM orders WHERE id >= 10")
+
+
+def test_index_only_scans_skip_the_table(db):
+    sql = "SELECT id, status FROM orders WHERE status = 'open'"
+    assert "IndexOnlyScan orders using orders_status" in plan(db, sql)
+    covered, rows = pages_read(db, sql)
+    # Needing a column outside the index means a table lookup per row.
+    wider = "SELECT id, status, customer FROM orders WHERE status = 'open'"
+    assert "IndexScan orders using orders_status" in plan(db, wider)
+    fetched, more = pages_read(db, wider)
+    assert rows == [row[:2] for row in more] and len(rows) == 40 and covered * 3 < fetched
+
+
+def test_index_only_rows_match_full_rows(tmp_path):
+    with Database(tmp_path / "t.db", max_keys=8) as db:
+        db.execute_script("""
+            CREATE TABLE t (a INTEGER, b REAL, flag BOOLEAN, note TEXT, PRIMARY KEY (a, b));
+            CREATE TABLE r (x INTEGER, y TEXT);
+            CREATE INDEX t_flag ON t (flag, note);
+            CREATE INDEX r_y ON r (y);
+            INSERT INTO t VALUES (1, 1.5, TRUE, 'p'), (1, 2.0, FALSE, NULL), (2, 1.0, TRUE, 'q'), (3, 0.5, NULL, 'p');
+            INSERT INTO r VALUES (1, 'u'), (2, 'v'), (3, 'u'), (NULL, NULL);
+        """)
+        queries = [
+            "SELECT a, b, flag FROM t WHERE flag = TRUE ORDER BY a",
+            "SELECT note, count(*) FROM t WHERE flag = FALSE OR flag = TRUE GROUP BY note ORDER BY note",
+            "SELECT y FROM r WHERE y = 'u'",
+            "WITH c AS (SELECT * FROM t WHERE flag = TRUE) SELECT a FROM c UNION ALL SELECT a + 10 FROM c WHERE note = 'p'",
+            "SELECT a FROM t WHERE flag = TRUE AND EXISTS (SELECT 1 FROM r WHERE r.x = t.a AND r.y = t.note)",
+        ]
+        expected = {}
+        db.optimize = False
+        for q in queries:
+            expected[q] = db.execute(q).rows
+        db.optimize = True
+        for q in queries:
+            assert db.execute(q).rows == expected[q], q
+        assert "IndexOnlyScan t using t_flag" in plan(db, queries[0])
+        assert "IndexOnlyScan r using r_y" in plan(db, queries[2])
+        # The CTE is read for a and for note; both are in the index entry.
+        assert "IndexScan t using t_flag" not in plan(db, queries[3])
 
 
 def test_index_ranges_handle_nulls_types_and_composite_keys(db):
@@ -104,7 +145,7 @@ def test_in_lists_become_index_point_lookups(db):
     full_scan, same = pages_read(db, sql)
     db.optimize = True
     assert rows == same == [(7, 8), (1500, 1)] and reads * 5 < full_scan
-    assert "IndexScan orders using orders_customer (customer IN (4, 5))" in plan(
+    assert "IndexOnlyScan orders using orders_customer (customer IN (4, 5))" in plan(
         db, "SELECT id FROM orders WHERE customer IN (4, 5)")
     assert len(db.execute("SELECT id FROM orders WHERE customer IN (4, 5)").rows) == 40
 

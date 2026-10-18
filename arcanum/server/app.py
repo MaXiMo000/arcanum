@@ -246,7 +246,7 @@ def create_app(settings=None):
         reply = await session.request({"op": "query", "sql": body.sql, "max_rows": settings.max_rows})
         if not reply["ok"]:
             return JSONResponse({"error": reply["error"]}, status_code=400)
-        return {"results": reply["results"]}
+        return {"results": reply["results"], "stats": reply["stats"]}
 
     @app.get("/sessions/{session_id}/state")
     async def state(session_id: str):

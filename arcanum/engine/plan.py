@@ -26,6 +26,7 @@ class OneRow:
 class TableScan:
     table: object  # catalog.TableSchema
     columns: list
+    reads: tuple | None = None  # columns read above the scan, once mark_index_only has run
 
 
 @dataclass(eq=False)
@@ -36,7 +37,9 @@ class IndexScan:
     lo or hi is set, lies in that range, or if points is set, equals one of
     those values (an IN list: one lookup per distinct value). lo and hi are
     (expr, inclusive). All bound expressions are constants or outer
-    references, evaluated once per scan.
+    references, evaluated once per scan. index_only: the index entries hold
+    every column the query reads, so the table is never consulted; columns
+    outside the index come back as NULL.
     """
     table: object
     index: object  # catalog.IndexSchema, or None for the table's primary key
@@ -45,6 +48,8 @@ class IndexScan:
     hi: tuple | None
     columns: list
     points: list | None = None
+    index_only: bool = False
+    uncovered: tuple = ()  # columns read above the scan that the index entries lack
 
     @property
     def key_columns(self):
@@ -197,7 +202,7 @@ def describe(node):
         if node.points is not None:
             conditions.append(f"{column} IN ({', '.join(map(format_expr, node.points))})")
         using = node.index.name if node.index is not None else "primary key"
-        return f"IndexScan {node.table.name} using {using} ({' AND '.join(conditions)})"
+        return f"{operator(node)} {node.table.name} using {using} ({' AND '.join(conditions)})"
     if isinstance(node, WorkTableScan):
         return f"WorkTableScan {node.name}"
     if isinstance(node, Values):
@@ -234,12 +239,23 @@ def describe(node):
     return type(node).__name__
 
 
-def plan_tree(plan, stats=None):
-    """The plan as nested dicts for a UI: label, operator, estimate, and actual rows and time if traced."""
+def operator(node):
+    """The operator's name; an IndexScan that never reads the table is an IndexOnlyScan."""
+    if isinstance(node, IndexScan) and node.index_only:
+        return "IndexOnlyScan"
+    return type(node).__name__
+
+
+def plan_tree(plan, stats=None, ids=None):
+    """The plan as nested dicts for a UI: label, operator, estimate, and actual rows and time if traced.
+
+    ids, if given, is filled with id(node) -> the entry's id.
+    """
     counter = iter(range(1_000_000))
+    ids = {} if ids is None else ids
 
     def visit(node):
-        entry = {"id": next(counter), "operator": type(node).__name__, "label": describe(node),
+        entry = {"id": ids.setdefault(id(node), next(counter)), "operator": operator(node), "label": describe(node),
                  "est_rows": getattr(node, "est_rows", None), "children": [], "subplans": []}
         if stats is not None:
             rows, seconds = stats.get(id(node), (0, 0.0))

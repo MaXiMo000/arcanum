@@ -2,15 +2,16 @@
 
 from dataclasses import dataclass, field
 
-from ..errors import SqlError
+from ..errors import ArcanumError, SqlError
 from ..sql import nodes as n
 from ..sql.parser import parse_statements
 from ..storage import Pager
+from .advisor import advise
 from .binder import Binder
 from .catalog import Catalog
 from .executor import Context, QueryLimits, index_scan_pairs, run
 from .expr import conjuncts
-from .optimizer import Optimizer
+from .optimizer import Optimizer, mark_index_only
 from .plan import IndexScan, TableScan, explain, plan_tree
 
 _WRITES = (n.Insert, n.Update, n.Delete, n.CreateTable, n.DropTable, n.CreateIndex, n.DropIndex, n.Analyze)
@@ -24,6 +25,8 @@ class Result:
     status: str = ""  # e.g. "INSERT 3", "CREATE TABLE"
     plan: dict | None = None  # the query plan as a tree (see plan.plan_tree), when traced
     row_total: int = 0  # rows the query produced; more than len(rows) when max_rows cut them off
+    advice: list = field(default_factory=list)  # the advisor's hints (see advisor.py), when traced
+    statement: str = ""  # the statement's own text, when traced
 
 
 class Database:
@@ -71,8 +74,21 @@ class Database:
         return self._execute(statement, text, sql, trace, max_rows)
 
     def execute_script(self, sql, trace=False, max_rows=None):
-        """Run several semicolon-separated statements; returns one Result per statement."""
-        return [self._execute(statement, text, sql, trace, max_rows) for statement, text in parse_statements(sql)]
+        """Run several semicolon-separated statements; returns one Result per statement.
+
+        If one fails, the error carries `completed` (how many statements before
+        it ran, and stay run) and `statement_start` (its offset in sql).
+        """
+        results, cursor = [], 0
+        for statement, text in parse_statements(sql):
+            start = sql.find(text, cursor)
+            cursor = start + len(text)
+            try:
+                results.append(self._execute(statement, text, sql, trace, max_rows))
+            except ArcanumError as e:
+                e.completed, e.statement_start = len(results), start
+                raise
+        return results
 
     def close(self):
         if self.in_transaction:
@@ -134,8 +150,8 @@ class Database:
                 total += 1
                 if max_rows is None or total <= max_rows:
                     rows.append(row)
-            return Result([c.name for c in plan.columns], rows, status=f"SELECT {total}",
-                          plan=plan_tree(plan, ctx.stats) if trace else None, row_total=total)
+            result = Result([c.name for c in plan.columns], rows, status=f"SELECT {total}", row_total=total)
+            return self._traced(result, statement, text, plan, ctx.stats) if trace else result
         if isinstance(statement, n.Explain):
             if not isinstance(statement.statement, n.Query):
                 raise SqlError("Arcanum doesn't support EXPLAIN for statements other than queries yet")
@@ -146,14 +162,13 @@ class Database:
                 for _ in run(plan, ctx):
                     pass
                 stats = ctx.stats
-            return Result(["plan"], [(line,) for line in explain(plan, stats)], status="EXPLAIN",
-                          plan=plan_tree(plan, stats) if trace else None)
+            result = Result(["plan"], [(line,) for line in explain(plan, stats)], status="EXPLAIN")
+            return self._traced(result, statement, text, plan, stats) if trace else result
         if isinstance(statement, n.Insert):
             return self._insert(binder, statement)
-        if isinstance(statement, n.Update):
-            return self._update(binder, statement)
-        if isinstance(statement, n.Delete):
-            return self._delete(binder, statement)
+        if isinstance(statement, (n.Update, n.Delete)):
+            result = self._update(binder, statement) if isinstance(statement, n.Update) else self._delete(binder, statement)
+            return self._traced(result, statement, text) if trace else result
         if isinstance(statement, n.CreateTable):
             if statement.name in self.catalog.tables and statement.if_not_exists:
                 return Result(status="CREATE TABLE")
@@ -204,11 +219,20 @@ class Database:
             self.catalog.insert_row(table, self.catalog.check_row(table, row))
         return Result(rowcount=len(rows), status=f"INSERT {len(rows)}")
 
+    def _traced(self, result, statement, text, plan=None, stats=None):
+        """Attach the plan tree (with actual rows and time, if measured) and the advisor's hints."""
+        ids = {}
+        result.statement = text
+        if plan is not None:
+            result.plan = plan_tree(plan, stats, ids)
+        result.advice = advise(statement, text, self.catalog, plan, stats, ids, self.limits)
+        return result
+
     def _context(self, analyze=False):
         return Context(self.catalog, analyze, self.limits)
 
     def _plan(self, plan):
-        return Optimizer().optimize(plan) if self.optimize else plan
+        return mark_index_only(Optimizer().optimize(plan)) if self.optimize else plan
 
     def _matching_rows(self, ctx, table, where):
         """(key, row) of every row the WHERE clause selects, through an index when one helps."""

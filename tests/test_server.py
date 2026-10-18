@@ -76,17 +76,33 @@ def test_queries_return_rows_and_the_traced_plan(client):
     scan = plan["children"][0]
     assert scan["label"] == "IndexScan customers using primary key (id > 20)" and scan["rows"] == 4
 
-    results = sql(client, session, "INSERT INTO customers VALUES (90, 'New', 'Rome'); "
-                                   "SELECT count(*) FROM customers").json()["results"]
+    reply = sql(client, session, "INSERT INTO customers VALUES (90, 'New', 'Rome'); SELECT count(*) FROM customers").json()
+    results = reply["results"]
     assert [r["status"] for r in results] == ["INSERT 1", "SELECT 1"] and results[1]["rows"] == [[25]]
+    # What the engine did for the whole request, counted exactly whatever the event stream drops.
+    stats = reply["stats"]
+    assert stats["commits"] == 1 and stats["log_frames"] >= 2 and stats["pages_written"] >= 1
+    assert stats["cache_hits"] + stats["disk_reads"] >= stats["nodes_visited"] > 0 and stats["elapsed_ms"] > 0
+
+    lookup = sql(client, session, "SELECT name FROM customers WHERE id = 7").json()["stats"]
+    assert lookup["nodes_visited"] == 3 and lookup["log_frames"] == 0  # root, internal, leaf; read-only
 
 
 def test_errors_are_structured(client):
     session = new_session(client)
     error = sql(client, session, "SELECT nope FROM customers").json()["error"]
+    doctor = error.pop("doctor")
     assert error == {"type": "SqlError", "message": "column nope does not exist", "line": 1, "column": 8}
+    assert doctor["pos"] == 7 and doctor["end"] == 11 and "no column nope" in doctor["hint"]
+    typo = sql(client, session, "SELECT nme FROM customers").json()["error"]["doctor"]
+    assert typo["fix"] == typo["rerun"] == "SELECT name FROM customers"
+    # Statements before the failing one ran; the rerun starts at the failing statement.
+    partial = sql(client, session, "UPDATE customers SET city = 'Rome' WHERE id = 3; SELECT nme FROM customers").json()
+    assert partial["error"]["completed"] == 1 and partial["error"]["doctor"]["rerun"] == "SELECT name FROM customers"
     response = sql(client, session, "INSERT INTO customers VALUES (1, 'Dup', NULL)")
     assert response.status_code == 400 and response.json()["error"]["type"] == "ConstraintError"
+    advice = sql(client, session, "SELECT * FROM customers WHERE name = NULL").json()["results"][0]["advice"]
+    assert advice[0]["code"] == "null-compare" and "IS NULL" in advice[0]["fix"]["sql"]
     assert sql(client, session, "SELECT 1 " + " " * 3000).status_code == 413
     assert sql(client, "x" * 24, "SELECT 1").status_code == 404
     assert sql(client, "../../etc/passwd", "SELECT 1").status_code == 404

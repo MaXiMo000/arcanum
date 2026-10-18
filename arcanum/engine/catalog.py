@@ -244,19 +244,33 @@ class Catalog:
         for key, value in self.btree(table.root).scan():
             yield key, self._row(table, value)
 
-    def scan_range(self, table, index, lo=None, hi=None, hi_inclusive=False):
-        """Yield (table key, row) for rows whose key in `index` (None = primary key) is in [lo, hi)."""
+    def scan_range(self, table, index, lo=None, hi=None, hi_inclusive=False, index_only=False):
+        """Yield (table key, row) for rows whose key in `index` (None = primary key) is in [lo, hi).
+
+        index_only builds each row from the index entry alone: the index and
+        primary key columns are filled in and every other column is NULL.
+        """
         if index is None:
             for key, value in self.btree(table.root).scan(lo, hi, hi_inclusive=hi_inclusive):
                 yield key, self._row(table, value)
             return
         tree, width = self.btree(table.root), len(index.columns)
+        positions = [*index.columns, *table.primary_key]
         for entry, _ in self.btree(index.root).scan(lo, hi, hi_inclusive=hi_inclusive):
-            key = encode(decode(entry)[width:])  # an index entry ends with the row's table key
-            yield key, self._row(table, tree.get(key))
+            values = decode(entry)
+            key = encode(values[width:])  # an index entry ends with the row's table key
+            if index_only:
+                row = [None] * len(table.columns)
+                for position, value in zip(positions, values, strict=False):
+                    row[position] = value
+                yield key, self._typed(table, tuple(row))
+            else:
+                yield key, self._row(table, tree.get(key))
 
     def _row(self, table, value):
-        row = decode(value)
+        return self._typed(table, decode(value))
+
+    def _typed(self, table, row):
         if table.booleans:
             row = tuple(bool(v) if v is not None and i in table.booleans else v for i, v in enumerate(row))
         return row
