@@ -38,7 +38,9 @@ Arcanum is an educational database engine. It is not meant to store sensitive da
 - Unexpected errors return a generic message with a reference; details stay in the server log.
 - Invalid requests are not echoed back. Access logs are off by default because URLs carry session ids.
 - Responses send `nosniff`, `no-referrer`, frame denial and a strict Content Security Policy for the UI;
-  CORS allows only configured origins and never credentials. WebSockets from other origins are refused.
+  CORS allows only configured origins and never credentials. Requests that change anything (POST,
+  DELETE) and WebSockets coming from other sites are refused, so a foreign page cannot act through a
+  visitor's browser.
 
 ## What the application cannot do on its own
 

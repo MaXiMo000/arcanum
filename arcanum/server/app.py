@@ -179,6 +179,12 @@ def create_app(settings=None):
         client = _client(request)
         if not limiter.allow(client, "request", settings.rate_per_second, settings.rate_burst):
             return _error(429, "RateLimited", "too many requests; slow down", {"Retry-After": "1"})
+        origin = request.headers.get("origin")
+        if (request.method in ("POST", "PUT", "PATCH", "DELETE") and origin is not None
+                and origin not in settings.allowed_origins and not _same_origin(request, origin)):
+            # CORS only hides the response; a foreign page could still send a simple POST (one with no
+            # body opens a session). Browsers always send Origin on these, so refuse foreign ones outright.
+            return _error(403, "ForeignOrigin", "requests from other sites are not accepted")
         if request.method in ("POST", "PUT", "PATCH"):
             length = request.headers.get("content-length")
             if length is None:
@@ -310,6 +316,6 @@ def create_app(settings=None):
     return app
 
 
-def _same_origin(websocket, origin):
-    host = websocket.headers.get("host")
+def _same_origin(connection, origin):
+    host = connection.headers.get("host")
     return host is not None and origin in (f"http://{host}", f"https://{host}")

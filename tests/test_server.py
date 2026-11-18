@@ -291,3 +291,14 @@ def test_stale_session_files_are_removed_at_startup(tmp_path):
     unrelated.write_bytes(b"keep")
     create_app(Settings(data_dir=str(data)))
     assert not stale.exists() and unrelated.exists()
+
+
+def test_other_sites_cannot_change_anything(client):
+    foreign = {"Origin": "https://evil.example"}
+    assert client.post("/sessions", headers=foreign).status_code == 403
+    session = new_session(client)
+    assert client.post(f"/sessions/{session}/query", json={"sql": "DELETE FROM orders"}, headers=foreign).status_code == 403
+    assert client.delete(f"/sessions/{session}", headers=foreign).status_code == 403
+    # The page's own origin, an allowed one and requests without Origin (scripts, curl) still work.
+    assert client.post("/sessions", headers={"Origin": "http://testserver"}).status_code == 201
+    assert sql(client, session, "SELECT count(*) FROM orders").json()["results"][0]["rows"] == [[80]]
