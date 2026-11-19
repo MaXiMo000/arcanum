@@ -137,6 +137,27 @@ export interface Limits {
   max_sql_bytes: number;
 }
 
+/** The two database sessions each visitor gets, side by side. */
+export type SessionName = "A" | "B";
+
+/** A session's open transaction (if any) and the snapshot its next statement would read through. */
+export interface SessionTxn {
+  xid: number | null;
+  isolation: string | null;
+  snapshot: { xmin: number; xmax: number; active: number[]; fixed: boolean };
+}
+
+export type TxnStatus = "committed" | "running" | "aborted";
+
+/** One version of a row: created by xmin, deleted by xmax, and which sessions currently see it. */
+export interface RowVersion {
+  xmin: number;
+  xmax: number | null;
+  row: Value[];
+  status: [TxnStatus, TxnStatus | null];
+  seen_by: SessionName[];
+}
+
 export interface EngineState {
   tables: TableInfo[];
   trees: Tree[];
@@ -152,6 +173,12 @@ export interface EngineState {
   wal: { committed_frames: number; uncommitted: boolean };
   in_transaction: boolean;
   limits: Limits;
+  sessions: Record<SessionName, SessionTxn>;
+  running: { xid: number; session: string; isolation: string }[];
+  next_xid: number;
+  commit_log: number[];
+  /** Rows that currently hold more than one version, or one not yet frozen. */
+  versions: { table: string; key: Value[]; versions: RowVersion[] }[];
 }
 
 export interface EngineEvent {
@@ -218,8 +245,8 @@ const sessionPath = (id: string) => `/sessions/${encodeURIComponent(id)}`;
 
 export const api = {
   createSession: () => call<SessionInfo>("POST", "/sessions"),
-  query: (id: string, sql: string) =>
-    call<{ results: QueryResult[]; stats: QueryStats }>("POST", `${sessionPath(id)}/query`, { sql }),
+  query: (id: string, sql: string, session: SessionName = "A") =>
+    call<{ results: QueryResult[]; stats: QueryStats }>("POST", `${sessionPath(id)}/query`, { sql, session }),
   state: (id: string) => call<EngineState>("GET", `${sessionPath(id)}/state`),
   crash: (id: string, duringWrite: boolean) =>
     call<CrashSummary>("POST", `${sessionPath(id)}/crash`, { during_write: duringWrite }),

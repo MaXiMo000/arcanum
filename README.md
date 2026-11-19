@@ -64,6 +64,7 @@ with Database("company.db") as db:
 | Binder: name resolution, type checking, correlated subqueries | done |
 | Executor: iterator-model operators, hash join, hash aggregate, window functions, recursive CTEs | done |
 | Atomic statements, `BEGIN` / `COMMIT` / `ROLLBACK`, `EXPLAIN [ANALYZE]` | done |
+| MVCC: row versions, snapshots, `READ COMMITTED` / `REPEATABLE READ`, concurrent sessions | done |
 | Write-ahead log, checkpoints and crash recovery | done |
 | Cost-based optimizer: index scans, statistics, join ordering, subquery decorrelation | done |
 | Index-only scans | done |
@@ -85,7 +86,8 @@ with Database("company.db") as db:
 - Aggregates `count`, `sum`, `avg`, `min` and `max` (with `DISTINCT`)
 - Functions `abs`, `round`, `length`, `lower`, `upper`, `trim`, `ltrim`, `rtrim`, `replace`, `substr`,
   `coalesce`, `ifnull` and `nullif`; `CASE`, `CAST`, `BETWEEN`, `LIKE`, `IN`, `IS [NOT] NULL` and `||`
-- `BEGIN`, `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]`, `ANALYZE [table]`
+- `BEGIN [ISOLATION LEVEL READ COMMITTED | REPEATABLE READ]`, `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]`,
+  `ANALYZE [table]`
 
 ### Semantics
 
@@ -189,6 +191,44 @@ Arcanum is pure Python, so it trades raw speed for being readable end to end. On
 The B+tree keeps decoded nodes alongside the buffer pool, so a page is decoded once per read from disk
 rather than on every visit; a node written by the tree is stored already decoded.
 
+## Concurrency: MVCC
+
+Concurrency control works like PostgreSQL's. A row is a chain of versions, each stamped with the
+transaction that created it (`xmin`) and the one that deleted it (`xmax`); an `UPDATE` marks the old
+version deleted and appends a new one. Every statement reads through a snapshot: the transactions that had
+committed when it was taken, plus its own. `READ COMMITTED` (the default) takes a snapshot per statement;
+`REPEATABLE READ` takes one for the whole transaction.
+
+```python
+from arcanum import Database
+
+db = Database("bank.db")
+db.execute_script("CREATE TABLE account (id INTEGER PRIMARY KEY, balance INTEGER); INSERT INTO account VALUES (1, 100)")
+a, b = db.connect("a"), db.connect("b")
+a.execute("BEGIN")
+a.execute("UPDATE account SET balance = 0 WHERE id = 1")
+b.execute("SELECT balance FROM account").rows  # [(100,)]: no dirty reads, and no waiting
+b.execute("UPDATE account SET balance = 50")     # LockWaitError: a holds the row
+a.execute("COMMIT")
+b.execute("SELECT balance FROM account").rows  # [(0,)]
+```
+
+- Readers never wait for writers, and writers never wait for readers.
+- A write to a row another open transaction changed is a write-write conflict. PostgreSQL makes the second
+  writer wait; sessions here take turns, so it fails with `LockWaitError` and can be retried.
+- Under `REPEATABLE READ`, changing a row that changed after the snapshot fails with PostgreSQL's
+  "could not serialize access due to concurrent update", so updates are never lost.
+- Primary key and `UNIQUE` checks consider every live version, including those of open transactions.
+- Index entries can belong to any version of a row, so every index match is rechecked against the version
+  the snapshot sees. Index-only scans stay index-only while a table has no unsettled rows (the role of
+  PostgreSQL's visibility map) and check the table otherwise.
+- Every commit and rollback prunes: versions no snapshot can see any more are removed with their index
+  entries, and surviving versions are frozen. A row settles back to one frozen version as soon as nobody
+  needs the others, and the commit log only keeps the ids that versions still mention.
+- Transaction ids are reserved on disk in batches, so they are never reused after a crash; a database
+  reopened with unsettled rows is vacuumed, discarding whatever unfinished transactions left behind.
+- A schema change inside a transaction holds off other sessions until that transaction ends.
+
 ## Durability and crash recovery
 
 Arcanum keeps a write-ahead log next to the database file (`<name>-wal`):
@@ -212,11 +252,15 @@ never a mix.
 
 Two modes share one screen: the database in the middle, an inspector on the right.
 
-- **Learn**: nine short lessons (B+trees, growth and merges, indexes, the buffer pool, the optimizer, the
-  query advisor, transactions, the log, crash recovery). Every step runs real SQL on your own database and
+- **Learn**: ten short lessons (B+trees, growth and merges, indexes, the buffer pool, the optimizer, the
+  query advisor, two sessions at once, transactions, the log, crash recovery). Every step runs real SQL on your own database and
   checks what the engine actually did (nodes visited, pages read, splits, log frames) before moving on.
 - **Play**: an editor with syntax highlighting, name completion and errors underlined, example queries,
-  and challenges judged from what the engine really did.
+  and challenges judged from what the engine really did. Switch to two sessions to get a second editor on
+  the same database, like two psql terminals, and watch transactions see (or not see) each other.
+- **Row versions** on the map: every row that currently holds versions, each version's `xmin` and `xmax`
+  coloured by whether that transaction is open, committed or rolled back, and which session sees which
+  version.
 
 The inspector explains every statement:
 
@@ -445,8 +489,9 @@ tests/
 
 Arcanum aims to be the clearest way to see how a database works from the inside. Next:
 
-- **MVCC and concurrent sessions**: snapshot isolation with row versions, two sessions side by side, and
-  the version chains drawn in the tree.
+- **Waiting instead of failing**: true concurrent sessions, so a conflicting write waits for the other
+  transaction as in PostgreSQL, with a lock graph and deadlock detection drawn live.
+- **SERIALIZABLE**: serializable snapshot isolation, with the read/write dependencies that cause an abort shown.
 - **Lock manager and deadlock visualizer**: lock queues per row and table, a waits-for graph, and the
   victim the detector picks.
 - **An LSM-tree engine beside the B+tree**: memtable, flushes and compaction, with the same workload

@@ -1,3 +1,4 @@
+import type { SessionName, SessionTxn } from "../api";
 import type { Connection, Speed } from "../feed";
 
 export type View = "2d" | "3d";
@@ -11,7 +12,7 @@ interface Props {
   speed: Speed;
   onSpeed: (speed: Speed) => void;
   connection: Connection;
-  inTransaction: boolean;
+  sessions: Record<SessionName, SessionTxn> | null;
   onCrash: () => void;
   crashDisabled: boolean;
   theme: "light" | "dark";
@@ -79,10 +80,17 @@ export function TopBar(p: Props) {
         <i aria-hidden="true" />
         {p.connection === "live" ? "live" : p.connection}
       </span>
-      {p.inTransaction && (
-        <span className="status-pill txn" role="status" title="A BEGIN is waiting for COMMIT or ROLLBACK">
-          transaction open
-        </span>
+      {Object.entries(p.sessions ?? {}).map(([name, s]) =>
+        s.xid === null ? null : (
+          <span
+            key={name}
+            className={`status-pill txn s-${name}`}
+            role="status"
+            title={`Session ${name} has transaction ${s.xid} open (${s.isolation}); it is waiting for COMMIT or ROLLBACK`}
+          >
+            {name} · txn {s.xid}
+          </span>
+        ),
       )}
       <Segmented<View>
         label="View"

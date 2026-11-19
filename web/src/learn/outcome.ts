@@ -1,8 +1,10 @@
 // What happened when a statement ran, and helpers lessons and challenges use to judge it.
-import type { CrashSummary, EngineState, PlanNode, QueryResult, QueryStats, Tree } from "../api";
+import type { ApiError, CrashSummary, EngineState, PlanNode, QueryResult, QueryStats, SessionName, Tree } from "../api";
 
 export interface Outcome {
   id: number;
+  /** The database session that ran it. */
+  session: SessionName;
   sql: string;
   results: QueryResult[];
   stats: QueryStats;
@@ -12,6 +14,8 @@ export interface Outcome {
 
 export interface CheckContext {
   outcome: Outcome | null;
+  /** The error a step that expects one failed with. */
+  error?: ApiError | null;
   crash: CrashSummary | null;
   state: EngineState | null;
   /** A fix applied from the advisor, measured before and after. */

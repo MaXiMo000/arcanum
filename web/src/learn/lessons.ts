@@ -1,6 +1,7 @@
 // The guided course. Every step runs real SQL against the visitor's own database, then checks what the
 // engine actually did (pages read, nodes visited, splits, log frames...) before moving on.
 // Text wrapped in `backticks` is shown as code.
+import type { SessionName } from "../api";
 import { advised, explainText, findTree, pagesRead, planHas, plural, treeLevels, type CheckContext } from "./outcome";
 
 export type InspectorTab = "explain" | "results" | "flow" | "advisor" | "pages" | "log" | "events";
@@ -11,6 +12,10 @@ export interface Step {
   body: string[];
   sql?: string;
   action?: "crash";
+  /** The database session the SQL runs in (A unless set). */
+  session?: SessionName;
+  /** The error type this step is meant to end in (it passes when the SQL fails with it). */
+  expectError?: string;
   /** Which inspector tab tells this step's story best. */
   focus?: InspectorTab;
   check?: (ctx: CheckContext) => boolean;
@@ -38,6 +43,14 @@ FROM (WITH RECURSIVE s(n) AS (
 
 const rows = (ctx: CheckContext, i = 0) => ctx.outcome?.results[i]?.row_total ?? 0;
 const stat = (ctx: CheckContext) => ctx.outcome!.stats;
+/** How many versions the given row currently holds (0 when it has settled to a single frozen one). */
+const versionsOf = (ctx: CheckContext, table: string, id: number) =>
+  ctx.state?.versions.find((r) => r.table === table && r.key[0] === id)?.versions.length ?? 0;
+/** A column of the first row of a result (the last result by default). */
+const firstValue = (ctx: CheckContext, column: number, result?: number) => {
+  const results = ctx.outcome?.results ?? [];
+  return results[result ?? results.length - 1]?.rows[0]?.[column];
+};
 
 export const LESSONS: Lesson[] = [
   {
@@ -311,6 +324,113 @@ SELECT id, ms FROM visits WHERE page = '/page-7';`,
           const first = ctx.earlier("slow");
           return `Index Only Scan: ${plural(pagesRead(stat(ctx)), "page")}, all from visits_page_ms${first ? `, down from ${pagesRead(first.stats)} for the full scan` : ""}. Next, make a typo in the playground: the doctor will spot it and offer the corrected SQL.`;
         },
+      },
+    ],
+  },
+  {
+    id: "isolation",
+    title: "Two sessions at once",
+    summary: "Row versions, snapshots and write conflicts, the way PostgreSQL handles them.",
+    minutes: 6,
+    steps: [
+      {
+        id: "begin",
+        title: "Change a row, without committing",
+        body: [
+          "You now have two sessions on the same database, A and B, like two psql terminals. Session A opens a transaction and moves customer 1.",
+          "PostgreSQL does not overwrite the row: it marks the old version deleted by A's transaction (its `xmax`) and adds a new version created by it (`xmin`). Watch **Row versions** on the map.",
+        ],
+        sql: "BEGIN;\nUPDATE customers SET city = 'Rome' WHERE id = 1;",
+        session: "A",
+        check: (ctx) => versionsOf(ctx, "customers", 1) === 2,
+        success: (ctx) => `Customer 1 now has two versions; transaction ${ctx.state?.sessions.A.xid} created the new one and is still open.`,
+      },
+      {
+        id: "no-dirty-read",
+        title: "B reads the row",
+        body: ["Session B asks for customer 1. A has not committed, so B's snapshot does not include A's transaction."],
+        sql: "SELECT id, name, city FROM customers WHERE id = 1;",
+        session: "B",
+        check: (ctx) => firstValue(ctx, 2) === "Osaka",
+        success: () => "B sees Osaka, the old version. No dirty reads: a snapshot only includes transactions that had committed when it was taken. And B did not wait: readers never block writers.",
+      },
+      {
+        id: "write-conflict",
+        title: "B tries to change the same row",
+        body: [
+          "Two writers on one row cannot both win. PostgreSQL makes the second writer wait until the first commits or rolls back.",
+          "Here sessions take turns, so instead of waiting the statement fails and says what it would have waited for.",
+        ],
+        sql: "UPDATE customers SET city = 'Lima' WHERE id = 1;",
+        session: "B",
+        expectError: "LockWaitError",
+        success: () => "Refused: the row is held by A's open transaction. Rows A has not touched stay free for B.",
+        hint: "This step should fail with a lock conflict. Did session A's transaction from the first step end? Run the first step again.",
+      },
+      {
+        id: "commit",
+        title: "A commits",
+        body: ["Committing marks A's transaction committed. Nothing else moves: the versions were already in place."],
+        sql: "COMMIT;",
+        session: "A",
+        success: () => "Committed. With no snapshot left that needs the old version, the engine pruned it: customer 1 is back to a single, frozen version.",
+      },
+      {
+        id: "read-committed",
+        title: "B reads again",
+        body: ["B is in READ COMMITTED, PostgreSQL's default: every statement takes a fresh snapshot."],
+        sql: "SELECT id, name, city FROM customers WHERE id = 1;",
+        session: "B",
+        check: (ctx) => firstValue(ctx, 2) === "Rome",
+        success: () => "Rome. The same query gave a different answer once A committed: a non-repeatable read, which READ COMMITTED allows.",
+      },
+      {
+        id: "repeatable",
+        title: "A snapshot that holds still",
+        body: ["Now B opens a REPEATABLE READ transaction. Its snapshot is taken by the first statement and kept until it ends."],
+        sql: "BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT id, name, city FROM customers WHERE id = 2;",
+        session: "B",
+        check: (ctx) => firstValue(ctx, 2, 1) === "Quito",
+        success: () => "Customer 2 lives in Quito, as far as B's snapshot is concerned.",
+      },
+      {
+        id: "a-commits-change",
+        title: "A changes that row and commits",
+        body: ["Session A runs a single statement outside a transaction, so it commits at once."],
+        sql: "UPDATE customers SET city = 'Lisbon' WHERE id = 2;",
+        session: "A",
+        check: (ctx) => versionsOf(ctx, "customers", 2) === 2,
+        success: () => "Committed, yet both versions stay: B's snapshot still needs the old one. That is why long transactions make PostgreSQL tables bloat until VACUUM can clean up.",
+      },
+      {
+        id: "still-quito",
+        title: "B reads again",
+        body: ["Same query in B's REPEATABLE READ transaction."],
+        sql: "SELECT id, name, city FROM customers WHERE id = 2;",
+        session: "B",
+        check: (ctx) => firstValue(ctx, 2) === "Quito",
+        success: () => "Still Quito: the snapshot holds still, so every read in the transaction agrees with every other.",
+      },
+      {
+        id: "serialization",
+        title: "B tries to update it",
+        body: [
+          "B wants to change a row that changed after its snapshot. Applying it would silently overwrite A's update: a lost update.",
+        ],
+        sql: "UPDATE customers SET city = 'Kyiv' WHERE id = 2;",
+        session: "B",
+        expectError: "SerializationError",
+        success: () => "PostgreSQL's answer, word for word: could not serialize access due to concurrent update. The application retries the transaction.",
+        hint: "This step should fail with a serialization error. Run the previous steps in order: B needs its REPEATABLE READ snapshot from before A's change.",
+      },
+      {
+        id: "end",
+        title: "B gives up and retries later",
+        body: ["Roll back. With no snapshot needing the old version any more, the row settles."],
+        sql: "ROLLBACK;",
+        session: "B",
+        check: (ctx) => versionsOf(ctx, "customers", 2) === 0,
+        success: () => "Customer 2 is back to one frozen version. That is MVCC: readers and writers never block each other, and old versions live exactly as long as a snapshot needs them.",
       },
     ],
   },

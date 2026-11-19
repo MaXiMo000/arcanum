@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Comparison } from "./advisor/Advisor";
-import { api, ApiError, type AdviceFix, type CrashSummary, type EngineState, type QueryResult } from "./api";
+import { api, ApiError, type AdviceFix, type CrashSummary, type EngineState, type QueryResult, type SessionName } from "./api";
 import { CrashOverlay } from "./components/CrashOverlay";
 import { Inspector } from "./components/Inspector";
 import { Intro } from "./components/Intro";
@@ -207,14 +207,15 @@ export default function App() {
     [unlock],
   );
 
-  const runQuery = useCallback(
-    async (sql: string, focus?: InspectorTab): Promise<Outcome | null> => {
+  /** Run SQL in one of the two database sessions; the outcome, or the error it failed with. */
+  const execute = useCallback(
+    async (sql: string, focus?: InspectorTab, session: SessionName = "A"): Promise<Outcome | ApiError | null> => {
       const id = idRef.current;
       if (!id) return null;
       setRunError(null);
       setComparison(null);
       try {
-        const { results, stats } = await api.query(id, sql);
+        const { results, stats } = await api.query(id, sql, session);
         let after: EngineState | null = null;
         try {
           after = await api.state(id);
@@ -222,7 +223,7 @@ export default function App() {
         } catch {
           // The outcome still stands without the fresh picture.
         }
-        const next: Outcome = { id: ++outcomeIds.current, sql, results, stats, state: after };
+        const next: Outcome = { id: ++outcomeIds.current, session, sql, results, stats, state: after };
         setOutcome(next);
         const read = treeRead(results);
         if (read && after?.trees.some((t) => t.name === read)) setSelectedTree(read);
@@ -233,12 +234,22 @@ export default function App() {
         return next;
       } catch (e) {
         if (e instanceof ApiError && e.status === 404) onSessionGone();
-        setRunError({ error: e instanceof ApiError ? e : new ApiError(0, { type: "Error", message: String(e) }), sql });
+        const error = e instanceof ApiError ? e : new ApiError(0, { type: "Error", message: String(e) });
+        setRunError({ error, sql });
         setTab("explain");
-        return null;
+        void refresh(); // earlier statements of the script, or the transaction, may have changed things
+        return error;
       }
     },
-    [mode, judge, onSessionGone],
+    [mode, judge, onSessionGone, refresh],
+  );
+
+  const runQuery = useCallback(
+    async (sql: string, focus?: InspectorTab, session: SessionName = "A"): Promise<Outcome | null> => {
+      const result = await execute(sql, focus, session);
+      return result instanceof ApiError ? null : result;
+    },
+    [execute],
   );
 
   /** Run the advisor's fix, measuring the statement before and after it. */
@@ -384,7 +395,7 @@ export default function App() {
         speed={speed}
         onSpeed={setSpeed}
         connection={connection}
-        inTransaction={state?.in_transaction ?? false}
+        sessions={state?.sessions ?? null}
         onCrash={() => void crash()}
         crashDisabled={!sessionId || crashOpen}
         theme={theme}
@@ -397,7 +408,7 @@ export default function App() {
             progress={progress}
             onOpen={open}
             onPassed={markStep}
-            run={(sql: string, step: Step) => runQuery(sql, step.focus)}
+            run={(sql: string, step: Step) => execute(sql, step.focus, step.session)}
             crash={crash}
             state={state}
             busy={!state || crashOpen}
@@ -410,7 +421,8 @@ export default function App() {
           <PlayPanel
             sql={playSql}
             onSql={setPlaySql}
-            onRun={(sql) => runQuery(sql)}
+            onRun={(sql, session) => execute(sql, undefined, session)}
+            sessions={state?.sessions ?? null}
             maxSqlBytes={state?.limits.max_sql_bytes ?? null}
             disabled={!state || measuring}
             completed={progress.challenges}

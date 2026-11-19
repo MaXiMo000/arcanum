@@ -1,13 +1,18 @@
 import { useState } from "react";
-import type { TableInfo } from "../api";
+import { ApiError, type SessionName, type SessionTxn, type TableInfo } from "../api";
+import { formatValue } from "../format";
 import { EXAMPLES } from "../examples";
 import { CHALLENGES } from "./challenges";
 import { Editor } from "./Editor";
+import type { Outcome } from "./outcome";
+
+const SECOND_SESSION_SQL = "SELECT id, name, city FROM customers WHERE id = 1;";
 
 interface Props {
   sql: string;
   onSql: (sql: string) => void;
-  onRun: (sql: string) => Promise<unknown>;
+  onRun: (sql: string, session: SessionName) => Promise<Outcome | ApiError | null>;
+  sessions: Record<SessionName, SessionTxn> | null;
   maxSqlBytes: number | null;
   disabled: boolean;
   completed: Record<string, number>;
@@ -16,21 +21,23 @@ interface Props {
   error: { pos: number; end: number } | null;
 }
 
-export function PlayPanel({ sql, onSql, onRun, maxSqlBytes, disabled, completed, tables, error }: Props) {
-  const [running, setRunning] = useState(false);
-  const [showHints, setShowHints] = useState(false);
-  const tooLong = maxSqlBytes !== null && new TextEncoder().encode(sql).length > maxSqlBytes;
-  const done = CHALLENGES.filter((c) => c.id in completed).length;
+/** One line about what a run did: its statements' statuses and the first value, or the error. */
+function summary(result: Outcome | ApiError | null): { text: string; error: boolean } | null {
+  if (!result) return null;
+  if (result instanceof ApiError) return { text: `${result.body.type}: ${result.body.message}`, error: true };
+  const parts = result.results.map((r) => {
+    const first = r.rows[0]?.map(formatValue).join(", ");
+    return r.columns.length && r.row_total ? `${r.status} → ${first}${r.row_total > 1 ? ", …" : ""}` : r.status;
+  });
+  return { text: parts.join(" · "), error: false };
+}
 
-  const run = async () => {
-    if (running || disabled || tooLong || !sql.trim()) return;
-    setRunning(true);
-    try {
-      await onRun(sql);
-    } finally {
-      setRunning(false);
-    }
-  };
+export function PlayPanel(props: Props) {
+  const { sql, onSql, onRun, sessions, maxSqlBytes, disabled, completed, tables, error } = props;
+  const [two, setTwo] = useState(false);
+  const [sqlB, setSqlB] = useState(SECOND_SESSION_SQL);
+  const [showHints, setShowHints] = useState(false);
+  const done = CHALLENGES.filter((c) => c.id in completed).length;
 
   return (
     <section className="side glass" aria-label="Playground">
@@ -42,16 +49,46 @@ export function PlayPanel({ sql, onSql, onRun, maxSqlBytes, disabled, completed,
           checked by the advisor, and mistakes go to the doctor.
         </p>
       </header>
-      <label className="visually-hidden" htmlFor="sql-editor">
-        SQL
-      </label>
-      <Editor id="sql-editor" value={sql} onChange={onSql} onRun={() => void run()} tables={tables} error={error} />
-      <div className="run-row">
-        <button className="button primary" onClick={() => void run()} disabled={disabled || running || tooLong}>
-          {running ? "Running…" : "Run"}
+      <div className="segmented small sessions-toggle" role="radiogroup" aria-label="Sessions">
+        <button role="radio" aria-checked={!two} className={!two ? "active" : ""} onClick={() => setTwo(false)}>
+          One session
         </button>
-        {tooLong && <span className="muted small">SQL is limited to {maxSqlBytes?.toLocaleString()} bytes</span>}
+        <button role="radio" aria-checked={two} className={two ? "active" : ""} onClick={() => setTwo(true)}>
+          Two sessions
+        </button>
       </div>
+      {two && (
+        <p className="muted small">
+          Two connections to the same database, like two terminals running psql. BEGIN in one, change a row, and see what the
+          other one sees.
+        </p>
+      )}
+      <SessionEditor
+        name="A"
+        label={two ? "Session A" : null}
+        sql={sql}
+        onSql={onSql}
+        onRun={onRun}
+        txn={sessions?.A ?? null}
+        maxSqlBytes={maxSqlBytes}
+        disabled={disabled}
+        tables={tables}
+        error={error}
+      />
+      {two && (
+        <SessionEditor
+          name="B"
+          label="Session B"
+          sql={sqlB}
+          onSql={setSqlB}
+          onRun={onRun}
+          txn={sessions?.B ?? null}
+          maxSqlBytes={maxSqlBytes}
+          disabled={disabled}
+          tables={tables}
+          error={null}
+        />
+      )}
       <h3 className="section-title">Try one</h3>
       <div className="examples" role="group" aria-label="Example queries">
         {EXAMPLES.map((example) => (
@@ -87,5 +124,58 @@ export function PlayPanel({ sql, onSql, onRun, maxSqlBytes, disabled, completed,
         })}
       </ul>
     </section>
+  );
+}
+
+function SessionEditor({ name, label, sql, onSql, onRun, txn, maxSqlBytes, disabled, tables, error }: {
+  name: SessionName;
+  label: string | null;
+  sql: string;
+  onSql: (sql: string) => void;
+  onRun: (sql: string, session: SessionName) => Promise<Outcome | ApiError | null>;
+  txn: SessionTxn | null;
+  maxSqlBytes: number | null;
+  disabled: boolean;
+  tables: TableInfo[];
+  error: { pos: number; end: number } | null;
+}) {
+  const [running, setRunning] = useState(false);
+  const [last, setLast] = useState<{ text: string; error: boolean } | null>(null);
+  const tooLong = maxSqlBytes !== null && new TextEncoder().encode(sql).length > maxSqlBytes;
+
+  const run = async () => {
+    if (running || disabled || tooLong || !sql.trim()) return;
+    setRunning(true);
+    try {
+      setLast(summary(await onRun(sql, name)));
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div className={label ? `session-box s-${name}` : ""}>
+      {label && (
+        <div className="session-head">
+          <span className={`session-badge s-${name}`}>
+            <span aria-hidden="true">{name}</span> {label}
+          </span>
+          <span className="muted small">
+            {txn?.xid ? `transaction ${txn.xid} · ${txn.isolation?.toLowerCase()}` : "no transaction: each statement commits"}
+          </span>
+        </div>
+      )}
+      <label className="visually-hidden" htmlFor={`sql-editor-${name}`}>
+        SQL for {label ?? "the playground"}
+      </label>
+      <Editor id={`sql-editor-${name}`} value={sql} onChange={onSql} onRun={() => void run()} tables={tables} error={error} />
+      <div className="run-row">
+        <button className="button primary" onClick={() => void run()} disabled={disabled || running || tooLong}>
+          {running ? "Running…" : label ? `Run in ${name}` : "Run"}
+        </button>
+        {tooLong && <span className="muted small">SQL is limited to {maxSqlBytes?.toLocaleString()} bytes</span>}
+      </div>
+      {label && last && <p className={`session-last small ${last.error ? "error" : ""}`}>{last.text}</p>}
+    </div>
   );
 }

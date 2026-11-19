@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import type { CrashSummary, EngineState } from "../api";
+import { ApiError, type CrashSummary, type EngineState } from "../api";
 import { RichText } from "./RichText";
 import { LESSONS, type Lesson, type Step } from "./lessons";
 import type { CheckContext, Outcome } from "./outcome";
@@ -9,7 +9,7 @@ interface Props {
   progress: Progress;
   onOpen: (lesson: string | null, step?: number) => void;
   onPassed: (lesson: string, step: string) => void;
-  run: (sql: string, step: Step) => Promise<Outcome | null>;
+  run: (sql: string, step: Step) => Promise<Outcome | ApiError | null>;
   crash: () => Promise<CrashSummary | null>;
   state: EngineState | null;
   onTryInPlayground: (sql: string) => void;
@@ -84,16 +84,27 @@ function LessonView({ lesson, progress, onOpen, onPassed, run, crash, state, onT
   const attempt = async () => {
     setStatus({ kind: "running" });
     let outcome: Outcome | null = null;
+    let error: ApiError | null = null;
     let summary: CrashSummary | null = null;
-    if (step.sql) outcome = await run(step.sql, step);
+    if (step.sql) {
+      const result = await run(step.sql, step);
+      if (result instanceof ApiError) error = result;
+      else outcome = result;
+    }
     if (step.action === "crash") summary = await crash();
-    if ((step.sql && !outcome) || (step.action === "crash" && !summary)) {
+    if (step.expectError) {
+      if (error?.body.type !== step.expectError) {
+        setStatus({ kind: "failed", message: step.hint ?? `This step should fail with ${step.expectError}. Run it again.` });
+        return;
+      }
+    } else if ((step.sql && !outcome) || (step.action === "crash" && !summary)) {
       setStatus({ kind: "failed", message: "That did not run. See the error on the right, then try again." });
       return;
     }
     if (outcome) outcomes.current.set(step.id, outcome);
     const ctx: CheckContext = {
       outcome,
+      error,
       crash: summary,
       state: outcome?.state ?? state,
       earlier: (id) => outcomes.current.get(id),
@@ -142,6 +153,11 @@ function LessonView({ lesson, progress, onOpen, onPassed, run, crash, state, onT
             <RichText text={paragraph} />
           </p>
         ))}
+        {step.session && (
+          <p className={`session-badge s-${step.session}`}>
+            <span aria-hidden="true">{step.session}</span> Runs in session {step.session}
+          </p>
+        )}
         {step.sql && <pre className="step-sql">{step.sql}</pre>}
         {interactive && (
           <div className="step-actions">

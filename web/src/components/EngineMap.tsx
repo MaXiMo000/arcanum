@@ -6,6 +6,7 @@ import { useEffect, useRef } from "react";
 import type { EngineState, Tree } from "../api";
 import type { FeedState, Flash } from "../feed";
 import { TreeView } from "./TreeView";
+import { Versions } from "./Versions";
 
 export type MapFocus = "pool" | "disk" | "log" | null;
 
@@ -42,6 +43,8 @@ export function EngineMap({ trees, selected, onSelect, feed, flashMs, state, own
         <TreeView trees={trees} selected={selected} onSelect={onSelect} nodeFlash={feed.nodeFlash} flashMs={flashMs} />
         <Descent trees={trees} selected={selected} feed={feed} />
       </section>
+
+      <Versions state={state} />
 
       <Bus up={reading} upLabel="pages read from disk" down={false} downLabel="" />
 
