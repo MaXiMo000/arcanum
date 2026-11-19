@@ -237,22 +237,25 @@ The inspector explains every statement:
 - **Doctor**: on an error, the explanation, the change as a diff, and a button that applies it and runs.
 - Results, the page map, the write-ahead log and the raw event stream.
 
-The 2D view shows the engine working as you run SQL:
+The centre of the screen is the **engine map**: the whole storage stack at once, as a database textbook
+draws it, with every page a query touches lighting up in each layer it passes through.
 
-- **B+trees** of every table and index: nodes light up as a query visits them and slide into place
-  when they split or merge.
-- **Pages**: every page of the file, coloured by the tree that owns it, marked when it is in the buffer
-  pool or changed but not yet written, and flashing on each cache hit, disk read and write.
-- **Write-ahead log**: frames appear as they are appended, turn solid when the log is fsynced, and clear
-  at each checkpoint.
-- **Query plans** with the optimizer's estimated rows next to the real ones, results, and SQL errors
-  pointing at the exact column.
+- **The B+tree** the query read (the map follows each query to the table or index it used): keys in
+  every node, the path the lookup walked highlighted and spelled out ("root p2 → p12 → leaf p7"), nodes
+  sliding into place when they split or merge, and the leaf chain.
+- **The buffer pool**: its fixed set of page slots in memory, mirrored from the engine's own
+  least-recently-used order. A page read from disk drops into a free slot or the least recently used
+  page's; the slot that will be evicted next is marked; changed pages carry a dot until they are logged;
+  more recently used pages are brighter; hit rate and dirty count update live.
+- **The disk**: the data file page by page, coloured by the table or index that owns each page, and the
+  write-ahead log, whose frames appear as they are appended, turn solid when the log is synced, and drain
+  into the data file at each checkpoint. Connectors between the layers animate as pages move.
 - **Pull the plug**: watch committed transactions stream in, the engine get killed mid-write, and recovery
   replay the log, with a check that every acknowledged row came back.
-- Playback at full speed, normal speed or slow motion, a light and a dark theme, and a layout that works
-  down to phone width.
+- Playback at full speed, normal speed or slow motion, light and dark themes, and a layout that adapts
+  from a wide monitor (memory and disk side by side under the tree) down to phone width.
 
-Switch to **3D** for the vault: the selected tree as lit glass slabs with their keys written on their
+Switch to **3D** for the same tree as lit glass slabs with their keys written on their
 faces, hung from curved pointers that leave each parent from the gap between the keys they separate, with
 the leaves chained in order (a wide tree bends into a ring). A query's descent sends a comet down each
 pointer it follows and rings each node it reaches; splits flare. Under the tree, the data file is a

@@ -49,7 +49,18 @@ export interface Counters {
   checkpoints: number;
 }
 
+/**
+ * The buffer pool as the engine holds it: pages in least-recently-used order (first = next to be
+ * evicted), each in a fixed slot so the view can keep it in place while it stays cached.
+ */
+export interface Pool {
+  size: number;
+  /** page -> slot and whether it changed since the last commit, in LRU order. */
+  pages: Map<number, { slot: number; dirty: boolean }>;
+}
+
 export interface FeedState {
+  pool: Pool;
   nodeFlash: Map<number, Flash>;
   pageFlash: Map<number, Flash>;
   wal: WalFrame[];
@@ -73,6 +84,7 @@ export type Connection = "connecting" | "live" | "offline";
 
 export function useEngineFeed(sessionId: string | null, onSessionGone: () => void, onStructureChange: () => void) {
   const state = useRef<FeedState>({
+    pool: { size: 0, pages: new Map() },
     nodeFlash: new Map(),
     pageFlash: new Map(),
     wal: [],
@@ -98,16 +110,27 @@ export function useEngineFeed(sessionId: string | null, onSessionGone: () => voi
     const page = typeof e.page === "number" ? e.page : null;
     switch (e.kind) {
       case "page_read":
-        if (page !== null) s.pageFlash.set(page, { kind: e.source === "cache" ? "hit" : "miss", at: now });
+        if (page !== null) {
+          s.pageFlash.set(page, { kind: e.source === "cache" ? "hit" : "miss", at: now });
+          touch(s.pool, page, false);
+        }
         if (e.source === "cache") s.counters.hits++;
         else s.counters.misses++;
         break;
       case "page_write":
       case "page_alloc":
-        if (page !== null) s.pageFlash.set(page, { kind: "write", at: now });
+        if (page !== null) {
+          s.pageFlash.set(page, { kind: "write", at: now });
+          touch(s.pool, page, true);
+        }
         s.counters.writes++;
         break;
       case "cache_evict":
+        if (page !== null) {
+          s.pageFlash.set(page, { kind: "evict", at: now });
+          s.pool.pages.delete(page);
+        }
+        break;
       case "page_free":
         if (page !== null) s.pageFlash.set(page, { kind: "evict", at: now });
         break;
@@ -137,6 +160,7 @@ export function useEngineFeed(sessionId: string | null, onSessionGone: () => voi
         break;
       case "commit":
         s.counters.commits++;
+        for (const entry of s.pool.pages.values()) entry.dirty = false; // logged, so no longer at risk
         break;
       case "rollback":
         s.wal = s.wal.filter((frame) => frame.committed);
@@ -154,6 +178,7 @@ export function useEngineFeed(sessionId: string | null, onSessionGone: () => voi
         s.crash = { phase: "crashed", batches: s.crash.phase === "writing" ? s.crash.batches : 0 };
         s.nodeFlash.clear();
         s.pageFlash.clear();
+        s.pool.pages.clear(); // memory is lost; the next state sync shows what recovery loaded
         break;
       case "recovery":
         s.crash = { phase: "recovering", frames: Number(e.frames) || 0 };
@@ -265,6 +290,33 @@ export function useEngineFeed(sessionId: string | null, onSessionGone: () => voi
     dirty.current = true;
   }, []);
 
+  /**
+   * Take the pool from a fresh engine state ([page, dirty], least recently used first). Ignored while
+   * events are still queued: they describe how the pool got there and will bring it up to date.
+   */
+  const syncPool = useCallback((cached: { page: number; dirty: boolean }[], size: number) => {
+    if (queue.current.length) return;
+    const pool = state.current.pool;
+    const previous = pool.pages;
+    const used = new Set<number>();
+    const next = new Map<number, { slot: number; dirty: boolean }>();
+    for (const { page, dirty } of cached) {
+      const slot = previous.get(page)?.slot;
+      if (slot !== undefined && slot < size) used.add(slot);
+      next.set(page, { slot: slot !== undefined && slot < size ? slot : -1, dirty });
+    }
+    let free = 0;
+    for (const entry of next.values()) {
+      if (entry.slot >= 0) continue;
+      while (used.has(free)) free++;
+      entry.slot = free;
+      used.add(free);
+    }
+    pool.size = size;
+    pool.pages = next;
+    dirty.current = true;
+  }, []);
+
   const startCrash = useCallback(() => {
     state.current.crash = { phase: "writing", batches: 0 };
     dirty.current = true;
@@ -279,5 +331,31 @@ export function useEngineFeed(sessionId: string | null, onSessionGone: () => voi
     connection,
     clearCrash,
     startCrash,
+    syncPool,
   };
+}
+
+/**
+ * A page was used: move it to the most recently used end, giving a newly cached page a free slot, or
+ * when the pool is full the slot of the least recently used page (which the engine evicts right after).
+ */
+function touch(pool: Pool, page: number, write: boolean) {
+  const entry = pool.pages.get(page);
+  if (entry) {
+    pool.pages.delete(page);
+    pool.pages.set(page, { slot: entry.slot, dirty: entry.dirty || write });
+    return;
+  }
+  if (!pool.size) return; // not seeded yet; the next state sync fills it in
+  let slot: number;
+  if (pool.pages.size >= pool.size) {
+    const [victim, oldest] = pool.pages.entries().next().value!;
+    pool.pages.delete(victim);
+    slot = oldest.slot;
+  } else {
+    const used = new Set([...pool.pages.values()].map((p) => p.slot));
+    slot = 0;
+    while (used.has(slot)) slot++;
+  }
+  pool.pages.set(page, { slot, dirty: write });
 }

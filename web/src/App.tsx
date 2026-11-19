@@ -8,7 +8,7 @@ import type { RunError } from "./components/Results";
 import { StoryBar } from "./components/StoryBar";
 import { Toasts, type Toast } from "./components/Toasts";
 import { TopBar, type Mode, type View } from "./components/TopBar";
-import { TreeView } from "./components/TreeView";
+import { EngineMap, type MapFocus } from "./components/EngineMap";
 import { EXAMPLES } from "./examples";
 import { FLASH_MS, useEngineFeed } from "./feed";
 import { CHALLENGES } from "./learn/challenges";
@@ -20,7 +20,7 @@ import { useProgress } from "./learn/progress";
 
 const SESSION_KEY = "arcanum.session";
 const THEME_KEY = "arcanum.theme";
-const VIEW_KEY = "arcanum.view";
+const VIEW_KEY = "arcanum.view.v2"; // v2: the engine map became the default view
 const MODE_KEY = "arcanum.mode";
 const INTRO_KEY = "arcanum.intro-seen";
 const EXPLAIN_PREFIX = /^\s*EXPLAIN\s+(ANALYZE\s+)?/i;
@@ -43,6 +43,21 @@ function writeStorage(storage: () => Storage, key: string, value: string | null)
   } catch {
     // Not essential: the page works without it.
   }
+}
+
+/** The tree a query read first (an index scan reads the index's own tree), so the map can follow it. */
+function treeRead(results: QueryResult[]): string | null {
+  for (const result of results) {
+    const stack = result.plan ? [result.plan] : [];
+    while (stack.length) {
+      const node = stack.shift()!;
+      if (node.operator === "TableScan") return node.label.replace(/^TableScan /, "");
+      const m = /^(?:IndexScan|IndexOnlyScan) (\S+) using (.+?) \(/.exec(node.label);
+      if (m) return m[2] === "primary key" ? m[1]! : m[2]!;
+      stack.push(...node.children);
+    }
+  }
+  return null;
 }
 
 /** The tree shown until the viewer picks one; fixed once, so tables created later do not steal the view. */
@@ -70,7 +85,8 @@ export default function App() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [introOpen, setIntroOpen] = useState(() => readStorage(local, INTRO_KEY) === null);
   const [mode, setMode] = useState<Mode>(() => (readStorage(local, MODE_KEY) === "play" ? "play" : "learn"));
-  const [view, setView] = useState<View>(() => (readStorage(local, VIEW_KEY) === "2d" ? "2d" : "3d"));
+  const [view, setView] = useState<View>(() => (readStorage(local, VIEW_KEY) === "3d" ? "3d" : "2d"));
+  const [mapFocus, setMapFocus] = useState<MapFocus>(null);
   const [theme, setTheme] = useState<"light" | "dark">(() => (readStorage(local, THEME_KEY) === "light" ? "light" : "dark"));
   const { progress, markStep, unlock, open } = useProgress();
 
@@ -161,12 +177,16 @@ export default function App() {
     void startSession(true);
   }, [startSession]);
 
-  const { feed, pending, speed, setSpeed, skip, connection, clearCrash, startCrash } = useEngineFeed(
+  const { feed, pending, speed, setSpeed, skip, connection, clearCrash, startCrash, syncPool } = useEngineFeed(
     sessionId,
     onSessionGone,
     refresh,
   );
   const flashMs = FLASH_MS[speed];
+
+  useEffect(() => {
+    if (state) syncPool(state.pager.cached, state.pager.pool_size);
+  }, [state, syncPool]);
 
   useEffect(() => {
     document.documentElement.style.setProperty("--flash-ms", `${flashMs}ms`);
@@ -204,7 +224,11 @@ export default function App() {
         }
         const next: Outcome = { id: ++outcomeIds.current, sql, results, stats, state: after };
         setOutcome(next);
-        setTab(focus ?? (mode === "play" ? "results" : "explain"));
+        const read = treeRead(results);
+        if (read && after?.trees.some((t) => t.name === read)) setSelectedTree(read);
+        // Pages and the log live on the stage now: point there, and tell the story in the inspector.
+        setMapFocus(focus === "pages" ? "pool" : focus === "log" ? "log" : null);
+        setTab(focus && focus !== "pages" && focus !== "log" ? focus : mode === "play" ? "results" : "explain");
         judge({ outcome: next, crash: null, state: after, earlier: () => undefined });
         return next;
       } catch (e) {
@@ -333,7 +357,16 @@ export default function App() {
         />
       </Suspense>
     ) : state ? (
-      <TreeView trees={state.trees} selected={selectedTree} onSelect={setSelectedTree} nodeFlash={feed.nodeFlash} flashMs={flashMs} />
+      <EngineMap
+        trees={state.trees}
+        selected={selectedTree}
+        onSelect={setSelectedTree}
+        feed={feed}
+        flashMs={flashMs}
+        state={state}
+        owners={owners}
+        focus={mapFocus}
+      />
     ) : (
       <div className="stage-loading" aria-busy="true">
         Opening your database…
@@ -394,12 +427,9 @@ export default function App() {
           onTab={setTab}
           outcome={outcome}
           error={runError}
-          state={state}
           feed={feed}
-          flashMs={flashMs}
           pending={pending}
           onSkip={skip}
-          owners={owners}
           comparison={comparison}
           onApply={applyFix}
           onFix={fixError}

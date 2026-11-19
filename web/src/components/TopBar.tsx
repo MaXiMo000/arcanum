@@ -89,8 +89,8 @@ export function TopBar(p: Props) {
         value={p.view}
         onChange={p.onView}
         options={[
-          { value: "3d", label: "3D", hint: "The crystal vault" },
-          { value: "2d", label: "2D", hint: "The textbook view" },
+          { value: "2d", label: "Map", hint: "The engine map: tree, buffer pool and disk" },
+          { value: "3d", label: "3D", hint: "The tree in 3D" },
         ]}
       />
       <Segmented<Speed>
