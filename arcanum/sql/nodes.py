@@ -282,7 +282,7 @@ class Delete:
 
 @dataclass(slots=True)
 class Begin:
-    pass
+    isolation: str | None = None  # READ COMMITTED or REPEATABLE READ; None for the default
 
 
 @dataclass(slots=True)

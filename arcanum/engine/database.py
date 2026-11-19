@@ -3,19 +3,21 @@
 import time
 from dataclasses import dataclass, field
 
-from ..errors import ArcanumError, SqlError
+from ..errors import ArcanumError, LockWaitError, SqlError
 from ..sql import nodes as n
 from ..sql.parser import parse_statements
-from ..storage import Pager
+from ..storage import Pager, encode
 from .advisor import advise
 from .binder import Binder
 from .catalog import Catalog
 from .executor import Context, QueryLimits, index_scan_pairs, run
 from .expr import conjuncts
+from .mvcc import READ_COMMITTED, REPEATABLE_READ, XID_BATCH, TransactionManager
 from .optimizer import Optimizer, mark_index_only
 from .plan import IndexScan, TableScan, explain, plan_tree
 
 _WRITES = (n.Insert, n.Update, n.Delete, n.CreateTable, n.DropTable, n.CreateIndex, n.DropIndex, n.Analyze)
+_DDL = (n.CreateTable, n.DropTable, n.CreateIndex, n.DropIndex)
 
 
 @dataclass
@@ -41,6 +43,13 @@ class Database:
     durable once it returns: it is in the write-ahead log, and opening the
     database after a crash replays every committed transaction and drops the rest.
 
+    Several sessions can share one database (connect()); execute() runs on a
+    default one. Concurrency control is PostgreSQL's: rows keep versions, each
+    statement reads through a snapshot (READ COMMITTED: taken per statement;
+    REPEATABLE READ: once per transaction), readers never wait for writers, and
+    a write to a row another open transaction changed fails with LockWaitError
+    where PostgreSQL would wait. Sessions take turns: one statement runs at a time.
+
     max_keys caps the keys per B+tree node, so trees split after a few rows;
     useful for demos and tests. optimize=False runs plans exactly as the binder
     builds them, to compare against the optimizer. limits (a QueryLimits) bounds
@@ -56,48 +65,57 @@ class Database:
         self.pager = Pager(path, pool_size, events, fs, checkpoint_frames, max_pages)
         self.events = self.pager.events
         self.catalog = Catalog(self.pager, max_keys)
+        self.mvcc = TransactionManager(self.catalog.clog, self.catalog.meta.get("xid_limit", 1))
+        self.catalog.mvcc = self.mvcc
+        self.connections = {}
+        self.exclusive = None  # the session whose open transaction changed the schema; others wait for it
+        self._snapshot = None  # what the running statement sees
+        self._txn = None  # the transaction the running statement writes in
+        self._main = self.connect("main")
+        if self.catalog.meta.get("unsettled"):
+            # The last session ended with rows still holding versions (a crash, most likely): settle them
+            # now that nothing is running, dropping whatever unfinished transactions left behind.
+            self.catalog.save_commit_log(self.mvcc.committed & self.catalog.vacuum(self.mvcc.next_xid))
         self.pager.commit()
-        self.in_transaction = False
 
     @property
     def recovered_frames(self):
         """How many committed log frames were replayed when this database was opened."""
         return self.pager.recovered_frames
 
+    @property
+    def in_transaction(self):
+        """Whether the default session has a transaction open."""
+        return self._main.in_transaction
+
+    def connect(self, name=None):
+        """A new session on this database, with its own transactions."""
+        name = name or f"s{len(self.connections) + 1}"
+        if name in self.connections:
+            raise ValueError(f"a session named {name} already exists")
+        conn = self.connections[name] = Connection(self, name)
+        return conn
+
     def execute(self, sql, trace=False, max_rows=None):
-        """Run one statement and return its Result.
+        """Run one statement in the default session and return its Result.
 
         trace=True also returns the plan of a query or EXPLAIN as a tree, with
         each operator's actual rows and time. max_rows keeps only the first rows
         of a query's result (the rest are counted in row_total, not stored).
         """
-        statements = parse_statements(sql)
-        if len(statements) != 1:
-            raise SqlError(f"execute() runs exactly one statement, got {len(statements)}; use execute_script()")
-        statement, text = statements[0]
-        return self._execute(statement, text, sql, trace, max_rows)
+        return self._main.execute(sql, trace, max_rows)
 
     def execute_script(self, sql, trace=False, max_rows=None):
-        """Run several semicolon-separated statements; returns one Result per statement.
+        """Run several semicolon-separated statements in the default session; returns one Result per statement.
 
         If one fails, the error carries `completed` (how many statements before
         it ran, and stay run) and `statement_start` (its offset in sql).
         """
-        results, cursor = [], 0
-        for statement, text in parse_statements(sql):
-            start = sql.find(text, cursor)
-            cursor = start + len(text)
-            try:
-                results.append(self._execute(statement, text, sql, trace, max_rows))
-            except ArcanumError as e:
-                e.completed, e.statement_start = len(results), start
-                raise
-        return results
+        return self._main.execute_script(sql, trace, max_rows)
 
     def close(self):
-        if self.in_transaction:
-            self.pager.rollback()
-            self.in_transaction = False
+        for conn in list(self.connections.values()):
+            conn.close()
         self.pager.close()
 
     def __enter__(self):
@@ -108,41 +126,86 @@ class Database:
 
     # ---- statement dispatch ---------------------------------------------------------
 
-    def _execute(self, statement, text, sql, trace=False, max_rows=None):
+    def _execute(self, conn, statement, text, sql, trace=False, max_rows=None):
+        if self.exclusive is not None and self.exclusive is not conn:
+            raise LockWaitError(f"session {self.exclusive.name} changed the schema in a transaction that is still "
+                                "open; PostgreSQL would make this statement wait until it commits or rolls back")
         if isinstance(statement, n.Begin):
-            if self.in_transaction:
+            if conn.txn is not None:
                 raise SqlError("a transaction is already in progress")
-            self.pager.savepoint()
-            self.in_transaction = True
+            conn.txn = self._begin(conn, statement.isolation or READ_COMMITTED)
             return Result(status="BEGIN")
-        if isinstance(statement, n.Commit):
-            self._require_transaction()
-            self.pager.release()
-            self.in_transaction = False
-            self.pager.commit()
-            return Result(status="COMMIT")
-        if isinstance(statement, n.Rollback):
-            self._require_transaction()
-            self.pager.rollback()
-            self.catalog.reload()
-            self.in_transaction = False
-            return Result(status="ROLLBACK")
+        if isinstance(statement, (n.Commit, n.Rollback)):
+            if conn.txn is None:
+                raise SqlError("there is no transaction in progress")
+            commit = isinstance(statement, n.Commit)
+            self._end(conn, conn.txn, commit)
+            return Result(status="COMMIT" if commit else "ROLLBACK")
 
+        if isinstance(statement, _DDL):
+            others = [c.name for c in self.connections.values() if c is not conn and c.txn is not None]
+            if others:
+                raise LockWaitError(f"session {others[0]} has a transaction open; PostgreSQL would make this schema "
+                                    "change wait until it ends")
+            if conn.txn is not None and not conn.ddl:
+                # Schema changes are not versioned: undo them, if the transaction rolls back, by restoring pages.
+                # No other session may run meanwhile, so the restore cannot touch anyone else's work.
+                self.pager.savepoint()
+                conn.ddl = True
+                self.exclusive = conn
+        txn, autocommit = conn.txn, False
+        if txn is None and isinstance(statement, _WRITES):
+            txn, autocommit = self._begin(conn, READ_COMMITTED), True
+        self._txn, self._snapshot = txn, self._take_snapshot(txn)
         self.pager.savepoint()
         try:
             result = self._run(statement, text, sql, trace, max_rows)
         except BaseException:
             self.pager.rollback()
             self.catalog.reload()
+            if autocommit:
+                self._end(conn, txn, commit=False)
             raise
+        finally:
+            self._txn = self._snapshot = None
         self.pager.release()
-        if not self.in_transaction and isinstance(statement, _WRITES):
-            self.pager.commit()
+        if autocommit:
+            self._end(conn, txn, commit=True)
         return result
 
-    def _require_transaction(self):
-        if not self.in_transaction:
-            raise SqlError("there is no transaction in progress")
+    def _begin(self, conn, isolation):
+        if self.mvcc.next_xid >= self.catalog.meta.get("xid_limit", 0):
+            # Reserve the next batch of ids on disk first, so none is handed out twice after a crash.
+            self.catalog.set_meta("xid_limit", self.mvcc.next_xid + XID_BATCH)
+        return self.mvcc.begin(conn.name, isolation)
+
+    def _take_snapshot(self, txn):
+        if txn is None:
+            return self.mvcc.snapshot()
+        if txn.isolation == REPEATABLE_READ:
+            if txn.snapshot is None:
+                txn.snapshot = self.mvcc.snapshot(txn.xid)
+            return txn.snapshot
+        return self.mvcc.snapshot(txn.xid)
+
+    def _end(self, conn, txn, commit):
+        """Commit or roll back txn, then settle every row whose versions nobody needs any more."""
+        if conn.ddl:
+            if commit:
+                self.pager.release()
+            else:
+                self.pager.rollback()
+                self.catalog.reload()
+            conn.ddl = False
+            self.exclusive = None
+        self.mvcc.end(txn, commit)
+        if conn.txn is txn:
+            conn.txn = None
+        # The commit itself: versions the transaction made are frozen where no snapshot needs them, and
+        # the commit log keeps its id only while some version still mentions it.
+        mentioned = self.catalog.prune(self.mvcc.horizon())
+        self.catalog.save_commit_log(self.mvcc.committed & mentioned)
+        self.pager.commit()
 
     def _run(self, statement, text, sql, trace=False, max_rows=None):
         binder = Binder(self.catalog, sql)
@@ -216,7 +279,7 @@ class Database:
             else:
                 tables = list(self.catalog.tables.values())
             for table in tables:
-                self.catalog.analyze(table)
+                self.catalog.analyze(table, self._snapshot)
             return Result(status="ANALYZE")
         raise SqlError(f"Arcanum doesn't support {type(statement).__name__} yet")
 
@@ -233,7 +296,7 @@ class Database:
             row = list(defaults)
             for pos, value in zip(positions, values, strict=True):
                 row[pos] = value
-            self.catalog.insert_row(table, self.catalog.check_row(table, row))
+            self.catalog.insert_row(table, self.catalog.check_row(table, row), self._txn)
         return Result(rowcount=len(rows), status=f"INSERT {len(rows)}")
 
     def _traced(self, result, statement, text, plan=None, stats=None, decisions=None):
@@ -248,7 +311,7 @@ class Database:
         return result
 
     def _context(self, analyze=False):
-        return Context(self.catalog, analyze, self.limits)
+        return Context(self.catalog, analyze, self.limits, self._snapshot)
 
     def _plan(self, plan, decisions=None):
         """Optimize a bound plan; decisions, if a list, receives the optimizer's reasoning."""
@@ -263,7 +326,7 @@ class Database:
             optimizer = Optimizer()
             optimizer.optimize_expr(where)
             scan, conditions = optimizer.access_path(scan, conjuncts(where))
-        pairs = index_scan_pairs(scan, ctx) if isinstance(scan, IndexScan) else self.catalog.scan(table)
+        pairs = index_scan_pairs(scan, ctx) if isinstance(scan, IndexScan) else self.catalog.scan(table, ctx.snapshot)
         checks = [ctx.compile(c) for c in conditions]
         matches = []
         for key, row in pairs:
@@ -272,30 +335,87 @@ class Database:
                 matches.append((key, row))
         return matches
 
+    def _locked_rows(self, ctx, table, where):
+        """The rows a WHERE clause selects, each checked writable (see Catalog.lock_row):
+        [(key, row as seen, versions, position of the version to change)]."""
+        locked = []
+        for key, row in self._matching_rows(ctx, table, where):
+            hit = self.catalog.lock_row(table, key, self._txn, ctx.snapshot)
+            if hit is not None:
+                locked.append((key, row, *hit))
+        return locked
+
     def _update(self, binder, statement):
         table, where, assignments = binder.bind_update(statement)
         ctx = self._context()
-        targets = self._matching_rows(ctx, table, where)
+        targets = self._locked_rows(ctx, table, where)
         compiled = [(pos, ctx.compile(e)) for pos, e in assignments]
-        updated = []
-        for _, row in targets:
+        stayed, moved = [], []
+        for key, row, versions, current in targets:
             new = list(row)
             for pos, f in compiled:
                 new[pos] = f(row, ())
-            updated.append(self.catalog.check_row(table, new))
-        # Remove every old version before writing new ones, so swapping key values
-        # between rows (UPDATE t SET id = id + 1) is not mistaken for a duplicate.
-        for key, row in targets:
-            self.catalog.delete_row(table, key, row)
-        for (key, _), row in zip(targets, updated, strict=True):
-            self.catalog.insert_row(table, row, None if table.primary_key else key)
+            new = self.catalog.check_row(table, new)
+            if not table.primary_key or encode(tuple(new[i] for i in table.primary_key)) == key:
+                stayed.append((key, versions, current, new))
+            else:
+                moved.append((key, versions, current, new))
+        # Every old version is marked deleted before uniqueness is checked, so swapping keys or unique
+        # values between rows (UPDATE t SET id = id + 1) is not mistaken for a duplicate.
+        for key, versions, current, new in stayed:
+            self.catalog.update_version(table, key, versions, current, new, self._txn)
+        for key, versions, current, _ in moved:
+            self.catalog.delete_version(table, key, versions, current, self._txn)
+        for _, _, _, new in moved:
+            self.catalog.insert_row(table, new, self._txn)
+        for key, _, _, new in stayed:
+            self.catalog.check_unique(table, new, key, self._txn)
         return Result(rowcount=len(targets), status=f"UPDATE {len(targets)}")
 
     def _delete(self, binder, statement):
         table, where = binder.bind_delete(statement)
-        targets = self._matching_rows(self._context(), table, where)
-        for key, row in targets:
-            self.catalog.delete_row(table, key, row)
+        targets = self._locked_rows(self._context(), table, where)
+        for key, _, versions, current in targets:
+            self.catalog.delete_version(table, key, versions, current, self._txn)
         return Result(rowcount=len(targets), status=f"DELETE {len(targets)}")
 
 
+
+
+class Connection:
+    """A session on a Database: its own transaction, isolation level and snapshots over shared data."""
+
+    def __init__(self, db, name):
+        self.db = db
+        self.name = name
+        self.txn = None  # the open transaction (from BEGIN), if any
+        self.ddl = False  # whether that transaction changed the schema (and so holds a page savepoint)
+
+    @property
+    def in_transaction(self):
+        return self.txn is not None
+
+    def execute(self, sql, trace=False, max_rows=None):
+        statements = parse_statements(sql)
+        if len(statements) != 1:
+            raise SqlError(f"execute() runs exactly one statement, got {len(statements)}; use execute_script()")
+        statement, text = statements[0]
+        return self.db._execute(self, statement, text, sql, trace, max_rows)
+
+    def execute_script(self, sql, trace=False, max_rows=None):
+        results, cursor = [], 0
+        for statement, text in parse_statements(sql):
+            start = sql.find(text, cursor)
+            cursor = start + len(text)
+            try:
+                results.append(self.db._execute(self, statement, text, sql, trace, max_rows))
+            except ArcanumError as e:
+                e.completed, e.statement_start = len(results), start
+                raise
+        return results
+
+    def close(self):
+        """End the session, rolling back its open transaction."""
+        if self.txn is not None:
+            self.db._end(self, self.txn, commit=False)
+        self.db.connections.pop(self.name, None)

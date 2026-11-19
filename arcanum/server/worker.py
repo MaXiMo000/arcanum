@@ -162,6 +162,8 @@ def worker_main(path, conn, event_conn, options):
                       pool_size=options["pool_size"], limits=limits)
         if not db.catalog.tables:
             db.execute_script(SEED_SQL)
+        for name in SESSIONS:
+            db.connect(name)
     except Exception as e:
         pump.flush()
         send(conn, {"ready": False, "error": error_json(e)})
@@ -192,9 +194,14 @@ def worker_main(path, conn, event_conn, options):
             send(conn, {"ok": False, "error": error_json(e)})
 
 
+SESSIONS = ("A", "B")  # the database sessions each visitor can type into, side by side
+VERSION_ROWS = 40  # rows with versions the state shows at most
+
+
 def _query(db, message, conn, pump):
+    session = db.connections[message.get("session") or SESSIONS[0]]
     try:
-        results = db.execute_script(message["sql"], trace=True, max_rows=message["max_rows"])
+        results = session.execute_script(message["sql"], trace=True, max_rows=message["max_rows"])
     except (SqlError, ConstraintError) as e:
         e.doctor = diagnose(e, db.catalog, message["sql"])
         if e.doctor and e.doctor["fix"]:
@@ -235,7 +242,39 @@ def _state(db, message, conn, pump):
         "pool_size": pager.pool_size, "cached": [{"page": p, "dirty": d} for p, d in pager.cached_pages()],
         "free": pager.free_pages(), "stats": dict(pager.stats)},
         "wal": {"committed_frames": pager.wal.committed_frames, "uncommitted": pager.wal.has_uncommitted},
-        "in_transaction": db.in_transaction}
+        "in_transaction": db.connections[SESSIONS[0]].in_transaction, **_mvcc_state(db)}
+
+
+def _mvcc_state(db):
+    """Each session's transaction and what it would see now, and every row still holding versions."""
+    manager, catalog = db.mvcc, db.catalog
+    sessions, views = {}, {}
+    for name in SESSIONS:
+        txn = db.connections[name].txn
+        if txn is None:
+            view = manager.snapshot()
+        elif txn.snapshot is not None:
+            view = txn.snapshot  # REPEATABLE READ, after its first statement
+        else:
+            view = manager.snapshot(txn.xid)
+        views[name] = view
+        sessions[name] = {
+            "xid": txn.xid if txn else None,
+            "isolation": txn.isolation if txn else None,
+            "snapshot": {"xmin": view.xmin, "xmax": view.xmax, "active": sorted(view.active),
+                         "fixed": bool(txn and txn.snapshot is not None)},
+        }
+    rows = []
+    for table, key, versions in catalog.unsettled_rows(VERSION_ROWS):
+        shown = []
+        for xmin, xmax, row in versions:
+            shown.append({"xmin": xmin, "xmax": xmax, "row": [_json_value(v) for v in row],
+                          "status": [manager.status(xmin), manager.status(xmax) if xmax is not None else None],
+                          "seen_by": [name for name, view in views.items() if manager.visible(view, xmin, xmax)]})
+        rows.append({"table": table.name, "key": list(decode(key)), "versions": shown})
+    return {"sessions": sessions, "next_xid": manager.next_xid,
+            "running": [{"xid": t.xid, "session": t.owner, "isolation": t.isolation} for t in manager.running.values()],
+            "commit_log": sorted(catalog.clog), "versions": rows}
 
 
 def _workload(db, message, conn, pump):

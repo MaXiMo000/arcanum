@@ -52,8 +52,9 @@ class QueryLimits:
 class Context:
     """State for running one statement."""
 
-    def __init__(self, catalog, analyze=False, limits=None):
+    def __init__(self, catalog, analyze=False, limits=None, snapshot=None):
         self.catalog = catalog
+        self.snapshot = snapshot  # which row versions the statement sees (see mvcc.py)
         self.events = catalog.pager.events if catalog is not None else None
         self.limits = limits or QueryLimits()
         self.sort_memory_rows = self.limits.sort_memory_rows
@@ -333,7 +334,7 @@ def _one_row(plan, ctx, outer):
 
 
 def _table_scan(plan, ctx, outer):
-    for _, row in ctx.catalog.scan(plan.table):
+    for _, row in ctx.catalog.scan(plan.table, ctx.snapshot):
         yield row
 
 
@@ -367,7 +368,8 @@ def index_scan_pairs(plan, ctx, outer=()):
         # One point lookup per distinct non-NULL value, in key order so the rows come out sorted.
         keys = {encode([*eq, v]) for v in (value(e, position) for e in plan.points) if v is not None}
         for key in sorted(keys):
-            yield from ctx.catalog.scan_range(plan.table, plan.index, key, key + _AFTER_ALL, index_only=plan.index_only)
+            yield from ctx.catalog.scan_range(plan.table, plan.index, ctx.snapshot, key, key + _AFTER_ALL,
+                                              index_only=plan.index_only)
         return
     lo, hi, hi_inclusive = prefix or None, (prefix + _AFTER_ALL) if prefix else None, False
     if plan.lo is not None:
@@ -382,7 +384,7 @@ def index_scan_pairs(plan, ctx, outer=()):
         if v is None:
             return
         hi = encode([*eq, v]) + (_AFTER_ALL if plan.hi[1] else b"")
-    yield from ctx.catalog.scan_range(plan.table, plan.index, lo, hi, hi_inclusive, plan.index_only)
+    yield from ctx.catalog.scan_range(plan.table, plan.index, ctx.snapshot, lo, hi, hi_inclusive, plan.index_only)
 
 
 def _work_table_scan(plan, ctx, outer):

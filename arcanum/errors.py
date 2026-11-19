@@ -36,3 +36,16 @@ class ConstraintError(ArcanumError):
 
 class ExecutionError(ArcanumError):
     """A query failed while running, for example dividing by zero."""
+
+
+class LockWaitError(ExecutionError):
+    """A write needs a row (or the schema) that another session's open transaction holds.
+
+    PostgreSQL would make the statement wait until that transaction ends; here
+    sessions take turns, so the statement fails instead and can be retried.
+    """
+
+
+class SerializationError(ExecutionError):
+    """A REPEATABLE READ transaction tried to change a row that changed after its snapshot was taken.
+    PostgreSQL reports the same: "could not serialize access due to concurrent update"."""

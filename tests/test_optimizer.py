@@ -7,6 +7,7 @@ these tests check the shapes and costs themselves.
 import pytest
 
 from arcanum import Database, QueryLimits
+from arcanum.storage import decode
 
 
 @pytest.fixture
@@ -245,4 +246,5 @@ def test_statistics_survive_reopen_and_feed_estimates(tmp_path):
         assert stats.rows == 400 and stats.columns[1].distinct == 4
         assert "est=100" in plan(db, "SELECT id FROM t WHERE k = 2")  # 400 rows / 4 distinct values
         db.execute("DROP TABLE t")
-        assert not [k for k, _ in db.catalog.tree.scan()]  # the stats entries went with the table
+        # The stats entries went with the table; only the engine's own bookkeeping remains.
+        assert {decode(v)[0] for _, v in db.catalog.tree.scan()} <= {"meta"}

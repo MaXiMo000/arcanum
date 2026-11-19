@@ -25,6 +25,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
@@ -121,6 +122,7 @@ class RateLimiter:
 
 class QueryRequest(BaseModel):
     sql: str
+    session: Literal["A", "B"] = "A"  # which of the visitor's two database sessions runs it
 
 
 class CrashRequest(BaseModel):
@@ -249,7 +251,8 @@ def create_app(settings=None):
         session = manager.get(session_id)
         if len(body.sql.encode()) > settings.max_sql_bytes:
             return _error(413, "SqlTooLong", f"SQL is limited to {settings.max_sql_bytes} bytes")
-        reply = await session.request({"op": "query", "sql": body.sql, "max_rows": settings.max_rows})
+        reply = await session.request({"op": "query", "sql": body.sql, "session": body.session,
+                                       "max_rows": settings.max_rows})
         if not reply["ok"]:
             return JSONResponse({"error": reply["error"]}, status_code=400)
         return {"results": reply["results"], "stats": reply["stats"]}

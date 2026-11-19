@@ -302,3 +302,29 @@ def test_other_sites_cannot_change_anything(client):
     # The page's own origin, an allowed one and requests without Origin (scripts, curl) still work.
     assert client.post("/sessions", headers={"Origin": "http://testserver"}).status_code == 201
     assert sql(client, session, "SELECT count(*) FROM orders").json()["results"][0]["rows"] == [[80]]
+
+
+def test_two_sessions_see_each_other_only_after_commit(client):
+    session = new_session(client)
+
+    def run(text, who):
+        return client.post(f"/sessions/{session}/query", json={"sql": text, "session": who})
+
+    assert run("BEGIN; UPDATE customers SET city = 'Rome' WHERE id = 1", "A").status_code == 200
+    seen = run("SELECT city FROM customers WHERE id = 1", "B").json()["results"][0]["rows"]
+    assert seen == [["Osaka"]]
+    blocked = run("UPDATE customers SET city = 'Lima' WHERE id = 1", "B")
+    assert blocked.status_code == 400 and blocked.json()["error"]["type"] == "LockWaitError"
+
+    state = client.get(f"/sessions/{session}/state").json()
+    a = state["sessions"]["A"]
+    assert a["xid"] and a["isolation"] == "READ COMMITTED" and state["sessions"]["B"]["xid"] is None
+    [row] = [r for r in state["versions"] if r["table"] == "customers" and r["key"] == [1]]
+    old, new = row["versions"]
+    assert old["xmax"] == new["xmin"] == a["xid"]
+    assert old["seen_by"] == ["B"] and new["seen_by"] == ["A"]
+
+    run("COMMIT", "A")
+    assert run("SELECT city FROM customers WHERE id = 1", "B").json()["results"][0]["rows"] == [["Rome"]]
+    assert client.get(f"/sessions/{session}/state").json()["versions"] == []  # settled again
+    assert client.post(f"/sessions/{session}/query", json={"sql": "SELECT 1", "session": "C"}).status_code == 422

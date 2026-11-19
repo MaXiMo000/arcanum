@@ -120,6 +120,25 @@ class _Parser:
             return f"string {tok.value!r}"
         return f"'{tok.value}'"
 
+    def isolation_level(self):
+        """The optional ISOLATION LEVEL clause of BEGIN."""
+        if not self.accept_kw("ISOLATION"):
+            return None
+        self.expect_kw("LEVEL")
+        tok = self.tok
+        if self.accept_kw("READ"):
+            if self.accept_kw("COMMITTED"):
+                return "READ COMMITTED"
+            if self.accept_kw("UNCOMMITTED"):
+                return "READ COMMITTED"  # as in PostgreSQL, which never shows uncommitted rows
+            raise self.error(f"expected COMMITTED, got {self.describe()}")
+        if self.accept_kw("REPEATABLE"):
+            self.expect_kw("READ")
+            return "REPEATABLE READ"
+        if self.accept_kw("SERIALIZABLE"):
+            raise self.unsupported("SERIALIZABLE isolation (use REPEATABLE READ)", tok)
+        raise self.error(f"expected READ COMMITTED or REPEATABLE READ, got {self.describe()}")
+
     def error(self, message, tok=None):
         return SqlError(message, self.sql, (tok or self.tok).pos)
 
@@ -196,7 +215,9 @@ class _Parser:
             return self.drop()
         if word in ("BEGIN", "COMMIT", "ROLLBACK"):
             self.accept_kw("TRANSACTION")
-            return {"BEGIN": n.Begin, "COMMIT": n.Commit, "ROLLBACK": n.Rollback}[word]()
+            if word == "BEGIN":
+                return n.Begin(self.isolation_level())
+            return {"COMMIT": n.Commit, "ROLLBACK": n.Rollback}[word]()
         if word == "EXPLAIN":
             analyze = bool(self.accept_kw("ANALYZE"))
             return n.Explain(self.statement(), analyze)

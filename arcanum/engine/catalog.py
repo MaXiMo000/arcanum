@@ -20,12 +20,13 @@ from collections import Counter
 from dataclasses import dataclass, field
 from functools import cached_property
 
-from ..errors import ConstraintError, ExecutionError, SqlError
+from ..errors import ConstraintError, ExecutionError, LockWaitError, SerializationError, SqlError
 from ..sql import nodes as n
 from ..sql.parser import parse
-from ..storage import BTree, DuplicateKeyError, decode, encode
+from ..storage import BTree, decode, encode
 from ..storage.btree import MAX_ENTRY
 from .expr import BOOLEAN, REAL, assignable, literal_type, to_text
+from .mvcc import FROZEN, pack, prune, settled, unpack
 
 CATALOG_ROOT = 1
 HISTOGRAM_BUCKETS = 16
@@ -126,16 +127,27 @@ class Catalog:
         if pager.page_count == 1 and BTree.create(pager).root != CATALOG_ROOT:
             raise AssertionError("the catalog must be the first tree in a new database")
         self.tree = BTree(pager, CATALOG_ROOT)
+        self.mvcc = None  # the TransactionManager, set by the Database
+        self.unsettled = {}  # table name -> keys of rows that may hold versions other than one frozen one
         self.reload()
 
     def reload(self):
-        """Rebuild the in-memory schema from the catalog tree (after open or rollback)."""
+        """Rebuild the in-memory schema from the catalog tree (after open or rollback).
+
+        Rows changed since the last prune (unsettled) are tracked in memory and
+        kept across a reload: a rolled-back statement can only have removed some.
+        """
         self.tables, self.indexes, self._next_rowid = {}, {}, {}
+        self.meta, self.clog = {}, set()
         entries = [decode(value) for _, value in self.tree.scan()]
         stats = {}
         for kind, name, sql, root in entries:
             if kind == "table":
                 self.tables[name] = _table_from_ast(parse(sql), root, sql)
+            elif kind == "meta":
+                self.meta[name] = root
+            elif kind == "clog":
+                self.clog.add(root)
         for kind, name, sql, root in entries:
             if kind == "index":
                 stmt = parse(sql)
@@ -182,8 +194,10 @@ class Catalog:
             positions.append(pos)
         index = IndexSchema(stmt.name, table.name, positions, stmt.unique,
                             BTree.create(self.pager, self.max_keys).root, sql)
-        for key, row in list(self.scan(table)):
-            self._index_insert(table, index, key, row)
+        for key, row in list(self.versions(table)):
+            self._index_add(index, key, row)
+        if index.unique:
+            self._check_unique_all(table, index)
         table.indexes.append(index)
         self.indexes[index.name] = index
         self._put_entry("index", index.name, sql, index.root)
@@ -197,6 +211,7 @@ class Catalog:
             del self.indexes[index.name]
         self.btree(table.root).drop()
         self.tree.delete(encode((name,)))
+        self.unsettled.pop(name, None)
         for column in range(-1, len(table.columns)):
             self.tree.delete(encode((name, "stats", column)))
         self._next_rowid.pop(name, None)
@@ -218,9 +233,9 @@ class Catalog:
 
     # ---- rows --------------------------------------------------------------------
 
-    def analyze(self, table):
+    def analyze(self, table, snapshot):
         """Collect row and column statistics for the optimizer and store them in the catalog."""
-        rows = [row for _, row in self.scan(table)]
+        rows = [row for _, row in self.scan(table, snapshot)]
         columns = []
         for i in range(len(table.columns)):
             values = sorted(row[i] for row in rows if row[i] is not None)
@@ -239,36 +254,79 @@ class Catalog:
             self.tree.insert(encode((table.name, "stats", column)),
                              encode(("stats", table.name, json.dumps(data), column)), replace=True)
 
-    def scan(self, table):
-        """Yield (key, row) for every row, in primary key order."""
-        for key, value in self.btree(table.root).scan():
-            yield key, self._row(table, value)
+    # ---- rows: chains of versions (see mvcc.py) ------------------------------------------------
 
-    def scan_range(self, table, index, lo=None, hi=None, hi_inclusive=False, index_only=False):
+    def chain(self, table, key):
+        """The versions stored under key, oldest first, or None."""
+        value = self.btree(table.root).get(key)
+        return None if value is None else unpack(decode(value), len(table.columns))
+
+    def _store(self, table, key, versions):
+        tree = self.btree(table.root)
+        if not versions:
+            tree.delete(key)
+            return
+        value = encode(pack(versions))
+        _check_size(len(key) + len(value), f"row of table {table.name}")
+        tree.insert(key, value, replace=True)
+
+    def _visible(self, table, versions, snapshot):
+        """The version of a row that snapshot sees (raw, untyped), or None."""
+        if len(versions) == 1 and versions[0][0] == FROZEN and versions[0][1] is None:
+            return versions[0][2]  # settled: everyone sees it
+        for xmin, xmax, row in reversed(versions):
+            if self.mvcc.visible(snapshot, xmin, xmax):
+                return row
+        return None
+
+    def scan(self, table, snapshot):
+        """Yield (key, row) for every row the snapshot sees, in primary key order."""
+        width = len(table.columns)
+        for key, value in self.btree(table.root).scan():
+            row = self._visible(table, unpack(decode(value), width), snapshot)
+            if row is not None:
+                yield key, self._typed(table, row)
+
+    def versions(self, table):
+        """Yield (key, row) for every version of every row, whoever can see it (for building an index)."""
+        width = len(table.columns)
+        for key, value in self.btree(table.root).scan():
+            for _, _, row in unpack(decode(value), width):
+                yield key, row
+
+    def scan_range(self, table, index, snapshot, lo=None, hi=None, hi_inclusive=False, index_only=False):
         """Yield (table key, row) for rows whose key in `index` (None = primary key) is in [lo, hi).
 
-        index_only builds each row from the index entry alone: the index and
-        primary key columns are filled in and every other column is NULL.
+        An index entry may belong to any version of its row, so each match is
+        checked against the version the snapshot sees (PostgreSQL's recheck).
+        index_only builds rows from the entries alone, which is only correct
+        while every row of the table is settled; otherwise it checks the table,
+        as PostgreSQL does for pages its visibility map does not mark all-visible.
+        Columns outside the index come back as NULL.
         """
+        width = len(table.columns)
         if index is None:
             for key, value in self.btree(table.root).scan(lo, hi, hi_inclusive=hi_inclusive):
-                yield key, self._row(table, value)
+                row = self._visible(table, unpack(decode(value), width), snapshot)
+                if row is not None:
+                    yield key, self._typed(table, row)
             return
-        tree, width = self.btree(table.root), len(index.columns)
+        tree, size = self.btree(table.root), len(index.columns)
         positions = [*index.columns, *table.primary_key]
+        all_visible = not self.unsettled.get(table.name)
         for entry, _ in self.btree(index.root).scan(lo, hi, hi_inclusive=hi_inclusive):
             values = decode(entry)
-            key = encode(values[width:])  # an index entry ends with the row's table key
-            if index_only:
-                row = [None] * len(table.columns)
+            key = encode(values[size:])  # an index entry ends with the row's table key
+            if index_only and all_visible:
+                row = [None] * width
                 for position, value in zip(positions, values, strict=False):
                     row[position] = value
                 yield key, self._typed(table, tuple(row))
-            else:
-                yield key, self._row(table, tree.get(key))
-
-    def _row(self, table, value):
-        return self._typed(table, decode(value))
+                continue
+            stored = tree.get(key)
+            row = self._visible(table, unpack(decode(stored), width), snapshot) if stored is not None else None
+            if row is not None and tuple(row[i] for i in index.columns) == tuple(values[:size]):
+                yield key, self._typed(table, row)
 
     def _typed(self, table, row):
         if table.booleans:
@@ -287,31 +345,182 @@ class Catalog:
             out.append(value)
         return tuple(out)
 
-    def insert_row(self, table, row, rowid_key=None):
-        """Insert a row produced by check_row, maintaining every index.
+    def insert_row(self, table, row, txn, rowid_key=None):
+        """Add a row produced by check_row as a new version created by txn, maintaining every index.
 
         Tables without a primary key get a new row id unless rowid_key (an
-        existing row's key, when UPDATE rewrites it) is given.
+        existing row's key, when UPDATE rewrites it) is given. Raises
+        ConstraintError for a key or unique value another live row holds, and
+        LockWaitError when the competing row belongs to an open transaction.
         """
         if table.primary_key:
             key = encode(tuple(row[i] for i in table.primary_key))
         else:
             key = rowid_key if rowid_key is not None else encode((self._take_rowid(table),))
-        value = encode(row)
-        _check_size(len(key) + len(value), f"row of table {table.name}")
-        try:
-            self.btree(table.root).insert(key, value)
-        except DuplicateKeyError:
+        versions = self.chain(table, key) or []
+        if versions and self._live(versions, txn, lambda r: True):
             values = ", ".join(_show(row[i]) for i in table.primary_key)
-            raise ConstraintError(f"duplicate key ({values}) violates the primary key of table {table.name}") from None
+            raise ConstraintError(f"duplicate key ({values}) violates the primary key of table {table.name}")
         for index in table.indexes:
-            self._index_insert(table, index, key, row)
+            self._check_unique(table, index, row, key, txn)
+        self._store(table, key, [*versions, [txn.xid, None, row]])
+        for index in table.indexes:
+            self._index_add(index, key, row)
+        self._touch(table, key, txn)
         return key
 
-    def delete_row(self, table, key, row):
+    def lock_row(self, table, key, txn, snapshot):
+        """The versions of a row about to be updated or deleted by txn, after the checks PostgreSQL makes.
+
+        Returns (versions, position of the current version), or None if the
+        row is gone. Raises LockWaitError if another open transaction already
+        changed it, and SerializationError if a transaction that committed after
+        a REPEATABLE READ snapshot did.
+        """
+        versions = self.chain(table, key)
+        if not versions:
+            return None
+        live = [i for i, (xmin, _, _) in enumerate(versions) if xmin == txn.xid or self.mvcc.status(xmin) != "aborted"]
+        if not live:
+            return None
+        current = live[-1]
+        xmin, xmax, _ = versions[current]
+        self._not_held(table, key, xmin, txn)
+        if xmax is not None and xmax != txn.xid:
+            self._not_held(table, key, xmax, txn)
+            if self.mvcc.status(xmax) == "committed":
+                if not self.mvcc.sees(snapshot, xmax):
+                    raise SerializationError("could not serialize access due to concurrent update: "
+                                             f"{self._describe(table, key)} was changed by a transaction that "
+                                             "committed after this transaction's snapshot")
+                return None  # deleted before our snapshot: we never saw it
+        if not self.mvcc.sees(snapshot, xmin):
+            raise SerializationError("could not serialize access due to concurrent update: "
+                                     f"{self._describe(table, key)} was changed by a transaction that committed "
+                                     "after this transaction's snapshot")
+        return versions, current
+
+    def delete_version(self, table, key, versions, current, txn):
+        """Mark the current version deleted by txn (dropping it outright if txn also created it)."""
+        xmin, _, row = versions[current]
+        if xmin == txn.xid:
+            remaining = versions[:current] + versions[current + 1:]
+            self._store(table, key, remaining)
+            self._index_clean(table, key, [row], remaining)
+        else:
+            versions[current][1] = txn.xid
+            self._store(table, key, versions)
+        self._touch(table, key, txn)
+
+    def update_version(self, table, key, versions, current, row, txn):
+        """Replace the current version by a new one with the same key: the old one is marked deleted and
+        the new one appended, so snapshots that saw the old version keep seeing it. Unique indexes are
+        checked by check_unique once the whole statement has written its versions."""
+        old = versions[current]
+        if old[0] == txn.xid:
+            remaining = versions[:current] + versions[current + 1:]
+        else:
+            old[1] = txn.xid
+            remaining = versions
+        remaining = [*remaining, [txn.xid, None, row]]
+        self._store(table, key, remaining)
+        if old[0] == txn.xid:
+            self._index_clean(table, key, [old[2]], remaining)
         for index in table.indexes:
-            self.btree(index.root).delete(encode(tuple(row[i] for i in index.columns)) + key)
-        self.btree(table.root).delete(key)
+            self._index_add(index, key, row)
+        self._touch(table, key, txn)
+
+    def prune(self, horizon):
+        """Tidy every row a transaction touched since the last prune: drop versions no snapshot can see,
+        freeze the rest where possible, and remove index entries no version needs. Returns the
+        transaction ids the remaining versions still mention (the commit log must keep those)."""
+        mentioned = set()
+        for name in list(self.unsettled):
+            table = self.tables.get(name)
+            keys = self.unsettled.pop(name)
+            if table is None:
+                continue
+            still = set()
+            for key in keys:
+                versions = self.chain(table, key)
+                if versions is None:
+                    continue
+                kept = prune(versions, self.mvcc, horizon)
+                if kept != versions:
+                    self._store(table, key, kept)
+                    gone = [row for _, _, row in versions if all(row is not k[2] for k in kept)]
+                    self._index_clean(table, key, gone, kept)
+                if kept and not settled(kept):
+                    still.add(key)
+                    for xmin, xmax, _ in kept:
+                        mentioned.update(x for x in (xmin, xmax) if x)
+            if still:
+                self.unsettled[name] = still
+        self.set_meta("unsettled", 1 if self.unsettled else 0)
+        return mentioned
+
+    def vacuum(self, horizon):
+        """Prune every row of every table (used at open when rows may still hold unsettled versions)."""
+        for table in self.tables.values():
+            self.unsettled[table.name] = {key for key, _ in self.btree(table.root).scan()}
+        return self.prune(horizon)
+
+    def unsettled_rows(self, limit):
+        """[(table, key, versions)] for rows that currently hold more than one version or an unfrozen one."""
+        out = []
+        for name, keys in self.unsettled.items():
+            table = self.tables.get(name)
+            if table is None:
+                continue
+            for key in sorted(keys):
+                versions = self.chain(table, key)
+                if versions and not settled(versions):
+                    out.append((table, key, versions))
+                    if len(out) >= limit:
+                        return out
+        return out
+
+    # ---- helpers --------------------------------------------------------------------------------
+
+    def _touch(self, table, key, txn):
+        if not self.unsettled:
+            self.set_meta("unsettled", 1)  # logged with the versions, so a crash leaves a vacuum to do
+        self.unsettled.setdefault(table.name, set()).add(key)
+        txn.touched.setdefault(table.name, set()).add(key)
+
+    def _live(self, versions, txn, matches):
+        """Whether some version matching `matches` is live for a writer: created by a transaction that
+        committed (or by txn) and not deleted by one. A version an open transaction holds raises
+        LockWaitError: PostgreSQL would wait to see whether it commits."""
+        for xmin, xmax, row in versions:
+            if not matches(row):
+                continue
+            created = "own" if xmin == txn.xid else self.mvcc.status(xmin)
+            if created == "aborted":
+                continue
+            if created == "running":
+                raise self._held_error(xmin)
+            if xmax is None or (xmax != txn.xid and self.mvcc.status(xmax) == "aborted"):
+                return True
+            if xmax != txn.xid and self.mvcc.status(xmax) == "running":
+                raise self._held_error(xmax)
+        return False
+
+    def _not_held(self, table, key, xid, txn):
+        if xid != txn.xid and self.mvcc.status(xid) == "running":
+            raise self._held_error(xid, self._describe(table, key))
+
+    def _held_error(self, xid, what="a row with that key"):
+        owner = self.mvcc.running[xid].owner
+        return LockWaitError(f"{what} is held by the open transaction {xid} in session {owner}; PostgreSQL "
+                             "would make this statement wait until that transaction commits or rolls back")
+
+    def _describe(self, table, key):
+        values = decode(key)
+        if table.primary_key:
+            names = [table.columns[i].name for i in table.primary_key]
+            return "row (" + ", ".join(f"{n} = {_show(v)}" for n, v in zip(names, values, strict=True)) + ")"
+        return f"row {values[0]}"
 
     def _take_rowid(self, table):
         rowid = self._next_rowid.get(table.name)
@@ -321,22 +530,69 @@ class Catalog:
         self._next_rowid[table.name] = rowid + 1
         return rowid
 
-    def _index_insert(self, table, index, key, row):
-        self._check_unique(table, index, row)
+    def _index_add(self, index, key, row):
         entry = encode(tuple(row[i] for i in index.columns)) + key
         _check_size(len(entry), f"entry of index {index.name}")
-        self.btree(index.root).insert(entry, b"")
+        tree = self.btree(index.root)
+        if tree.get(entry) is None:
+            tree.insert(entry, b"")
 
-    def _check_unique(self, table, index, row):
+    def _index_clean(self, table, key, removed, remaining):
+        """Delete the index entries of removed versions that no remaining version shares."""
+        for index in table.indexes:
+            keep = {tuple(r[i] for i in index.columns) for _, _, r in remaining}
+            for values in {tuple(r[i] for i in index.columns) for r in removed} - keep:
+                self.btree(index.root).delete(encode(values) + key)
+
+    def check_unique(self, table, row, key, txn):
+        for index in table.indexes:
+            self._check_unique(table, index, row, key, txn)
+
+    def _check_unique(self, table, index, row, key, txn):
         values = tuple(row[i] for i in index.columns)
         if not index.unique or None in values:  # NULLs never collide in a unique index
             return
-        prefix = encode(values)
+        prefix, size = encode(values), len(index.columns)
         for existing, _ in self.btree(index.root).scan(lo=prefix):
-            if existing.startswith(prefix):
+            if not existing.startswith(prefix):
+                break
+            other = encode(decode(existing)[size:])
+            if other == key:
+                continue  # an older version of the same row
+            versions = self.chain(table, other) or []
+            if self._live(versions, txn, lambda r: tuple(r[i] for i in index.columns) == values):
                 shown = ", ".join(_show(v) for v in values)
                 raise ConstraintError(f"duplicate value ({shown}) violates unique index {index.name}")
-            break
+
+    def _check_unique_all(self, table, index):
+        """CREATE UNIQUE INDEX on existing rows: no two live rows may share a value."""
+        seen = {}
+        for key, value in self.btree(table.root).scan():
+            for xmin, xmax, row in unpack(decode(value), len(table.columns)):
+                if self.mvcc.status(xmin) == "aborted" or (xmax is not None and self.mvcc.status(xmax) == "committed"):
+                    continue
+                values = tuple(row[i] for i in index.columns)
+                if None in values:
+                    continue
+                if seen.setdefault(values, key) != key:
+                    shown = ", ".join(_show(v) for v in values)
+                    raise ConstraintError(f"duplicate value ({shown}) violates unique index {index.name}")
+
+    def set_meta(self, name, value):
+        """Store a number in the catalog (the transaction id limit, the unsettled flag, the commit log)."""
+        if self.meta.get(name) == value:
+            return
+        self.meta[name] = value
+        self.tree.insert(encode(("", name)), encode(("meta", name, "", value)), replace=True)
+
+    def save_commit_log(self, committed):
+        """Keep exactly these committed transaction ids in the stored commit log."""
+        stored = set(self.clog)
+        for xid in committed - stored:
+            self.tree.insert(encode(("", "clog", xid)), encode(("clog", "", "", xid)))
+        for xid in stored - committed:
+            self.tree.delete(encode(("", "clog", xid)))
+        self.clog = set(committed)
 
 
 def _table_from_ast(stmt, root, sql):
