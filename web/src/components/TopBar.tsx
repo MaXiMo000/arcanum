@@ -1,7 +1,7 @@
 import type { SessionName, SessionTxn } from "../api";
 import type { Connection, Speed } from "../feed";
 
-export type View = "2d" | "3d";
+export type View = "2d" | "3d" | "lab";
 export type Mode = "learn" | "play";
 
 interface Props {
@@ -100,6 +100,7 @@ export function TopBar(p: Props) {
         options={[
           { value: "2d", label: "Map", hint: "The engine map: tree, buffer pool and disk" },
           { value: "3d", label: "3D", hint: "The tree in 3D" },
+          { value: "lab", label: "LSM", hint: "B+tree versus LSM tree on the same workload" },
         ]}
       />
       <Segmented<Speed>

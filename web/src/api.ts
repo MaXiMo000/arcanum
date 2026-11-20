@@ -239,6 +239,61 @@ export interface SessionInfo {
   limits: Limits;
 }
 
+/** One engine's measurements in the B+tree versus LSM tree comparison. */
+export interface EngineResult {
+  write_amp: number;
+  log_bytes: number;
+  data_bytes: number;
+  syncs: number;
+  write_ms: number;
+  space_amp: number;
+  disk_bytes: number;
+  lookup_reads: number;
+  scan_reads: number;
+  ms: number;
+}
+
+export interface LsmFile {
+  number: number;
+  bytes: number;
+  entries: number;
+  first: number;
+  last: number;
+}
+
+export interface LsmShape {
+  memtable: { entries: number; bytes: number; limit: number };
+  levels: LsmFile[][];
+  capacity: (number | null)[];
+  written: number;
+}
+
+export interface LsmMoment extends LsmShape {
+  op: number;
+  kind: "flush" | "compaction" | "move";
+  detail: { table?: number; bytes?: number; from?: number; to?: number; inputs?: number[]; overlapping?: number[];
+    outputs?: number[]; bytes_in?: number; bytes_out?: number };
+}
+
+export interface LabParams {
+  keys: number;
+  order: "sequential" | "random";
+  updates: number;
+  value_bytes: number;
+  memory_pages: number;
+}
+
+export interface LabResult {
+  workload: LabParams & { operations: number; logical_bytes: number; live_bytes: number; lookups: number; scans: number; batch: number };
+  btree: EngineResult & { height: number; pages: number; checkpoints: number };
+  lsm: EngineResult & { flushes: number; compactions: number; moves: number; bloom_skips: number; filter_memory: number; levels: number };
+  /** [operations done, B+tree bytes written, LSM bytes written] */
+  series: [number, number, number][];
+  shapes: LsmMoment[];
+  final: LsmShape;
+  key_space: number;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -286,6 +341,7 @@ export const api = {
   cancel: (id: string, ticket: string) =>
     call<QueryReply>("POST", `${sessionPath(id)}/tickets/${encodeURIComponent(ticket)}/cancel`),
   state: (id: string) => call<EngineState>("GET", `${sessionPath(id)}/state`),
+  lab: (id: string, params: LabParams) => call<LabResult>("POST", `${sessionPath(id)}/lab`, params),
   crash: (id: string, duringWrite: boolean) =>
     call<CrashSummary>("POST", `${sessionPath(id)}/crash`, { during_write: duringWrite }),
   eventsUrl: (id: string) => {

@@ -27,6 +27,7 @@ from ..errors import (
     SqlError,
 )
 from ..events import EventBus
+from ..lab import compare
 from ..sql.parser import parse_statements
 from ..storage import PAGE_SIZE, decode
 
@@ -193,6 +194,7 @@ def worker_main(path, conn, event_conn, options):
         "cancel": lambda m: jobs.cancel(m["ticket"]),
         "state": lambda m: _state(db, m, jobs),
         "workload": lambda m: _workload(db, m, conn, pump),
+        "lab": lambda m: {"ok": True, **compare(**m["params"])},
     }
     while True:
         try:

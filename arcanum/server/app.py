@@ -5,6 +5,7 @@
     POST   /sessions/{id}/query      run SQL; returns rows plus the traced query plan
     GET    /sessions/{id}/state      B+trees, buffer pool and log, for drawing the database
     POST   /sessions/{id}/crash      kill the engine (optionally mid-write) and recover
+    POST   /sessions/{id}/lab        the same workload on a B+tree and an LSM tree, compared
     WS     /sessions/{id}/events     live engine events: page reads, splits, log writes, recovery
     GET    /health
 
@@ -33,7 +34,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .sessions import SessionError, SessionManager, Subscriber
 
@@ -76,6 +77,8 @@ class Settings:
     rate_burst: int = 40
     sessions_per_minute: int = 4  # new sessions per client
     crashes_per_minute: int = 6  # crash demos per client
+    labs_per_minute: int = 6  # engine comparisons per client
+    lab_timeout: float = 60  # seconds an engine comparison may run
     max_websockets: int = 200
     max_websockets_per_client: int = 4
     max_websockets_per_session: int = 4
@@ -89,8 +92,9 @@ class Settings:
         int_fields = ["max_sessions", "max_sessions_per_client", "max_concurrent_queries", "max_pages", "max_rows",
                       "max_sql_bytes", "memory_rows", "sort_memory_rows", "spill_bytes", "recursive_rows",
                       "worker_memory_mb", "max_keys", "pool_size", "event_limit", "rate_burst", "sessions_per_minute",
-                      "crashes_per_minute", "max_websockets", "max_websockets_per_client", "max_websockets_per_session"]
-        float_fields = ["session_ttl", "query_timeout", "lock_timeout", "queue_timeout", "rate_per_second"]
+                      "crashes_per_minute", "labs_per_minute", "max_websockets", "max_websockets_per_client", "max_websockets_per_session"]
+        float_fields = ["session_ttl", "query_timeout", "lock_timeout", "queue_timeout", "rate_per_second",
+                        "lab_timeout"]
         values = {name: _env(f"ARCANUM_{name.upper()}", getattr(d, name), int) for name in int_fields}
         values |= {name: _env(f"ARCANUM_{name.upper()}", getattr(d, name), float) for name in float_fields}
         origins = _env("ARCANUM_ALLOWED_ORIGINS", ",".join(d.allowed_origins))
@@ -129,6 +133,14 @@ class QueryRequest(BaseModel):
 
 class CrashRequest(BaseModel):
     during_write: bool = True
+
+
+class LabRequest(BaseModel):
+    keys: int = Field(5000, ge=500, le=10_000)
+    order: Literal["sequential", "random"] = "random"
+    updates: float = Field(0.5, ge=0, le=1)  # extra writes that overwrite existing keys, per key
+    value_bytes: int = Field(64, ge=16, le=256)
+    memory_pages: int = Field(16, ge=8, le=64)
 
 
 TICKET = re.compile(r"^t[0-9]{1,9}$")
@@ -298,6 +310,17 @@ def create_app(settings=None):
         if not limiter.allow(_client(request), "crash", settings.crashes_per_minute / 60, burst):
             return _error(429, "RateLimited", "the crash demo is limited; wait a few seconds", {"Retry-After": "10"})
         return await session.crash(body.during_write if body is not None else True)
+
+    @app.post("/sessions/{session_id}/lab")
+    async def lab(session_id: str, request: Request, body: LabRequest | None = None):
+        session = manager.get(session_id)
+        if not limiter.allow(_client(request), "lab", settings.labs_per_minute / 60, max(1, settings.labs_per_minute // 2)):
+            return _error(429, "RateLimited", "engine comparisons are limited; wait a few seconds", {"Retry-After": "10"})
+        reply = await session.request({"op": "lab", "params": (body or LabRequest()).model_dump()},
+                                      timeout=settings.lab_timeout)
+        if not reply.pop("ok"):
+            return JSONResponse({"error": reply["error"]}, status_code=400)
+        return reply
 
     @app.websocket("/sessions/{session_id}/events")
     async def events(websocket: WebSocket, session_id: str):

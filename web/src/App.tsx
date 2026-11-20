@@ -17,6 +17,7 @@ import type { RunError } from "./components/Results";
 import { StoryBar } from "./components/StoryBar";
 import { Timeline, replayMarker } from "./components/Timeline";
 import { Toasts, type Toast } from "./components/Toasts";
+import { EngineLab } from "./components/EngineLab";
 import { TopBar, type Mode, type View } from "./components/TopBar";
 import { EngineMap, type MapFocus } from "./components/EngineMap";
 import { EXAMPLES } from "./examples";
@@ -108,7 +109,10 @@ export default function App() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [introOpen, setIntroOpen] = useState(() => readStorage(local, INTRO_KEY) === null);
   const [mode, setMode] = useState<Mode>(() => (readStorage(local, MODE_KEY) === "play" ? "play" : "learn"));
-  const [view, setView] = useState<View>(() => (readStorage(local, VIEW_KEY) === "3d" ? "3d" : "2d"));
+  const [view, setView] = useState<View>(() => {
+    const saved = readStorage(local, VIEW_KEY);
+    return saved === "3d" || saved === "lab" ? saved : "2d";
+  });
   const [mapFocus, setMapFocus] = useState<MapFocus>(null);
   const [theme, setTheme] = useState<"light" | "dark">(() => (readStorage(local, THEME_KEY) === "light" ? "light" : "dark"));
   const { progress, markStep, unlock, open } = useProgress();
@@ -511,7 +515,9 @@ export default function App() {
   }
 
   const stage =
-    state && view === "3d" ? (
+    view === "lab" ? (
+      <EngineLab sessionId={sessionId} />
+    ) : state && view === "3d" ? (
       <Suspense fallback={<div className="stage-loading">Loading the 3D view…</div>}>
         <Vault
           trees={state.trees}

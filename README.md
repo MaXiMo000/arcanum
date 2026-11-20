@@ -65,6 +65,8 @@ with Database("company.db") as db:
 | Executor: iterator-model operators, hash join, hash aggregate, window functions, recursive CTEs | done |
 | Atomic statements, `BEGIN` / `COMMIT` / `ROLLBACK`, `EXPLAIN [ANALYZE]` | done |
 | MVCC: row versions, snapshots, `READ COMMITTED` / `REPEATABLE READ`, concurrent sessions | done |
+| Lock waits, deadlock detection, `SERIALIZABLE` (serializable snapshot isolation) | done |
+| LSM tree (memtable, SSTables, Bloom filters, leveled compaction) compared with the B+tree | done |
 | Write-ahead log, checkpoints and crash recovery | done |
 | Cost-based optimizer: index scans, statistics, join ordering, subquery decorrelation | done |
 | Index-only scans | done |
@@ -241,6 +243,30 @@ b.execute("SELECT balance FROM account").rows  # [(0,)]
   reopened with unsettled rows is vacuumed, discarding whatever unfinished transactions left behind.
 - A schema change inside a transaction holds off other sessions until that transaction ends.
 
+## B+tree versus LSM tree
+
+The **LSM** view runs one workload on two storage engines and counts every byte each one reads,
+writes and syncs. One engine is Arcanum's own B+tree (pager, write-ahead log and checkpoints). The other
+is an LSM tree, the design behind RocksDB, LevelDB and Cassandra:
+
+- Writes go to a log and an in-memory memtable. A full memtable is written out as a sorted, immutable
+  SSTable in level 0.
+- Leveled compaction merges files into the next level, each level ten times larger. A file with nothing
+  to merge with moves down without being rewritten.
+- Each SSTable has a block index and a Bloom filter, so most lookups skip files without reading them.
+
+Both engines run on a counting in-memory file system with the same memory budget: the B+tree's buffer
+pool against the LSM tree's memtable and an equal block cache. The comparison reports the three
+amplifications:
+
+- write: bytes written per byte of data
+- read: blocks read per lookup and per range scan
+- space: bytes stored per byte of live data
+
+It also charts bytes written over the workload and replays every flush, compaction and move on a
+picture of the levels. With random keys the B+tree logs a whole page for almost every write, so the LSM
+tree writes an order of magnitude less, while lookups cost about the same.
+
 ## Durability and crash recovery
 
 Arcanum keeps a write-ahead log next to the database file (`<name>-wal`):
@@ -272,7 +298,9 @@ Two modes share one screen: the database in the middle, an inspector on the righ
   the same database, like two psql terminals, and watch transactions see (or not see) each other.
 - **Row versions** on the map: every row that currently holds versions, each version's `xmin` and `xmax`
   coloured by whether that transaction is open, committed or rolled back, and which session sees which
-  version.
+  version. While a session waits for a lock, a lock graph shows who waits for whom; under
+  `SERIALIZABLE`, the read/write dependencies between transactions appear as they form.
+- **LSM**: the B+tree versus LSM tree comparison (see above), with a scrubber over the LSM tree's levels.
 
 The inspector explains every statement:
 
@@ -364,6 +392,7 @@ python -m arcanum.server
 | `POST /sessions/{id}/query` | Run SQL (`{"sql": "...", "session": "A"}`; several statements allowed; `session` is `A` or `B`, two connections to the same database). Each result has `columns`, `rows`, `status` and the executed `plan` as a tree with estimated and actual rows per operator. |
 | `GET /sessions/{id}/tickets/{ticket}` | A statement waiting for another session's lock. `query` answers `202` with `waiting` (its `ticket`, the transaction it waits for and what it needs) when a statement has to wait; fetch the ticket until it returns the results. |
 | `POST /sessions/{id}/tickets/{ticket}/cancel` | Cancel a waiting statement. |
+| `POST /sessions/{id}/lab` | Run one workload (`keys`, `order`, `updates`, `value_bytes`, `memory_pages`) on a B+tree and an LSM tree; returns both engines' amplifications, the bytes-written curves and the LSM tree's shape after every flush and compaction. |
 | `GET /sessions/{id}/state` | Every B+tree (nodes, keys, children), the buffer pool (cached and dirty pages) and the log, for drawing the database. |
 | `POST /sessions/{id}/crash` | Pull the plug: kill the engine process, by default in the middle of a stream of write transactions, then restart it. The reply compares the rows acknowledged before the crash with the rows after recovery. |
 | `WS /sessions/{id}/events` | Live engine events in batches: `page_read`, `page_write`, `cache_evict`, `node_visit`, `node_split`, `node_merge`, `root_grow`, `wal_append`, `commit`, `checkpoint`, `sort_spill`, `crash`, `recovery`, `recovered`. |
@@ -473,6 +502,7 @@ arcanum/
     files.py       file access (swappable for crash tests)
     codec.py       order-preserving encoding of value tuples
     btree.py       B+tree
+    lsm.py         LSM tree: memtable, SSTables, Bloom filters, leveled compaction
   sql/
     lexer.py       tokenizer
     parser.py      recursive-descent parser
@@ -487,6 +517,9 @@ arcanum/
     advisor.py     findings and fixes from a finished plan
     doctor.py      diagnoses and corrections for failed statements
     executor.py    iterator-model operators, external sort
+    mvcc.py        row versions, snapshots and visibility
+    ssi.py         serializable snapshot isolation (SERIALIZABLE)
+  lab.py           the B+tree versus LSM tree comparison
   server/
     app.py         FastAPI routes and WebSocket
     sessions.py    session and worker-process management, crash demo
@@ -509,8 +542,6 @@ tests/
 
 Arcanum aims to be the clearest way to see how a database works from the inside. Next:
 
-- **An LSM-tree engine beside the B+tree**: memtable, flushes and compaction, with the same workload
-  replayed on both to compare write and read amplification.
 - **Replication**: a Raft-replicated log across three engines, with leader election, network partitions
   and catch-up you can trigger.
 - **Buffer pool policies**: LRU, Clock and 2Q on the same workload, with their hit rates over time.

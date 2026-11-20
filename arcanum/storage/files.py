@@ -6,6 +6,7 @@ a file system that simulates power loss (see tests/crashfs.py).
 
 import contextlib
 import os
+from collections import Counter
 
 
 class OsFile:
@@ -43,3 +44,55 @@ class OsFileSystem:
     def remove(self, path):
         with contextlib.suppress(FileNotFoundError):
             os.remove(path)
+
+
+class MemFile:
+    def __init__(self, fs, path):
+        self.fs, self.path = fs, path
+        self.data = fs.files.setdefault(path, bytearray())
+
+    def size(self):
+        return len(self.data)
+
+    def read(self, offset, size):
+        self.fs.count(self.path, "read", size)
+        return bytes(self.data[offset:offset + size])
+
+    def write(self, offset, data):
+        self.fs.count(self.path, "write", len(data))
+        if offset > len(self.data):
+            self.data.extend(bytes(offset - len(self.data)))
+        self.data[offset:offset + len(data)] = data
+
+    def truncate(self, size):
+        del self.data[size:]
+
+    def sync(self):
+        self.fs.count(self.path, "sync", 0)
+
+    def close(self):
+        pass
+
+
+class CountingMemFileSystem:
+    """Files in memory that count every read, write and sync, to compare how much I/O storage engines do
+    on the same workload. Counts are kept per kind of file: "log" (write-ahead logs) and "data"."""
+
+    def __init__(self):
+        self.files = {}  # path -> bytearray
+        self.io = Counter()
+
+    def open(self, path):
+        return MemFile(self, path)
+
+    def remove(self, path):
+        self.files.pop(path, None)
+
+    def count(self, path, op, size):
+        kind = "log" if path.endswith("wal") else "data"
+        self.io[f"{op}s"] += 1
+        self.io[f"{op}_bytes"] += size
+        self.io[f"{kind}_{op}_bytes"] += size
+
+    def size(self):
+        return sum(len(data) for data in self.files.values())

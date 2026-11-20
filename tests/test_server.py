@@ -423,3 +423,15 @@ def test_two_sessions_see_each_other_only_after_commit(client):
     assert run("SELECT city FROM customers WHERE id = 1", "B").json()["results"][0]["rows"] == [["Rome"]]
     assert client.get(f"/sessions/{session}/state").json()["versions"] == []  # settled again
     assert client.post(f"/sessions/{session}/query", json={"sql": "SELECT 1", "session": "C"}).status_code == 422
+
+
+def test_lab_compares_a_btree_and_an_lsm_tree_on_one_workload(client):
+    session = new_session(client)
+    reply = client.post(f"/sessions/{session}/lab", json={"keys": 1500, "order": "random", "updates": 0.5})
+    assert reply.status_code == 200
+    lab = reply.json()
+    assert lab["workload"]["operations"] == 2250
+    # The classic trade-off: the LSM tree writes far less for random writes.
+    assert lab["lsm"]["write_amp"] < lab["btree"]["write_amp"]
+    assert lab["lsm"]["flushes"] > 0 and lab["shapes"]
+    assert client.post(f"/sessions/{session}/lab", json={"keys": 10**6}).status_code == 422
