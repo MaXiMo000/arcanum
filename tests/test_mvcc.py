@@ -9,7 +9,7 @@ import random
 import pytest
 from crashfs import CrashFS
 
-from arcanum import ConstraintError, Database
+from arcanum import ConstraintError, Database, SqlError
 from arcanum.errors import LockWaitError, SerializationError
 
 
@@ -224,4 +224,48 @@ def test_other_levels_are_not_tracked(db):
     a.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
     value(a, "SELECT sum(balance) FROM account")
     assert db.ssi.sx == {}
+    a.execute("COMMIT")
+
+
+# ---- savepoints (subtransactions) ----------------------------------------------------------
+
+
+def test_savepoints_undo_part_of_a_transaction(db):
+    a, b = db.connect("a"), db.connect("b")
+    a.execute("BEGIN")
+    a.execute("UPDATE account SET balance = 1 WHERE id = 1")
+    a.execute("SAVEPOINT s1")
+    a.execute("UPDATE account SET balance = 2 WHERE id = 1")
+    a.execute("DELETE FROM account WHERE id = 2")
+    a.execute("INSERT INTO account VALUES (50, 'fifty', 5)")
+    a.execute("SAVEPOINT s2")
+    a.execute("UPDATE account SET balance = 3 WHERE id = 3")
+    a.execute("RELEASE SAVEPOINT s2")  # s2's change now belongs to s1
+    assert value(a, "SELECT balance FROM account WHERE id = 1") == 2
+    a.execute("ROLLBACK TO SAVEPOINT s1")
+    assert a.execute("SELECT id, balance FROM account WHERE id IN (1, 2, 3, 50) ORDER BY id").rows == [
+        (1, 1), (2, 200), (3, 300)]
+    with pytest.raises(LockWaitError):  # row 1 is still locked by the outer transaction
+        b.execute("UPDATE account SET balance = 9 WHERE id = 1")
+    b.execute("UPDATE account SET balance = 9 WHERE id = 2")  # row 2 was released by the rollback
+    a.execute("UPDATE account SET balance = 4 WHERE id = 3")  # the savepoint is still there, with a new id
+    a.execute("ROLLBACK TO s1")
+    a.execute("COMMIT")
+    assert db.execute("SELECT id, balance FROM account WHERE id <= 3 ORDER BY id").rows == [(1, 1), (2, 9), (3, 300)]
+    assert db.execute("SELECT count(*) FROM account WHERE id = 50").rows == [(0,)]
+
+
+def test_savepoint_errors_and_repeatable_read(db):
+    a = db.connect("a")
+    with pytest.raises(SqlError, match="transaction block"):
+        a.execute("SAVEPOINT x")
+    a.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    assert value(a, "SELECT balance FROM account WHERE id = 4") == 400
+    a.execute("SAVEPOINT x")
+    a.execute("UPDATE account SET balance = 0 WHERE id = 4")
+    assert value(a, "SELECT balance FROM account WHERE id = 4") == 0  # its own savepoint's write
+    with pytest.raises(SqlError, match="savepoint nope does not exist"):
+        a.execute("ROLLBACK TO nope")
+    a.execute("ROLLBACK TO x")
+    assert value(a, "SELECT balance FROM account WHERE id = 4") == 400
     a.execute("COMMIT")

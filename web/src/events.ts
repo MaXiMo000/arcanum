@@ -35,6 +35,15 @@ export function describeEvent(e: EngineEvent): { text: string; tone: Tone } {
       return { text: `session ${e.session} got its lock after ${num(e.waited_ms)} ms and goes on`, tone: "ok" };
     case "deadlock":
       return { text: `deadlock detected: session ${e.session}'s transaction ${num(e.victim)} rolled back`, tone: "danger" };
+    case "savepoint":
+      return { text: `session ${e.session}: savepoint ${e.name} starts subtransaction ${num(e.xid)}`, tone: "log" };
+    case "release":
+      return { text: `session ${e.session}: savepoint ${e.name} released, its changes join the transaction`, tone: "log" };
+    case "rollback_to":
+      return {
+        text: `session ${e.session}: rolled back to savepoint ${e.name}, aborting transaction ids ${(e.aborted as number[]).join(", ")}`,
+        tone: "danger",
+      };
     case "constraint":
       return {
         text:

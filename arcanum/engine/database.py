@@ -1,7 +1,7 @@
 """The public entry point: open a database file and run SQL against it."""
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..errors import ArcanumError, LockWaitError, SqlError
 from ..sql import nodes as n
@@ -10,6 +10,7 @@ from ..storage import Pager
 from .advisor import advise
 from .binder import Binder
 from .catalog import Catalog
+from .ddl import Alter
 from .dml import Writer
 from .executor import Context, QueryLimits, index_scan_pairs, run
 from .expr import conjuncts
@@ -18,8 +19,8 @@ from .optimizer import Optimizer, mark_index_only
 from .plan import IndexScan, TableScan, explain, plan_tree
 from .ssi import SERIALIZABLE, SSI
 
-_WRITES = (n.Insert, n.Update, n.Delete, n.CreateTable, n.DropTable, n.CreateIndex, n.DropIndex, n.Analyze)
-_DDL = (n.CreateTable, n.DropTable, n.CreateIndex, n.DropIndex)
+_DDL = (n.CreateTable, n.DropTable, n.CreateIndex, n.DropIndex, n.CreateView, n.DropView, n.AlterTable)
+_WRITES = (n.Insert, n.Update, n.Delete, n.Analyze, *_DDL)
 
 
 @dataclass
@@ -146,6 +147,8 @@ class Database:
             commit = isinstance(statement, n.Commit)
             self._end(conn, conn.txn, commit)
             return Result(status="COMMIT" if commit else "ROLLBACK")
+        if isinstance(statement, (n.Savepoint, n.RollbackTo, n.Release)):
+            return self._savepoint(conn, statement)
 
         if isinstance(statement, _DDL):
             others = [c for c in self.connections.values() if c is not conn and c.txn is not None]
@@ -157,6 +160,7 @@ class Database:
                 # No other session may run meanwhile, so the restore cannot touch anyone else's work.
                 self.pager.savepoint()
                 conn.ddl = True
+                conn.ddl_at = len(conn.savepoints)  # savepoints older than this cannot undo the schema change
                 self.exclusive = conn
         txn, autocommit = conn.txn, False
         if txn is None and isinstance(statement, _WRITES):
@@ -178,10 +182,50 @@ class Database:
             self._end(conn, txn, commit=True)
         return result
 
-    def _begin(self, conn, isolation):
+    def _reserve_xid(self):
         if self.mvcc.next_xid >= self.catalog.meta.get("xid_limit", 0):
             # Reserve the next batch of ids on disk first, so none is handed out twice after a crash.
             self.catalog.set_meta("xid_limit", self.mvcc.next_xid + XID_BATCH)
+
+    def _savepoint(self, conn, statement):
+        """SAVEPOINT, ROLLBACK TO SAVEPOINT and RELEASE SAVEPOINT, as subtransactions (see mvcc.py)."""
+        txn, name = conn.txn, statement.name
+        if txn is None:
+            raise SqlError(f"{type(statement).__name__.upper()} can only be used in a transaction block")
+        if isinstance(statement, n.Savepoint):
+            self._reserve_xid()
+            xid = self.mvcc.subtransaction(txn)
+            self.ssi.savepoint(txn, xid)
+            conn.savepoints.append({"name": name, "xid": xid, "xids": [xid]})
+            self.events.emit("savepoint", session=conn.name, name=name, xid=xid)
+            return Result(status="SAVEPOINT")
+        index = next((i for i in range(len(conn.savepoints) - 1, -1, -1) if conn.savepoints[i]["name"] == name), None)
+        if index is None:
+            raise SqlError(f"savepoint {name} does not exist")
+        if isinstance(statement, n.Release):
+            # Its ids (and those of the savepoints inside it) now belong to the enclosing one.
+            released = [x for sp in conn.savepoints[index:] for x in sp["xids"]]
+            del conn.savepoints[index:]
+            if conn.savepoints:
+                conn.savepoints[-1]["xids"] += released
+            txn.current = conn.savepoints[-1]["xid"] if conn.savepoints else txn.xid
+            self.events.emit("release", session=conn.name, name=name)
+            return Result(status="RELEASE")
+        if conn.ddl and index < conn.ddl_at:
+            raise SqlError(f"Arcanum can't roll back a schema change to savepoint {name} yet; roll back the "
+                           "whole transaction")
+        aborted = [x for sp in conn.savepoints[index:] for x in sp["xids"]]
+        self.mvcc.abort(txn, aborted)
+        del conn.savepoints[index + 1:]
+        self._reserve_xid()
+        xid = self.mvcc.subtransaction(txn)  # the savepoint stays, with a fresh id, as in PostgreSQL
+        self.ssi.savepoint(txn, xid)
+        conn.savepoints[index] = {"name": name, "xid": xid, "xids": [xid]}
+        self.events.emit("rollback_to", session=conn.name, name=name, aborted=aborted)
+        return Result(status="ROLLBACK")
+
+    def _begin(self, conn, isolation):
+        self._reserve_xid()
         txn = self.mvcc.begin(conn.name, isolation)
         self.ssi.begin(txn)
         return txn
@@ -191,9 +235,10 @@ class Database:
             return self.mvcc.snapshot()
         if txn.isolation in (REPEATABLE_READ, SERIALIZABLE):
             if txn.snapshot is None:
-                txn.snapshot = self.mvcc.snapshot(txn.xid)
-            return txn.snapshot
-        return self.mvcc.snapshot(txn.xid)
+                txn.snapshot = self.mvcc.snapshot(txn)
+            # The same snapshot all transaction long, seeing its own savepoints' writes too.
+            return replace(txn.snapshot, own=frozenset(txn.own))
+        return self.mvcc.snapshot(txn)
 
     def _end(self, conn, txn, commit):
         """Commit or roll back txn, then settle every row whose versions nobody needs any more."""
@@ -209,6 +254,7 @@ class Database:
         self.ssi.end(txn, commit)
         if conn.txn is txn:
             conn.txn = None
+            conn.savepoints = []
         # The commit itself: versions the transaction made are frozen where no snapshot needs them, and
         # the commit log keeps its id only while some version still mentions it.
         mentioned = self.catalog.prune(self.mvcc.horizon())
@@ -269,11 +315,25 @@ class Database:
                 return Result(status="CREATE INDEX")
             self.catalog.create_index(statement, text)
             return Result(status="CREATE INDEX")
+        if isinstance(statement, n.CreateView):
+            return self._create_view(binder, statement, text)
+        if isinstance(statement, n.AlterTable):
+            Alter(self, Writer(self, binder)).run(statement)
+            return Result(status="ALTER TABLE")
+        if isinstance(statement, n.DropView):
+            if statement.name not in self.catalog.views:
+                if statement.if_exists:
+                    return Result(status="DROP VIEW")
+                raise SqlError(f"view {statement.name} does not exist")
+            self._check_no_views(statement.name, "view")
+            self.catalog.drop_view(statement.name)
+            return Result(status="DROP VIEW")
         if isinstance(statement, n.DropTable):
             if statement.name not in self.catalog.tables:
                 if statement.if_exists:
                     return Result(status="DROP TABLE")
                 raise SqlError(f"table {statement.name} does not exist")
+            self._check_no_views(statement.name, "table")
             for child, fk in self.catalog.referencing(statement.name):
                 if child.name != statement.name:
                     raise SqlError(f"cannot drop table {statement.name} because foreign key {fk.name} on table "
@@ -296,6 +356,25 @@ class Database:
                 self.catalog.analyze(table, self._snapshot)
             return Result(status="ANALYZE")
         raise SqlError(f"Arcanum doesn't support {type(statement).__name__} yet")
+
+    def _create_view(self, binder, statement, text):
+        name = statement.name
+        if name in self.catalog.views and statement.or_replace:
+            self.catalog.drop_view(name)
+        self.catalog._check_name_free(name)
+        plan = binder.bind_query(statement.query)  # a view that does not bind is refused now, not when used
+        if statement.columns and len(statement.columns) > len(plan.columns):
+            raise SqlError(f"view {name} names {len(statement.columns)} columns but its query has {len(plan.columns)}")
+        names = (statement.columns or []) + [c.name for c in plan.columns[len(statement.columns or []):]]
+        if len(set(names)) != len(names):
+            raise SqlError(f"view {name} has two columns with the same name; give them aliases")
+        self.catalog.create_view(name, text)
+        return Result(status="CREATE VIEW")
+
+    def _check_no_views(self, name, kind):
+        dependents = self.catalog.dependent_views(name)
+        if dependents:
+            raise SqlError(f"cannot drop {kind} {name} because view {dependents[0]} depends on it; drop the view first")
 
     def _traced(self, result, statement, text, plan=None, stats=None, decisions=None):
         """Attach the plan tree (with actual rows and time, if measured), the planner's decisions and the advisor's hints."""
@@ -352,6 +431,8 @@ class Connection:
         self.name = name
         self.txn = None  # the open transaction (from BEGIN), if any
         self.ddl = False  # whether that transaction changed the schema (and so holds a page savepoint)
+        self.ddl_at = 0  # how many savepoints existed when it first did
+        self.savepoints = []  # [{"name", "xid": the id it writes with, "xids": every id it owns}], oldest first
 
     @property
     def in_transaction(self):

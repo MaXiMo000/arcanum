@@ -9,6 +9,12 @@ A snapshot fixes which transactions a statement can see: every transaction
 that committed before the snapshot was taken, and its own. xid 0 is the frozen
 transaction: a version whose creator is visible to every possible snapshot is
 frozen, and then needs no commit-log lookup at all.
+
+Savepoints are subtransactions, as in PostgreSQL: each SAVEPOINT takes a new
+transaction id, the transaction writes with its newest one, and every id it
+owns counts as its own. ROLLBACK TO aborts the savepoint's ids, so the versions
+they created disappear and the rows they deleted come back, for everyone,
+without touching a page.
 """
 
 from dataclasses import dataclass, field
@@ -23,11 +29,13 @@ XID_BATCH = 1000  # transaction ids reserved on disk at a time, so they are neve
 class Snapshot:
     """What a statement sees. xmin: every transaction below it had finished. xmax: the first transaction
     id not yet handed out. active: transactions still running when it was taken. own: the reader's own
-    transaction (None for a read-only statement outside a transaction)."""
+    transaction ids, its savepoints' included (empty for a read-only statement outside a transaction).
+    top: the reader's transaction id."""
     xmin: int
     xmax: int
     active: frozenset
-    own: int | None = None
+    own: frozenset = frozenset()
+    top: int | None = None
 
 
 @dataclass(eq=False)
@@ -37,6 +45,12 @@ class Transaction:
     owner: str  # the session (connection) running it
     snapshot: Snapshot | None = None  # REPEATABLE READ: the one taken by the first statement
     touched: dict = field(default_factory=dict)  # table name -> keys of the chains it changed
+    own: set = field(default_factory=set)  # its id and its savepoints' ids that were not rolled back
+    current: int = 0  # the id new versions are stamped with: the innermost savepoint's, or xid
+
+    def __post_init__(self):
+        self.own.add(self.xid)
+        self.current = self.current or self.xid
 
 
 class TransactionManager:
@@ -59,10 +73,26 @@ class TransactionManager:
         self.running[xid] = txn
         return txn
 
+    def subtransaction(self, txn):
+        """Start a savepoint of txn: a new id it writes with from now on."""
+        xid = self.next_xid
+        self.next_xid += 1
+        self.running[xid] = txn
+        txn.own.add(xid)
+        txn.current = xid
+        return xid
+
+    def abort(self, txn, xids):
+        """Roll back savepoint ids of txn: what they wrote is invisible from now on."""
+        for xid in xids:
+            self.running.pop(xid, None)
+            txn.own.discard(xid)
+
     def end(self, txn, committed):
-        self.running.pop(txn.xid, None)
+        for xid in txn.own:
+            self.running.pop(xid, None)
         if committed:
-            self.committed.add(txn.xid)
+            self.committed.update(txn.own)
 
     def status(self, xid):
         """"committed", "running" or "aborted"."""
@@ -70,9 +100,11 @@ class TransactionManager:
             return "committed"
         return "running" if xid in self.running else "aborted"
 
-    def snapshot(self, own=None):
-        active = frozenset(x for x in self.running if x != own)
-        return Snapshot(min(active, default=self.next_xid), self.next_xid, active, own)
+    def snapshot(self, txn=None):
+        own = frozenset(txn.own) if txn is not None else frozenset()
+        active = frozenset(x for x in self.running if x not in own)
+        return Snapshot(min(active, default=self.next_xid), self.next_xid, active, own,
+                        txn.xid if txn is not None else None)
 
     def horizon(self, exclude=None):
         """Every committed transaction below this is visible to every snapshot still in use (other than
@@ -84,7 +116,7 @@ class TransactionManager:
 
     def sees(self, snap, xid):
         """Whether the effects of transaction xid are visible to snapshot snap."""
-        if xid in (FROZEN, snap.own):
+        if xid == FROZEN or xid in snap.own:
             return True
         return xid < snap.xmax and xid not in snap.active and self.status(xid) == "committed"
 

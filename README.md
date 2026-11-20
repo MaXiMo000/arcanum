@@ -79,8 +79,14 @@ with Database("company.db") as db:
 - `CREATE TABLE` with `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `FOREIGN KEY` /
   `REFERENCES` (`ON DELETE NO ACTION | RESTRICT | CASCADE | SET NULL`), named `CONSTRAINT`s, `SERIAL`
   types and `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`; `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`
+- `ALTER TABLE`:
+  - `ADD` / `DROP COLUMN`, `RENAME [COLUMN]` and `RENAME TO`.
+  - `ALTER COLUMN ... SET` / `DROP DEFAULT`, `SET` / `DROP NOT NULL` and `TYPE`.
+  - `ADD` / `DROP CONSTRAINT` (`CHECK`, `FOREIGN KEY`, `UNIQUE`).
+- `CREATE [OR REPLACE] VIEW` and `DROP VIEW`. Views are read-only and are expanded where they are used.
 - `INSERT ... VALUES` / `INSERT ... SELECT` with `ON CONFLICT [(columns)] DO NOTHING | DO UPDATE SET ...
-  [WHERE ...]` (the proposed row as `EXCLUDED`), `UPDATE`, `DELETE`; all three with `RETURNING`
+  [WHERE ...]` (the proposed row as `EXCLUDED`), `UPDATE [... FROM]`, `DELETE [... USING]`; all three with
+  `RETURNING`
 - `SELECT` with `DISTINCT`, `DISTINCT ON`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... NULLS FIRST|LAST`, `LIMIT` and `OFFSET`
 - `INNER`, `LEFT`, `RIGHT`, `FULL` and `CROSS` joins, with `ON` or `USING`
 - Scalar, `IN`, `EXISTS`, correlated and `FROM` subqueries
@@ -103,6 +109,7 @@ with Database("company.db") as db:
   `pi` and `random`.
 - Other: `coalesce`, `ifnull`, `nullif`, `greatest` and `least`; `CASE`, `CAST`, `BETWEEN`, `IN`,
   `IS [NOT] NULL` and `||`.
+- `SAVEPOINT`, `ROLLBACK TO SAVEPOINT` and `RELEASE SAVEPOINT`
 - `BEGIN [ISOLATION LEVEL READ COMMITTED | REPEATABLE READ | SERIALIZABLE]`, `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]`,
   `ANALYZE [table]`
 
@@ -123,7 +130,10 @@ with Database("company.db") as db:
   - Foreign keys are checked at the end of each statement, so rows in one `INSERT` may reference each
     other. A key with a `NULL` in it references nothing.
   - A referenced row that another open transaction is changing makes the statement wait.
-  - `DROP TABLE` refuses while another table's foreign key references it.
+  - `DROP TABLE` refuses while another table's foreign key references it, or a view uses it.
+  - `ALTER TABLE` rewrites the rows when a column is added, dropped or retyped.
+  - Indexes, `CHECK`s, sequences and other tables' foreign keys follow renames.
+  - A change that would break a view is refused.
   - Sequences are never rolled back by a transaction. A value taken by a statement that fails is
     handed out again.
 
@@ -269,6 +279,11 @@ b.execute("SELECT balance FROM account").rows  # [(0,)]
 - Transaction ids are reserved on disk in batches, so they are never reused after a crash; a database
   reopened with unsettled rows is vacuumed, discarding whatever unfinished transactions left behind.
 - A schema change inside a transaction holds off other sessions until that transaction ends.
+- Savepoints are subtransactions, as in PostgreSQL:
+  - Each `SAVEPOINT` takes a new transaction id, and the transaction writes with its newest one.
+  - `ROLLBACK TO` aborts that id. The versions it created vanish and the rows it locked are released,
+    so a session waiting on one of them goes on.
+  - The row versions on the map show which subtransaction wrote what.
 
 ## B+tree versus LSM tree
 

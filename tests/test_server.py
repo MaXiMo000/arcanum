@@ -435,3 +435,20 @@ def test_lab_compares_a_btree_and_an_lsm_tree_on_one_workload(client):
     assert lab["lsm"]["write_amp"] < lab["btree"]["write_amp"]
     assert lab["lsm"]["flushes"] > 0 and lab["shapes"]
     assert client.post(f"/sessions/{session}/lab", json={"keys": 10**6}).status_code == 422
+
+
+def test_rolling_back_to_a_savepoint_wakes_waiting_statements(client):
+    session = new_session(client)
+
+    def run(text, who):
+        return client.post(f"/sessions/{session}/query", json={"sql": text, "session": who})
+
+    run("BEGIN; UPDATE customers SET city = 'x' WHERE id = 1; SAVEPOINT s; UPDATE customers SET city = 'y' WHERE id = 2", "A")
+    waiting = run("UPDATE customers SET city = 'b' WHERE id = 2", "B").json()["waiting"]
+    state = client.get(f"/sessions/{session}/state").json()
+    assert [sp["name"] for sp in state["sessions"]["A"]["savepoints"]] == ["s"]
+    assert run("ROLLBACK TO s", "A").status_code == 200  # releases row 2, while A keeps row 1
+    assert client.get(f"/sessions/{session}/tickets/{waiting['ticket']}").status_code == 200
+    run("COMMIT", "A")
+    rows = run("SELECT id, city FROM customers WHERE id <= 2 ORDER BY id", "A").json()["results"][0]["rows"]
+    assert rows == [[1, "x"], [2, "b"]]

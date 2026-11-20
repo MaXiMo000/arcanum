@@ -29,7 +29,7 @@ _TYPED_LITERALS = ("DATE", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL", "NUMERIC", "D
 
 _QUERY_START = ("SELECT", "WITH", "VALUES")
 _COMPARISONS = ("=", "!=", "<>", "<", "<=", ">", ">=")
-_UNSUPPORTED_CREATE = ("VIEW", "TRIGGER", "PROCEDURE", "FUNCTION", "SCHEMA", "DATABASE", "SEQUENCE", "TYPE")
+_UNSUPPORTED_CREATE = ("MATERIALIZED", "TRIGGER", "PROCEDURE", "FUNCTION", "SCHEMA", "DATABASE", "SEQUENCE", "TYPE")
 
 
 # Deeper trees would exhaust Python's recursion limit in later stages, so they are refused here.
@@ -206,8 +206,8 @@ class _Parser:
         if self.starts_query() or self.is_op("("):
             return self.query()
         tok = self.tok
-        word = self.accept_kw("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "BEGIN", "COMMIT",
-                              "ROLLBACK", "EXPLAIN", "ANALYZE")
+        word = self.accept_kw("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "BEGIN", "COMMIT",
+                              "ROLLBACK", "EXPLAIN", "ANALYZE", "SAVEPOINT", "RELEASE", "START", "END")
         if word == "INSERT":
             return self.insert()
         if word == "UPDATE":
@@ -218,11 +218,24 @@ class _Parser:
             return self.create()
         if word == "DROP":
             return self.drop()
-        if word in ("BEGIN", "COMMIT", "ROLLBACK"):
-            self.accept_kw("TRANSACTION")
+        if word == "ALTER":
+            return self.alter()
+        if word == "SAVEPOINT":
+            return n.Savepoint(self.ident("a savepoint name"))
+        if word == "RELEASE":
+            self.accept_kw("SAVEPOINT")
+            return n.Release(self.ident("a savepoint name"))
+        if word == "START":
+            self.expect_kw("TRANSACTION")
+            return n.Begin(self.isolation_level())
+        if word in ("BEGIN", "COMMIT", "ROLLBACK", "END"):
+            self.accept_kw("TRANSACTION", "WORK")
             if word == "BEGIN":
                 return n.Begin(self.isolation_level())
-            return {"COMMIT": n.Commit, "ROLLBACK": n.Rollback}[word]()
+            if word == "ROLLBACK" and self.accept_kw("TO"):
+                self.accept_kw("SAVEPOINT")
+                return n.RollbackTo(self.ident("a savepoint name"))
+            return n.Rollback() if word == "ROLLBACK" else n.Commit()
         if word == "EXPLAIN":
             analyze = bool(self.accept_kw("ANALYZE"))
             return n.Explain(self.statement(), analyze)
@@ -265,16 +278,24 @@ class _Parser:
         table = self.ident("a table name")
         self.expect_kw("SET")
         assignments = self.comma_list(self.assignment)
+        from_ = self.from_clause() if self.accept_kw("FROM") else None
         where = self.expr() if self.accept_kw("WHERE") else None
-        return n.Update(table, assignments, where, self.returning())
+        return n.Update(table, assignments, where, self.returning(), from_)
 
     def delete(self):
         self.expect_kw("FROM")
         table = self.ident("a table name")
+        using = self.from_clause() if self.accept_kw("USING") else None
         where = self.expr() if self.accept_kw("WHERE") else None
-        return n.Delete(table, where, self.returning())
+        return n.Delete(table, where, self.returning(), using)
 
     def create(self):
+        if self.accept_kw("OR"):
+            self.expect_kw("REPLACE")
+            self.expect_kw("VIEW")
+            return self.create_view(or_replace=True)
+        if self.accept_kw("VIEW"):
+            return self.create_view()
         unique = bool(self.accept_kw("UNIQUE"))
         if self.accept_kw("INDEX"):
             if_not_exists = self.if_not_exists()
@@ -289,6 +310,12 @@ class _Parser:
         if self.is_kw(*_UNSUPPORTED_CREATE):
             raise self.unsupported(f"CREATE {self.tok.value.upper()}")
         raise self.error(f"expected TABLE or INDEX after CREATE, got {self.describe()}")
+
+    def create_view(self, or_replace=False):
+        name = self.ident("a view name")
+        columns = self.paren_names() if self.is_op("(") else None
+        self.expect_kw("AS")
+        return n.CreateView(name, self.query(), columns, or_replace)
 
     def create_table(self):
         if_not_exists = self.if_not_exists()
@@ -326,6 +353,98 @@ class _Parser:
         if not stmt.columns:
             raise self.error("a table needs at least one column")
         return stmt
+
+    def default_value(self):
+        """A DEFAULT's expression and its text as written."""
+        start = self.tok.pos
+        value = self.unary()
+        return value, self.sql[start:self.tok.pos].strip()
+
+    def alter(self):
+        self.expect_kw("TABLE")
+        if_exists = self.if_exists()
+        name = self.ident("a table name")
+        return n.AlterTable(name, self.comma_list(lambda: self.alter_action(name)), if_exists)
+
+    def if_exists(self):
+        if self.accept_kw("IF"):
+            self.expect_kw("EXISTS")
+            return True
+        return False
+
+    def alter_action(self, table):
+        tok = self.tok
+        if self.accept_kw("ADD"):
+            if self.is_kw("CONSTRAINT", "CHECK", "FOREIGN", "UNIQUE", "PRIMARY"):
+                return n.AlterAction("ADD CONSTRAINT", definition=self.table_constraint())
+            self.accept_kw("COLUMN")
+            if_not_exists = self.if_not_exists()
+            holder = n.CreateTable(table, [])
+            column, is_pk = self.column_def(holder)
+            if is_pk or column.unique:
+                raise self.unsupported("adding a PRIMARY KEY or UNIQUE column (add the column, then ADD UNIQUE (...))",
+                                       tok)
+            return n.AlterAction("ADD COLUMN", column.name, (column, holder.checks, holder.foreign_keys),
+                                 if_exists=if_not_exists)
+        if self.accept_kw("DROP"):
+            if self.accept_kw("CONSTRAINT"):
+                if_exists = self.if_exists()
+                return n.AlterAction("DROP CONSTRAINT", new_name=self.ident("a constraint name"), if_exists=if_exists)
+            self.accept_kw("COLUMN")
+            if_exists = self.if_exists()
+            action = n.AlterAction("DROP COLUMN", self.ident("a column name"), if_exists=if_exists)
+            self.accept_kw("RESTRICT")
+            return action
+        if self.accept_kw("RENAME"):
+            if self.accept_kw("TO"):
+                return n.AlterAction("RENAME TABLE", new_name=self.ident("a table name"))
+            self.accept_kw("COLUMN")
+            column = self.ident("a column name")
+            self.expect_kw("TO")
+            return n.AlterAction("RENAME COLUMN", column, new_name=self.ident("a column name"))
+        if self.accept_kw("ALTER"):
+            self.accept_kw("COLUMN")
+            column = self.ident("a column name")
+            if self.accept_kw("SET"):
+                if self.accept_kw("DEFAULT"):
+                    value, text = self.default_value()
+                    return n.AlterAction("SET DEFAULT", column, default=value, default_sql=text)
+                if self.accept_kw("NOT"):
+                    self.expect_kw("NULL")
+                    return n.AlterAction("SET NOT NULL", column)
+                self.expect_kw("DATA")
+                self.expect_kw("TYPE")
+                return self.alter_type(column)
+            if self.accept_kw("DROP"):
+                if self.accept_kw("DEFAULT"):
+                    return n.AlterAction("DROP DEFAULT", column)
+                self.expect_kw("NOT")
+                self.expect_kw("NULL")
+                return n.AlterAction("DROP NOT NULL", column)
+            if self.accept_kw("TYPE"):
+                return self.alter_type(column)
+            raise self.error(f"expected SET, DROP or TYPE, got {self.describe()}")
+        raise self.error(f"expected ADD, DROP, RENAME or ALTER, got {self.describe()}")
+
+    def alter_type(self, column):
+        type_, modifiers = self.type_with_modifiers()
+        if self.is_kw("USING"):
+            raise self.unsupported("ALTER COLUMN ... TYPE ... USING")
+        return n.AlterAction("TYPE", column, type=type_, modifiers=modifiers)
+
+    def table_constraint(self):
+        name = self.ident("a constraint name") if self.accept_kw("CONSTRAINT") else None
+        tok = self.tok
+        if self.is_kw("CHECK"):
+            return self.check(name)
+        if self.accept_kw("FOREIGN"):
+            self.expect_kw("KEY")
+            return self.references(self.paren_names(), name)
+        if self.accept_kw("UNIQUE"):
+            return ("UNIQUE", name, self.paren_names())
+        if self.accept_kw("PRIMARY"):
+            raise self.unsupported("adding a PRIMARY KEY to an existing table", tok)
+        raise self.error(f"expected CHECK, FOREIGN KEY or UNIQUE, got {self.describe()}")
 
     def check(self, name):
         self.expect_kw("CHECK")
@@ -402,7 +521,7 @@ class _Parser:
             elif self.accept_kw("UNIQUE"):
                 column.unique = True
             elif self.accept_kw("DEFAULT"):
-                column.default = self.unary()
+                column.default, column.default_sql = self.default_value()
             else:
                 return column, is_pk
 
@@ -450,15 +569,17 @@ class _Parser:
         return False
 
     def drop(self):
-        word = self.accept_kw("TABLE", "INDEX")
+        word = self.accept_kw("TABLE", "INDEX", "VIEW")
         if not word:
-            raise self.error(f"expected TABLE or INDEX after DROP, got {self.describe()}")
+            raise self.error(f"expected TABLE, INDEX or VIEW after DROP, got {self.describe()}")
         if_exists = False
         if self.accept_kw("IF"):
             self.expect_kw("EXISTS")
             if_exists = True
         if word == "TABLE":
             return n.DropTable(self.ident("a table name"), if_exists)
+        if word == "VIEW":
+            return n.DropView(self.ident("a view name"), if_exists)
         return n.DropIndex(self.ident("an index name"), if_exists)
 
     # ---- queries -------------------------------------------------------------

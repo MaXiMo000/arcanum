@@ -255,6 +255,7 @@ class Job:
         self.kinds = Counter()  # engine events of every run of this job
         self.elapsed = 0.0  # seconds spent running (not waiting)
         self.holder = None  # the transaction it waits for, while parked
+        self.wake = None  # the id whose end lets it go on (the holder's, or one of its savepoints')
         self.what = ""
         self.since = None  # when it started waiting (monotonic)
         self.deadline = None
@@ -303,7 +304,7 @@ class Jobs:
             try:
                 result = self.db._execute(job.conn, statement, text, job.sql, True, job.max_rows)
             except LockWaitError as e:
-                if e.xid is None or self.db.mvcc.status(e.xid) != "running":
+                if e.xid is None or self.db.mvcc.status(getattr(e, "wake", e.xid)) != "running":
                     raise
                 self._check_deadlock(job, e.xid)
                 self._park(job, e)
@@ -324,7 +325,7 @@ class Jobs:
             progress = False
             for ticket, job in list(self.parked.items()):
                 expired = time.monotonic() >= job.deadline
-                if not expired and self.db.mvcc.status(job.holder) == "running":
+                if not expired and self.db.mvcc.status(job.wake) == "running":
                     continue
                 del self.parked[ticket]
                 progress = True
@@ -378,6 +379,7 @@ class Jobs:
             job.since = time.monotonic()
             job.deadline = job.since + self.lock_timeout
         job.holder, job.what = error.xid, error.what or str(error)
+        job.wake = getattr(error, "wake", error.xid)  # a savepoint rolled back releases the row early
         self.parked[job.ticket] = job
         holder = self.db.mvcc.running[error.xid]
         self.db.events.emit("lock_wait", session=job.conn.name, holder=error.xid, holder_session=holder.owner)
@@ -474,11 +476,12 @@ def _mvcc_state(db):
         elif txn.snapshot is not None:
             view = txn.snapshot  # REPEATABLE READ, after its first statement
         else:
-            view = manager.snapshot(txn.xid)
+            view = manager.snapshot(txn)
         views[name] = view
         sessions[name] = {
             "xid": txn.xid if txn else None,
             "isolation": txn.isolation if txn else None,
+            "savepoints": [{"name": sp["name"], "xid": sp["xid"]} for sp in db.connections[name].savepoints],
             "snapshot": {"xmin": view.xmin, "xmax": view.xmax, "active": sorted(view.active),
                          "fixed": bool(txn and txn.snapshot is not None)},
         }

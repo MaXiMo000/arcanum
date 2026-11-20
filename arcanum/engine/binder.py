@@ -19,6 +19,7 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 
 from ..errors import ExecutionError, SqlError
 from ..sql import nodes as n
+from ..sql.parser import parse
 from . import plan as p
 from .executor import evaluate_constant
 from .expr import (
@@ -42,6 +43,7 @@ from .expr import (
     Col,
     Const,
     Op,
+    Outer,
     SubqueryExpr,
     WindowCall,
     and_all,
@@ -150,6 +152,26 @@ class Binder:
             assignments.append((pos, value))
         return table, where, assignments
 
+    def bind_joined(self, table, from_node, where_node):
+        """UPDATE ... FROM and DELETE ... USING. Returns (the target-only part of WHERE, bound against the
+        target's rows; the other tables' plan filtered by the rest, evaluated per target row with the target
+        row as its outer row; the level that sees both, for SET expressions)."""
+        outer = self.table_level(table)
+        sub = self.subexpr_level(outer)
+        plan, sub.entries = self.from_item(sub, from_node)
+        if any(e.table == table.name for e in sub.entries):
+            raise self.error(f"table name {table.name} is specified more than once; give one an alias")
+        own, rest = [], []
+        if where_node is not None:
+            for c in conjuncts(self.condition(sub, where_node, "WHERE")):
+                if any(isinstance(x, (Col, SubqueryExpr)) for x in walk(c)):
+                    rest.append(c)
+                else:
+                    own.append(_from_outer(c))  # only the target's columns: usable to find target rows
+        if rest:
+            plan = p.Filter(plan, and_all(rest), plan.columns)
+        return and_all(own), plan, sub
+
     def bind_delete(self, stmt):
         table = self.table(stmt.table)
         level = self.table_level(table)
@@ -158,8 +180,30 @@ class Binder:
     def table(self, name, node=None):
         table = self.catalog.tables.get(name)
         if table is None:
+            if name in self.catalog.views:
+                raise self.error(f"{name} is a view; Arcanum's views are read-only", node)
             raise self.error(f"table {name} does not exist", node)
         return table
+
+    def view(self, level, item):
+        """A view, expanded in place like a subquery in FROM, with its own column names."""
+        stmt = parse(self.catalog.views[item.name])
+        expanding = getattr(self, "_expanding", set())
+        if item.name in expanding:
+            raise self.error(f"infinite recursion: view {item.name} refers to itself", item)
+        self._expanding = expanding | {item.name}
+        sql, self.sql = self.sql, self.catalog.views[item.name]
+        try:
+            plan = self.query(self.derived_level(level), stmt.query)
+        finally:
+            self._expanding, self.sql = expanding, sql
+        if stmt.columns:
+            if len(stmt.columns) > len(plan.columns):
+                raise self.error(f"view {item.name} names more columns than its query has", item)
+            names = stmt.columns + [c.name for c in plan.columns[len(stmt.columns):]]
+            plan = p.Project(plan, [Col(i, c.type, c.name) for i, c in enumerate(plan.columns)],
+                             [p.Column(name, c.type) for name, c in zip(names, plan.columns, strict=True)])
+        return plan
 
     def column_of(self, table, name):
         pos = table.column(name)
@@ -469,6 +513,9 @@ class Binder:
             if cte is not None:
                 columns = cte.columns
                 plan = cte.plan if cte.plan is not None else p.WorkTableScan(cte.work_id, item.name, columns)
+            elif item.name in self.catalog.views:
+                plan = self.view(level, item)
+                columns = plan.columns
             else:
                 table = self.table(item.name, item)
                 columns = [p.Column(c.name, c.type) for c in table.columns]
@@ -497,8 +544,8 @@ class Binder:
                 if len(lefts) != 1 or len(rights) != 1:
                     raise self.error(f"column {name} in USING must appear exactly once on each side of the join")
                 left_entry, right_entry = lefts[0], rights[0]
-                t = self.comparable(left_entry.expr, right_entry.expr, None)
-                conditions.append(Op("=", (left_entry.expr, right_entry.expr), BOOLEAN))
+                left_expr, right_expr, t = self.comparable(left_entry.expr, right_entry.expr, None)
+                conditions.append(Op("=", (left_expr, right_expr), BOOLEAN))
                 merged = {"RIGHT": right_entry.expr,
                           "FULL": Op("COALESCE", (left_entry.expr, right_entry.expr), t)}.get(item.kind, left_entry.expr)
                 li = next(i for i, e in enumerate(entries) if e is left_entry)
@@ -920,6 +967,13 @@ def _matches(signature, types):
     if len(signature) != len(types):
         return False
     return all(t == NULL or c == "A" or t in _SIGNATURE_ALLOWS[c] for c, t in zip(signature, types, strict=True))
+
+
+def _from_outer(e):
+    """Turn references to the enclosing row (depth 1) back into columns of the row itself."""
+    if isinstance(e, Outer) and e.depth == 1:
+        return Col(e.index, e.type, e.name)
+    return map_children(e, _from_outer)
 
 
 def _text_literal(e):

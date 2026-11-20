@@ -48,6 +48,7 @@ class SSI:
         self.describe = describe  # (table name, key) -> "row (id = 1)"
         self.emit = emit
         self.sx = {}  # xid -> Sx, running or committed but still relevant
+        self.aliases = {}  # savepoint id -> its transaction's id, for SERIALIZABLE transactions
 
     def begin(self, txn):
         if txn.isolation == SERIALIZABLE:
@@ -60,20 +61,28 @@ class SSI:
             if committed:
                 sx.committed = True
             else:
-                del self.sx[txn.xid]
+                self._forget(txn.xid)
                 for other in self.sx.values():
                     other.inn.pop(txn.xid, None)
                     other.out.pop(txn.xid, None)
         running = [s for s in self.sx.values() if not s.committed]
         for xid in [x for x, s in self.sx.items() if s.committed]:
             if not any(self._concurrent(r, self.sx[xid]) for r in running):
-                del self.sx[xid]
+                self._forget(xid)
+
+    def savepoint(self, txn, xid):
+        if txn.xid in self.sx:
+            self.aliases[xid] = txn.xid
+
+    def _forget(self, xid):
+        del self.sx[xid]
+        self.aliases = {a: t for a, t in self.aliases.items() if t != xid}
 
     # ---- reads ---------------------------------------------------------------------------------
 
     def reader(self, snapshot):
         """The Sx reading through snapshot, or None when the reader is not SERIALIZABLE."""
-        return self.sx.get(snapshot.own) if self.sx and snapshot is not None else None
+        return self.sx.get(snapshot.top) if self.sx and snapshot is not None else None
 
     def read(self, sx, table, lo=None, hi=None, hi_inclusive=False):
         """Remember that sx read table's primary key range [lo, hi) (lo and hi None: the whole table)."""
@@ -95,7 +104,7 @@ class SSI:
         if visible_at >= 0 and versions[visible_at][1] is not None:
             writers.add(versions[visible_at][1])
         for xid in writers:
-            writer = self.sx.get(xid)
+            writer = self.sx.get(self.aliases.get(xid, xid))
             if writer is not None and writer is not sx:
                 self._conflict(sx, writer, self.describe(table, key), current=sx)
 

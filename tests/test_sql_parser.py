@@ -238,7 +238,7 @@ def test_complex_queries_parse(sql):
     ("SELECT * FORM users", 1, 10, "expected end of statement, got 'FORM'"),
     ("SELECT (1 + 2", 1, 14, "expected ')', got end of input"),
     ("SELECT *\nFROM users\nWHERE", 3, 6, "expected an expression, got end of input"),
-    ("CREATE VIEW v AS SELECT 1", 1, 8, "Arcanum doesn't support CREATE VIEW yet"),
+    ("CREATE TRIGGER t AS SELECT 1", 1, 8, "Arcanum doesn't support CREATE TRIGGER yet"),
     ("SELECT * FROM a NATURAL JOIN b", 1, 17, "Arcanum doesn't support NATURAL joins yet"),
     ("SELECT * FROM (SELECT 1)", 1, 25, "a subquery in FROM needs an alias"),
     ("CREATE TABLE t (id INT PRIMARY KEY, x INT PRIMARY KEY)", 1, 37, "more than one primary key"),

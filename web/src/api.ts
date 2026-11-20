@@ -164,6 +164,8 @@ export interface SessionTxn {
   xid: number | null;
   isolation: string | null;
   snapshot: { xmin: number; xmax: number; active: number[]; fixed: boolean };
+  /** Open savepoints, oldest first, each with the transaction id it writes with. */
+  savepoints?: { name: string; xid: number }[];
 }
 
 export type TxnStatus = "committed" | "running" | "aborted";

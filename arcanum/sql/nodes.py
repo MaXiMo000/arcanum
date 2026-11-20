@@ -254,6 +254,7 @@ class ColumnDef:
     default: object = None
     identity: str | None = None  # "ALWAYS" or "BY DEFAULT" (SERIAL types are BY DEFAULT)
     modifiers: tuple = ()  # NUMERIC(precision, scale)
+    default_sql: str | None = field(default=None, compare=False)  # the default as written, for ALTER TABLE
 
 
 @dataclass(slots=True)
@@ -265,6 +266,42 @@ class CreateTable:
     checks: list = field(default_factory=list)  # [Check], column and table constraints alike
     foreign_keys: list = field(default_factory=list)  # [ForeignKey]
     uniques: list = field(default_factory=list)  # [(name or None, [column names])] from table constraints
+
+
+@dataclass(slots=True)
+class AlterAction:
+    """One change of ALTER TABLE. kind: ADD COLUMN, DROP COLUMN, RENAME COLUMN, RENAME TABLE, SET DEFAULT,
+    DROP DEFAULT, SET NOT NULL, DROP NOT NULL, TYPE, ADD CONSTRAINT or DROP CONSTRAINT."""
+    kind: str
+    column: str | None = None
+    definition: object = None  # ColumnDef for ADD COLUMN; Check, ForeignKey or ("UNIQUE", name, columns) for ADD
+    new_name: str | None = None
+    default: object = None
+    default_sql: str | None = None
+    type: str | None = None
+    modifiers: tuple = ()
+    if_exists: bool = False  # DROP ... IF EXISTS, or IF NOT EXISTS for ADD COLUMN
+
+
+@dataclass(slots=True)
+class AlterTable:
+    name: str
+    actions: list
+    if_exists: bool = False
+
+
+@dataclass(slots=True)
+class CreateView:
+    name: str
+    query: object
+    columns: list | None = None  # names for the query's columns
+    or_replace: bool = False
+
+
+@dataclass(slots=True)
+class DropView:
+    name: str
+    if_exists: bool = False
 
 
 @dataclass(slots=True)
@@ -311,6 +348,7 @@ class Update:
     assignments: list  # [(column, expr)]
     where: object = None
     returning: list | None = None
+    from_: object = None  # UPDATE ... FROM: other tables joined to each target row
 
 
 @dataclass(slots=True)
@@ -318,6 +356,7 @@ class Delete:
     table: str
     where: object = None
     returning: list | None = None
+    using: object = None  # DELETE ... USING: other tables joined to each target row
 
 
 @dataclass(slots=True)
@@ -328,6 +367,21 @@ class Begin:
 @dataclass(slots=True)
 class Commit:
     pass
+
+
+@dataclass(slots=True)
+class Savepoint:
+    name: str
+
+
+@dataclass(slots=True)
+class RollbackTo:
+    name: str
+
+
+@dataclass(slots=True)
+class Release:
+    name: str
 
 
 @dataclass(slots=True)

@@ -100,6 +100,8 @@ class Writer:
     def update(self, stmt):
         from .database import Result  # noqa: PLC0415
 
+        if stmt.from_ is not None:
+            return self.update_from(stmt, Result)
         table, where, assignments = self.binder.bind_update(stmt)
         for pos, _ in assignments:
             if table.columns[pos].identity == "ALWAYS":
@@ -123,14 +125,64 @@ class Writer:
     def delete(self, stmt):
         from .database import Result  # noqa: PLC0415
 
-        table, where = self.binder.bind_delete(stmt)
-        returning = self.returning(table, stmt.returning)
-        targets = self.db._locked_rows(self.ctx, table, where)
+        if stmt.using is not None:
+            table = self.binder.table(stmt.table)
+            returning = self.returning(table, stmt.returning)
+            targets = [(key, row, *hit) for key, row, _, hit in self.joined(table, stmt.using, stmt.where)]
+        else:
+            table, where = self.binder.bind_delete(stmt)
+            returning = self.returning(table, stmt.returning)
+            targets = self.db._locked_rows(self.ctx, table, where)
         for key, _, versions, current in targets:
             self.catalog.delete_version(table, key, versions, current, self.txn)
         self.removed(table, [row for _, row, _, _ in targets], deleting=True)
         self.report()
         return self.result(Result, returning, [row for _, row, _, _ in targets], f"DELETE {len(targets)}")
+
+    def joined(self, table, from_node, where_node, level_out=None):
+        """Target rows that match at least one row of the other tables: [(key, row, matched row, (versions,
+        position))]. As in PostgreSQL, a target row matching several rows uses the first."""
+        own, plan, level = self.binder.bind_joined(table, from_node, where_node)
+        if level_out is not None:
+            level_out.append(level)
+        plan = self.db._plan(plan)
+        out = []
+        for key, row in self.db._matching_rows(self.ctx, table, own):
+            match = next(run(plan, self.ctx, (row,)), None)  # the target row is the plan's outer row
+            if match is None:
+                continue
+            hit = self.catalog.lock_row(table, key, self.txn, self.ctx.snapshot)
+            if hit is not None:
+                out.append((key, row, match, hit))
+        return out
+
+    def update_from(self, stmt, result_type):
+        table = self.binder.table(stmt.table)
+        levels = []
+        matched = self.joined(table, stmt.from_, stmt.where, levels)
+        level, assignments = levels[0], []
+        for name, node in stmt.assignments:
+            pos = self.binder.column_of(table, name)
+            if table.columns[pos].identity == "ALWAYS":
+                raise ConstraintError(f"column {name} can only be updated to DEFAULT: it is an identity column "
+                                      "defined as GENERATED ALWAYS")
+            value = self.binder.plain_expr(level, node, "UPDATE")
+            if not assignable(value.type, table.columns[pos].type):
+                raise self.binder.error(f"column {name} is {table.columns[pos].type} but the value is {value.type}",
+                                        node)
+            assignments.append((pos, self.ctx.compile(value)))
+        returning = self.returning(table, stmt.returning)
+        changes = []
+        for key, row, match, (versions, current) in matched:
+            new = list(row)
+            for pos, f in assignments:
+                new[pos] = f(match, (row,))
+            new = self.catalog.check_row(table, new)
+            self.check(table, new)
+            changes.append((key, row, versions, current, new))
+        self.write_updates(table, changes)
+        self.report()
+        return self.result(result_type, returning, [c[4] for c in changes], f"UPDATE {len(changes)}")
 
     def write_updates(self, table, changes):
         """Write [(key, old row, versions, position, new row)] like UPDATE does, then apply the constraints."""

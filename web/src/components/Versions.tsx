@@ -123,6 +123,11 @@ export function Versions({ state }: { state: EngineState }) {
           {sessions.map(([name, s]) => (
             <span key={name} className={`txn-chip s-${name}`} title={`snapshot: sees transactions below ${s.snapshot.xmax}${s.snapshot.active.length ? ` except ${s.snapshot.active.join(", ")} (still open)` : ""}`}>
               <b>{name}</b> {s.xid ? `txn ${s.xid}${s.isolation === "REPEATABLE READ" ? " · RR" : s.isolation === "SERIALIZABLE" ? " · SER" : ""}` : "idle"}
+              {(s.savepoints ?? []).map((sp) => (
+                <span key={sp.xid} className="savepoint" title={`savepoint ${sp.name}: a subtransaction; its writes carry id ${sp.xid}`}>
+                  ↳ {sp.name} {sp.xid}
+                </span>
+              ))}
             </span>
           ))}
           <span className="txn-chip muted" title="the id the next transaction gets">next {state.next_xid}</span>

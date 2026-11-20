@@ -57,6 +57,7 @@ class ColumnSchema:
     default_expr: object = None  # a default that is an expression, such as now(): evaluated per row
     precision: int | None = None  # NUMERIC(precision, scale)
     scale: int | None = None
+    default_sql: str | None = None  # the default as written
 
 
 @dataclass(eq=False)
@@ -173,12 +174,15 @@ class Catalog:
         kept across a reload: a rolled-back statement can only have removed some.
         """
         self.tables, self.indexes, self._next_rowid = {}, {}, {}
+        self.views = {}  # name -> CREATE VIEW text, expanded wherever the view is used
         self.meta, self.clog = {}, set()
         entries = [decode(value) for _, value in self.tree.scan()]
         stats = {}
         for kind, name, sql, root in entries:
             if kind == "table":
                 self.tables[name] = _table_from_ast(parse(sql), root, sql)
+            elif kind == "view":
+                self.views[name] = sql
             elif kind == "meta":
                 self.meta[name] = root
             elif kind == "clog":
@@ -214,21 +218,60 @@ class Catalog:
             index_sql = f'CREATE UNIQUE INDEX "{name}" ON "{table.name}" ({listed})'
             self.create_index(parse(index_sql), index_sql)
         for fk in table.foreign_keys:
-            parent = self.tables.get(fk.parent)
-            if parent is None:
-                raise SqlError(f"table {fk.parent} referenced by foreign key {fk.name} does not exist")
-            refs = self.referenced(fk)
-            if len(refs) != len(fk.columns):
-                raise SqlError(f"foreign key {fk.name} has {len(fk.columns)} columns but references {len(refs)}")
-            if refs != parent.primary_key and not any(i.unique and i.columns == refs for i in parent.indexes):
-                raise SqlError(f"there is no unique constraint matching the columns of table {parent.name} "
-                               f"referenced by foreign key {fk.name}")
-            for child, ref in zip(fk.columns, refs, strict=True):
-                a, b = table.columns[child], parent.columns[ref]
-                if not (assignable(a.type, b.type) and assignable(b.type, a.type)):
-                    raise SqlError(f"foreign key {fk.name}: column {a.name} ({a.type}) and {parent.name}.{b.name} "
-                                   f"({b.type}) are of different types")
+            self.validate_foreign_key(table, fk)
         return table
+
+    def validate_foreign_key(self, table, fk):
+        parent = self.tables.get(fk.parent)
+        if parent is None:
+            raise SqlError(f"table {fk.parent} referenced by foreign key {fk.name} does not exist")
+        refs = self.referenced(fk)
+        if len(refs) != len(fk.columns):
+            raise SqlError(f"foreign key {fk.name} has {len(fk.columns)} columns but references {len(refs)}")
+        if refs != parent.primary_key and not any(i.unique and i.columns == refs for i in parent.indexes):
+            raise SqlError(f"there is no unique constraint matching the columns of table {parent.name} "
+                           f"referenced by foreign key {fk.name}")
+        for child, ref in zip(fk.columns, refs, strict=True):
+            a, b = table.columns[child], parent.columns[ref]
+            if not (assignable(a.type, b.type) and assignable(b.type, a.type)):
+                raise SqlError(f"foreign key {fk.name}: column {a.name} ({a.type}) and {parent.name}.{b.name} "
+                               f"({b.type}) are of different types")
+
+    def put_table(self, table, sql):
+        """Store a table's (new) definition; reload() turns it into the in-memory schema."""
+        self.tree.insert(encode((table.name,)), encode(("table", table.name, sql, table.root)), replace=True)
+
+    def put_index(self, index, sql):
+        self.tree.insert(encode((index.name,)), encode(("index", index.name, sql, index.root)), replace=True)
+
+    def drop_entry(self, name):
+        self.tree.delete(encode((name,)))
+
+    def drop_stats(self, table):
+        """Forget a table's ANALYZE statistics (its columns changed)."""
+        for column in range(-1, len(table.columns) + 1):
+            self.tree.delete(encode((table.name, "stats", column)))
+        table.stats = None
+
+    def rewrite_rows(self, table, change):
+        """Replace every version of every row by change(key, row), which may change the row's width."""
+        old_width = len(table.columns)
+        tree = self.btree(table.root)
+        for key, value in list(tree.scan()):
+            versions = [[xmin, xmax, tuple(change(key, row))] for xmin, xmax, row in unpack(decode(value), old_width)]
+            encoded = encode(pack(versions))
+            _check_size(len(key) + len(encoded), f"row of table {table.name}")
+            tree.insert(key, encoded, replace=True)
+
+    def drop_meta(self, name):
+        if self.meta.pop(name, None) is not None:
+            self.tree.delete(encode(("", name)))
+
+    def rename_meta(self, old, new):
+        value = self.meta.pop(old, None)
+        if value is not None:
+            self.tree.delete(encode(("", old)))
+            self.set_meta(new, value)
 
     def referenced(self, fk):
         """Positions, in the parent, of the columns a foreign key references."""
@@ -337,7 +380,23 @@ class Catalog:
         self.btree(index.root).drop()
         self.tree.delete(encode((name,)))
 
+    def create_view(self, name, sql):
+        self.views[name] = sql
+        self._put_entry("view", name, sql, 0)
+
+    def drop_view(self, name):
+        del self.views[name]
+        self.tree.delete(encode((name,)))
+
+    def dependent_views(self, name):
+        """Views whose query reads table or view `name`."""
+        from .binder import _references  # noqa: PLC0415 (the binder imports the catalog's module)
+
+        return [v for v, sql in self.views.items() if v != name and _references(parse(sql).query, name)]
+
     def _check_name_free(self, name):
+        if name in self.views:
+            raise SqlError(f"view {name} already exists")
         if name in self.tables:
             raise SqlError(f"table {name} already exists")
         if name in self.indexes:
@@ -500,7 +559,7 @@ class Catalog:
             raise ConstraintError(f"duplicate key ({values}) violates the primary key of table {table.name}")
         for index in table.indexes:
             self._check_unique(table, index, row, key, txn)
-        self._store(table, key, [*versions, [txn.xid, None, row]])
+        self._store(table, key, [*versions, [txn.current, None, row]])
         for index in table.indexes:
             self._index_add(index, key, row)
         self._touch(table, key, txn)
@@ -517,13 +576,13 @@ class Catalog:
         versions = self.chain(table, key)
         if not versions:
             return None
-        live = [i for i, (xmin, _, _) in enumerate(versions) if xmin == txn.xid or self.mvcc.status(xmin) != "aborted"]
+        live = [i for i, (xmin, _, _) in enumerate(versions) if xmin in txn.own or self.mvcc.status(xmin) != "aborted"]
         if not live:
             return None
         current = live[-1]
         xmin, xmax, _ = versions[current]
         self._not_held(table, key, xmin, txn)
-        if xmax is not None and xmax != txn.xid:
+        if xmax is not None and xmax not in txn.own:
             self._not_held(table, key, xmax, txn)
             if self.mvcc.status(xmax) == "committed":
                 if not self.mvcc.sees(snapshot, xmax):
@@ -540,12 +599,12 @@ class Catalog:
     def delete_version(self, table, key, versions, current, txn):
         """Mark the current version deleted by txn (dropping it outright if txn also created it)."""
         xmin, _, row = versions[current]
-        if xmin == txn.xid:
+        if xmin == txn.current:  # made in this same (sub)transaction: nothing can need it any more
             remaining = versions[:current] + versions[current + 1:]
             self._store(table, key, remaining)
             self._index_clean(table, key, [row], remaining)
         else:
-            versions[current][1] = txn.xid
+            versions[current][1] = txn.current
             self._store(table, key, versions)
         self._touch(table, key, txn)
 
@@ -554,14 +613,15 @@ class Catalog:
         the new one appended, so snapshots that saw the old version keep seeing it. Unique indexes are
         checked by check_unique once the whole statement has written its versions."""
         old = versions[current]
-        if old[0] == txn.xid:
+        replaced = old[0] == txn.current  # made in this same (sub)transaction: replace it outright
+        if replaced:
             remaining = versions[:current] + versions[current + 1:]
         else:
-            old[1] = txn.xid
+            old[1] = txn.current
             remaining = versions
-        remaining = [*remaining, [txn.xid, None, row]]
+        remaining = [*remaining, [txn.current, None, row]]
         self._store(table, key, remaining)
-        if old[0] == txn.xid:
+        if replaced:
             self._index_clean(table, key, [old[2]], remaining)
         for index in table.indexes:
             self._index_add(index, key, row)
@@ -633,25 +693,28 @@ class Catalog:
         for xmin, xmax, row in versions:
             if not matches(row):
                 continue
-            created = "own" if xmin == txn.xid else self.mvcc.status(xmin)
+            created = "own" if xmin in txn.own else self.mvcc.status(xmin)
             if created == "aborted":
                 continue
             if created == "running":
                 raise self._held_error(xmin)
-            if xmax is None or (xmax != txn.xid and self.mvcc.status(xmax) == "aborted"):
+            if xmax is None or (xmax not in txn.own and self.mvcc.status(xmax) == "aborted"):
                 return True
-            if xmax != txn.xid and self.mvcc.status(xmax) == "running":
+            if xmax not in txn.own and self.mvcc.status(xmax) == "running":
                 raise self._held_error(xmax)
         return False
 
     def _not_held(self, table, key, xid, txn):
-        if xid != txn.xid and self.mvcc.status(xid) == "running":
+        if xid not in txn.own and self.mvcc.status(xid) == "running":
             raise self._held_error(xid, self._describe(table, key))
 
     def _held_error(self, xid, what="a row with that key"):
-        owner = self.mvcc.running[xid].owner
-        return LockWaitError(f"{what} is held by the open transaction {xid} in session {owner}; PostgreSQL "
-                             "would make this statement wait until that transaction commits or rolls back", xid, what)
+        holder = self.mvcc.running[xid]
+        error = LockWaitError(f"{what} is held by the open transaction {holder.xid} in session {holder.owner}; "
+                              "PostgreSQL would make this statement wait until that transaction commits or rolls back",
+                              holder.xid, what)
+        error.wake = xid  # the (savepoint) id whose end releases the row
+        return error
 
     def _describe(self, table, key):
         values = decode(key)
@@ -752,7 +815,8 @@ def _table_from_ast(stmt, root, sql):
         if c.identity and c.default is not None:
             raise SqlError(f"both default and identity specified for column {c.name} of table {stmt.name}")
         precision, scale = c.modifiers if c.modifiers else (None, None)
-        columns.append(ColumnSchema(c.name, c.type, c.not_null, default, c.identity, default_expr, precision, scale))
+        columns.append(ColumnSchema(c.name, c.type, c.not_null, default, c.identity, default_expr, precision, scale,
+                                    c.default_sql))
     table = TableSchema(stmt.name, columns, [], root, sql)
     names = set()
     for i, check in enumerate(stmt.checks):
