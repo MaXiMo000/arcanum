@@ -283,7 +283,8 @@ class Optimizer:
             down, keep = [], []
             for c in preds:
                 cols = column_indexes(c)
-                if _movable(c) and all(i < len(node.groups) for i in cols):
+                # With grouping sets a group column is NULL in some rows, so a test on it must stay above.
+                if _movable(c) and node.sets is None and all(i < len(node.groups) for i in cols):
                     down.append(_substitute(c, node.groups))
                     self.note("pushdown", f"{format_expr(c)} moved below the aggregate",
                               "It only tests grouping columns, so whole groups can be dropped before any rows are "
@@ -722,6 +723,10 @@ class Optimizer:
             return {"UNION": left + right, "INTERSECT": min(left, right), "EXCEPT": left}[node.op]
         if isinstance(node, p.RecursiveCTE):
             return self.estimate(node.anchor) * 10
+        if isinstance(node, p.LateralJoin):
+            return max(self.estimate(node.left) * self.estimate(node.right), 1.0)
+        if isinstance(node, p.FunctionScan):
+            return _function_rows(node)
         return 100.0
 
     def annotate(self, node):
@@ -1004,10 +1009,19 @@ def _equi_between(c, owner, part, other):
 
 
 def _with_inputs(node, children):
-    if isinstance(node, (p.Join, p.SetOp)):
+    if isinstance(node, (p.Join, p.SetOp, p.LateralJoin)):
         return replace(node, left=children[0], right=children[1])
     if isinstance(node, p.RecursiveCTE):
         return replace(node, anchor=children[0], recursive=children[1])
     if children:
         return replace(node, input=children[0])
     return node
+
+
+def _function_rows(node):
+    """Rows a set-returning function gives: exact for generate_series over constants, else a guess."""
+    args = node.args
+    if node.name == "GENERATE_SERIES" and all(isinstance(a, Const) and type(a.value) is int for a in args):
+        start, stop, step = args[0].value, args[1].value, args[2].value if len(args) > 2 else 1
+        return float(max((stop - start) // step + 1, 1)) if step else 1.0
+    return 10.0  # a guess, as the planner cannot see inside an array or a document before running

@@ -104,10 +104,31 @@ class Join:
 
 @dataclass(eq=False)
 class Aggregate:
-    """Output rows are group values followed by aggregate results."""
+    """Output rows are group values followed by aggregate results. With grouping sets (ROLLUP, CUBE,
+    GROUPING SETS), each input row counts once per set, the groups outside a set are NULL, and a column
+    after the groups holds the set's GROUPING() bits (1 for each group not in the set, first group highest)."""
     input: object
     groups: list
     aggs: list  # [AggCall]
+    columns: list
+    sets: list | None = None  # [tuple of group positions], or None for plain GROUP BY
+
+
+@dataclass(eq=False)
+class LateralJoin:
+    """For each left row, run the right side with that row as its outer row (LATERAL, or a function in FROM)."""
+    left: object
+    right: object
+    kind: str  # INNER or LEFT
+    condition: object  # over the combined row, or None
+    columns: list
+
+
+@dataclass(eq=False)
+class FunctionScan:
+    """Rows from a set-returning function: unnest, generate_series, jsonb_each, ..."""
+    name: str
+    args: list
     columns: list
 
 
@@ -160,7 +181,7 @@ class RecursiveCTE:
 
 
 def inputs(node):
-    if isinstance(node, (Join, SetOp)):
+    if isinstance(node, (Join, SetOp, LateralJoin)):
         return [node.left, node.right]
     if isinstance(node, RecursiveCTE):
         return [node.anchor, node.recursive]
@@ -183,6 +204,10 @@ def expressions(node):
         return [key for key, _, _ in node.keys]
     if isinstance(node, Values):
         return [e for row in node.rows for e in row]
+    if isinstance(node, FunctionScan):
+        return list(node.args)
+    if isinstance(node, LateralJoin):
+        return [node.condition] if node.condition is not None else []
     return []
 
 
@@ -222,6 +247,8 @@ def describe(node):
         return text + (f" filter {format_expr(node.residual)}" if node.residual is not None else "")
     if isinstance(node, Aggregate):
         groups = ", ".join(map(format_expr, node.groups))
+        if node.sets is not None:  # ROLLUP / CUBE / GROUPING SETS: one hash table per set
+            groups = "; ".join("(" + ", ".join(format_expr(node.groups[i]) for i in s) + ")" for s in node.sets)
         aggs = ", ".join(map(format_expr, node.aggs))
         return "HashAggregate" + (f" group by {groups}" if groups else "") + (f" compute {aggs}" if aggs else "")
     if isinstance(node, Window):
@@ -236,6 +263,11 @@ def describe(node):
         return f"{node.op}{' ALL' if node.all else ''}"
     if isinstance(node, RecursiveCTE):
         return f"RecursiveCTE {node.name}{' (UNION ALL)' if node.all else ' (UNION)'}"
+    if isinstance(node, LateralJoin):
+        return f"Nested Loop {node.kind.title()} Lateral" + (f" on {format_expr(node.condition)}" if node.condition
+                                                            is not None else "")
+    if isinstance(node, FunctionScan):
+        return f"Function Scan {node.name.lower()}({', '.join(map(format_expr, node.args))})"
     return type(node).__name__
 
 

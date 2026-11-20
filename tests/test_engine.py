@@ -205,3 +205,12 @@ def test_events_show_the_engine_working(db):
 def test_bind_errors(db, sql, message):
     with pytest.raises(SqlError, match=message.replace("(", r"\(").replace(")", r"\)").replace("*", r"\*").replace("+", r"\+")):
         db.execute(sql)
+
+
+def test_nulls_sort_as_in_postgresql(tmp_path):
+    with Database(tmp_path / "n.db") as db:
+        db.execute("CREATE TABLE t (v INTEGER)")
+        db.execute("INSERT INTO t VALUES (2), (NULL), (1)")
+        assert db.execute("SELECT v FROM t ORDER BY v").rows == [(1,), (2,), (None,)]  # NULL is the largest
+        assert db.execute("SELECT v FROM t ORDER BY v DESC").rows == [(None,), (2,), (1,)]
+        assert db.execute("SELECT v FROM t ORDER BY v NULLS FIRST").rows == [(None,), (1,), (2,)]

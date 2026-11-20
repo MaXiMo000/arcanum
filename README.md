@@ -89,12 +89,16 @@ with Database("company.db") as db:
   `RETURNING`
 - `SELECT` with `DISTINCT`, `DISTINCT ON`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... NULLS FIRST|LAST`, `LIMIT` and `OFFSET`
 - `INNER`, `LEFT`, `RIGHT`, `FULL` and `CROSS` joins, with `ON` or `USING`
-- Scalar, `IN`, `EXISTS`, correlated and `FROM` subqueries
+- Scalar, `IN`, `EXISTS`, correlated and `FROM` subqueries; `LATERAL` subqueries and functions in `FROM`
+  (`unnest`, `generate_series`, `jsonb_each`, `jsonb_array_elements`, `jsonb_object_keys`,
+  `regexp_split_to_table`), with `AS t(a, b)` column names
+- `GROUP BY ROLLUP (...)`, `CUBE (...)` and `GROUPING SETS (...)`, with `grouping()`
 - `WITH` and `WITH RECURSIVE`
 - Window functions `row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`, `last_value` and
   every aggregate, with `PARTITION BY`, `ORDER BY` and `ROWS` / `RANGE` frames
 - `UNION`, `INTERSECT` and `EXCEPT`, each with or without `ALL`
-- Aggregates `count`, `sum`, `avg`, `min`, `max`, `string_agg`, `bool_and`, `bool_or` and `every`, with
+- Aggregates `count`, `sum`, `avg`, `min`, `max`, `string_agg`, `array_agg`, `jsonb_agg`, `jsonb_object_agg`,
+  `bool_and`, `bool_or` and `every`, with
   `DISTINCT`, `ORDER BY` inside the call and `FILTER (WHERE ...)`
 - Dates and times:
   - Typed literals (`DATE '2024-01-31'`, `INTERVAL '7 days'`) and `x::type` casts.
@@ -107,6 +111,16 @@ with Database("company.db") as db:
 - Pattern matching: `LIKE`, `ILIKE`, and the regular expression operators `~`, `~*`, `!~` and `!~*`.
 - Numbers: `abs`, `round`, `trunc`, `ceil`, `floor`, `mod`, `power`, `sqrt`, `exp`, `ln`, `log`, `sign`,
   `pi` and `random`.
+- Arrays:
+  - Types `INTEGER[]`, `TEXT[]` and so on, written `ARRAY[...]` or `'{...}'`.
+  - Subscripts `a[i]`, `= ANY (...)` and `op ALL (...)`, `@>`, `<@`, `&&` and `||`.
+  - Functions `array_length`, `cardinality`, `array_append`, `array_prepend`, `array_cat`, `array_remove`,
+    `array_position`, `array_to_string` and `string_to_array`.
+- JSONB (`JSON` is accepted as the same type):
+  - Operators `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, `||` and `-`, and subscripts `j['key']`.
+  - Functions `to_jsonb`, `jsonb_build_object`, `jsonb_build_array`, `jsonb_set`, `jsonb_typeof`,
+    `jsonb_array_length`, `jsonb_extract_path[_text]`, `jsonb_strip_nulls` and `jsonb_pretty`, with
+    `json_*` spellings.
 - Other: `coalesce`, `ifnull`, `nullif`, `greatest` and `least`; `CASE`, `CAST`, `BETWEEN`, `IN`,
   `IS [NOT] NULL` and `||`.
 - `SAVEPOINT`, `ROLLBACK TO SAVEPOINT` and `RELEASE SAVEPOINT`
@@ -115,13 +129,14 @@ with Database("company.db") as db:
 
 ### Semantics
 
-- Types are `INTEGER`, `REAL`, `NUMERIC(p, s)`, `TEXT`, `BOOLEAN`, `DATE` and `TIMESTAMP`, with `INTERVAL`
-  in expressions. They are checked before a query runs: comparing a number with text, or storing text
+- Types are `INTEGER`, `REAL`, `NUMERIC(p, s)`, `TEXT`, `BOOLEAN`, `DATE`, `TIMESTAMP`, `JSONB` and
+  one-dimensional arrays of the scalar types, with `INTERVAL` in expressions. They are checked before a query runs: comparing a number with text, or storing text
   in an `INTEGER` column, is an error rather than a silent conversion.
 - As in PostgreSQL, a text literal takes the type it is compared with or stored into
   (`WHERE day > '2024-01-01'`). `NUMERIC` is exact decimal arithmetic. Timestamps have no time zone and
   are read as UTC.
-- `NULL` follows SQL's three-valued logic, sorts first in ascending order and last in descending order.
+- `NULL` follows SQL's three-valued logic. It sorts as the largest value, as in PostgreSQL: last in
+  ascending order and first in descending order, unless `NULLS FIRST` or `LAST` says otherwise.
 - Integer division truncates toward zero; `%` takes integers; dividing by zero and integer overflow are errors.
 - `LIKE` is case-sensitive.
 - Every statement is atomic, and a committed transaction survives any crash (see below).

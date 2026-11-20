@@ -166,6 +166,38 @@ class TableRef:
 class SubqueryRef:
     query: "Query"
     alias: str
+    lateral: bool = False  # LATERAL: may refer to the FROM items before it
+    columns: list | None = None  # AS alias (a, b): names for its columns
+
+
+@dataclass(slots=True)
+class FunctionRef:
+    """A function that returns rows, in FROM: unnest(...), generate_series(...), jsonb_each(...)."""
+    name: str
+    args: list
+    alias: str | None = None
+    columns: list | None = None
+    pos: int | None = field(default=None, compare=False, repr=False)
+
+
+@dataclass(slots=True)
+class Subscript:
+    expr: object
+    index: object
+
+
+@dataclass(slots=True)
+class ArrayLiteral:
+    items: list
+
+
+@dataclass(slots=True)
+class Quantified:
+    """left op ANY (array) or left op ALL (array)."""
+    op: str
+    left: object
+    right: object
+    all: bool = False
 
 
 @dataclass(slots=True)
@@ -186,6 +218,7 @@ class Select:
     having: object = None
     distinct: bool = False
     distinct_on: list = field(default_factory=list)  # DISTINCT ON (exprs)
+    grouping_sets: list | None = None  # ROLLUP / CUBE / GROUPING SETS: each set lists group_by items
 
 
 @dataclass(slots=True)

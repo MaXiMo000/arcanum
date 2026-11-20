@@ -22,10 +22,13 @@ TYPES = {
     "BOOLEAN": "BOOLEAN", "BOOL": "BOOLEAN",
     "NUMERIC": "NUMERIC", "DECIMAL": "NUMERIC",
     "DATE": "DATE", "TIMESTAMP": "TIMESTAMP", "TIMESTAMPTZ": "TIMESTAMP", "INTERVAL": "INTERVAL",
+    "JSON": "JSONB", "JSONB": "JSONB",
 }
+_CONTAINER_OPS = ("||", "->", "->>", "#>", "#>>", "@>", "<@", "&&", "?", "?|", "?&")
+MAX_GROUPING_SETS = 4096
 # Words that are values without parentheses, as in standard SQL.
 _NILADIC = ("CURRENT_DATE", "CURRENT_TIMESTAMP", "LOCALTIMESTAMP")
-_TYPED_LITERALS = ("DATE", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL", "NUMERIC", "DECIMAL")
+_TYPED_LITERALS = ("DATE", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL", "NUMERIC", "DECIMAL", "JSON", "JSONB")
 
 _QUERY_START = ("SELECT", "WITH", "VALUES")
 _COMPARISONS = ("=", "!=", "<>", "<", "<=", ">", ">=")
@@ -549,6 +552,25 @@ class _Parser:
             self.expect_kw("TIME")
             self.expect_kw("ZONE")
         type_ = TYPES[word]
+        dimensions = 0
+        while True:  # INTEGER[], TEXT[3], INTEGER ARRAY
+            if self.accept_op("["):
+                if not self.is_op("]"):
+                    self.expect_int()
+                self.expect_op("]")
+            elif self.accept_kw("ARRAY"):
+                if self.accept_op("["):
+                    self.expect_int()
+                    self.expect_op("]")
+            else:
+                break
+            dimensions += 1
+        if dimensions > 1:
+            raise self.unsupported("arrays of more than one dimension", tok)
+        if dimensions:
+            if type_ in ("INTERVAL", "JSONB"):
+                raise self.unsupported(f"arrays of {type_}", tok)
+            return type_ + "[]", ()
         if type_ == "NUMERIC" and modifiers:
             precision, scale = (*modifiers, 0)[:2]
             if len(modifiers) > 2 or not 1 <= precision <= 1000 or not 0 <= scale <= precision:
@@ -660,14 +682,15 @@ class _Parser:
         columns = self.comma_list(self.select_item)
         from_ = self.from_clause() if self.accept_kw("FROM") else None
         where = self.expr() if self.accept_kw("WHERE") else None
-        group_by = []
+        group_by, grouping_sets = [], None
         if self.accept_kw("GROUP"):
             self.expect_kw("BY")
-            group_by = self.comma_list(self.expr)
+            group_by, grouping_sets = self.group_by()
         having = self.expr() if self.accept_kw("HAVING") else None
         if self.is_kw("WINDOW"):
             raise self.unsupported("named windows")
-        return n.Select(columns, from_, where, group_by, having, distinct and not distinct_on, distinct_on)
+        return n.Select(columns, from_, where, group_by, having, distinct and not distinct_on, distinct_on,
+                        grouping_sets)
 
     def select_item(self):
         if self.accept_op("*"):
@@ -718,8 +741,7 @@ class _Parser:
                 raise self.error(f"expected ON or USING after the joined table, got {self.describe()}")
 
     def table_primary(self):
-        if self.is_kw("LATERAL"):
-            raise self.unsupported("LATERAL")
+        lateral = bool(self.accept_kw("LATERAL"))
         if self.accept_op("("):
             if not self.starts_query():
                 raise self.unsupported("parenthesized joins")
@@ -729,9 +751,81 @@ class _Parser:
             alias = self.alias()
             if alias is None:
                 raise self.error("a subquery in FROM needs an alias, e.g. (SELECT ...) AS sub", tok)
-            return n.SubqueryRef(query, alias)
+            return n.SubqueryRef(query, alias, lateral, self.column_aliases())
         pos = self.tok.pos
+        if self.is_name() and self.peek().kind == OP and self.peek().value == "(":
+            name = self.advance().value.upper()
+            self.expect_op("(")
+            args = [] if self.is_op(")") else self.comma_list(self.expr)
+            self.expect_op(")")
+            return n.FunctionRef(name, args, self.alias(), self.column_aliases(), pos)
+        if lateral:
+            raise self.error(f"expected a subquery or a function after LATERAL, got {self.describe()}")
         return n.TableRef(self.ident("a table name"), self.alias(), pos)
+
+    def column_aliases(self):
+        return self.paren_names() if self.is_op("(") else None
+
+    def group_by(self):
+        """GROUP BY items. Returns (every distinct expression, the grouping sets or None). Plain items are
+        in every set; ROLLUP, CUBE and GROUPING SETS multiply the sets, as in PostgreSQL."""
+        sets, plain = [[]], True
+        self._plain_groups = []
+        for item in self.comma_list(self.grouping_item):
+            plain = plain and item is None
+            options = item if item is not None else None
+            if options is None:
+                continue
+            sets = [a + b for a in sets for b in options]
+            if len(sets) > MAX_GROUPING_SETS:
+                raise self.error(f"too many grouping sets (the limit is {MAX_GROUPING_SETS})")
+        exprs = []
+        for e in self._plain_groups + [e for s in sets for e in s]:
+            if e not in exprs:
+                exprs.append(e)
+        if plain:
+            return exprs, None
+        return exprs, [self._plain_groups + s for s in sets]
+
+    def grouping_item(self):
+        """None for a plain expression (remembered in _plain_groups), else the list of sets it stands for."""
+        word = self.accept_kw("ROLLUP", "CUBE", "GROUPING")
+        if word is None:
+            if self.is_op("(") and self.peek().kind == OP and self.peek().value == ")":
+                self.advance()
+                self.advance()
+                return [[]]  # (): the grand total
+            self._plain_groups.append(self.expr())
+            return None
+        if word == "GROUPING":
+            self.expect_kw("SETS")
+            self.expect_op("(")
+            sets = self.comma_list(self.grouping_set)
+            self.expect_op(")")
+            return sets
+        self.expect_op("(")
+        elements = self.comma_list(self.grouping_set)
+        self.expect_op(")")
+        if word == "ROLLUP":
+            return [[e for part in elements[:k] for e in part] for k in range(len(elements), -1, -1)]
+        if len(elements) > 12:
+            raise self.error("CUBE takes at most 12 elements")
+        width = len(elements)
+        return [[e for i in range(width) if mask & (1 << (width - 1 - i)) for e in elements[i]]
+                for mask in range((1 << width) - 1, -1, -1)]
+
+    def grouping_set(self):
+        """(a, b), (), or a single expression: a list of expressions."""
+        if self.is_op("(") and not self.peek_starts_query():
+            self.advance()
+            items = [] if self.is_op(")") else self.comma_list(self.expr)
+            self.expect_op(")")
+            return items
+        return [self.expr()]
+
+    def peek_starts_query(self):
+        tok = self.peek()
+        return tok.kind == WORD and tok.value.upper() in _QUERY_START
 
     def order_by(self):
         self.expect_kw("BY")
@@ -787,7 +881,11 @@ class _Parser:
         while True:
             if op := self.accept_op(*_COMPARISONS, "~", "~*", "!~", "!~*"):
                 pos = self.prev_pos
-                left = n.Binary("!=" if op == "<>" else op, left, self.concat(), pos)
+                op = "!=" if op == "<>" else op
+                if self.is_kw("ANY", "SOME", "ALL") and self.peek().kind == OP and self.peek().value == "(":
+                    left = self.quantified(op, left)
+                else:
+                    left = n.Binary(op, left, self.concat(), pos)
             elif self.accept_kw("IS"):
                 negated = bool(self.accept_kw("NOT"))
                 self.expect_kw("NULL")
@@ -807,6 +905,22 @@ class _Parser:
                 else:
                     return left
 
+    def quantified(self, op, left):
+        """x op ANY (array) / ALL (array); = ANY (subquery) is IN, <> ALL (subquery) is NOT IN."""
+        every = self.advance().value.upper() == "ALL"
+        self.expect_op("(")
+        if self.starts_query():
+            query = self.query()
+            self.expect_op(")")
+            if (op, every) == ("=", False):
+                return n.InSubquery(left, query)
+            if (op, every) == ("!=", True):
+                return n.InSubquery(left, query, negated=True)
+            raise self.unsupported(f"{op} {'ALL' if every else 'ANY'} with a subquery (use an array, or IN)")
+        right = self.expr()
+        self.expect_op(")")
+        return n.Quantified(op, left, right, every)
+
     def in_rest(self, left, negated):
         self.expect_op("(")
         if self.starts_query():
@@ -818,10 +932,11 @@ class _Parser:
         return n.InList(left, items, negated)
 
     def concat(self):
+        """|| and PostgreSQL's other operators (-> ->> #> @> ? && ...), which share one precedence level."""
         left = self.additive()
-        while self.accept_op("||"):
+        while op := self.accept_op(*_CONTAINER_OPS):
             pos = self.prev_pos
-            left = n.Binary("||", left, self.additive(), pos)
+            left = n.Binary(op, left, self.additive(), pos)
         return left
 
     def additive(self):
@@ -850,10 +965,16 @@ class _Parser:
                 return n.Literal(-operand.value)  # so -9223372036854775808 stays in range
             return n.Unary(op, operand, pos)
         expr = self.primary()
-        while self.accept_op("::"):  # PostgreSQL's cast: x::date
-            type_, modifiers = self.type_with_modifiers()
-            expr = n.Cast(expr, type_, modifiers)
-        return expr
+        while True:
+            if self.accept_op("::"):  # PostgreSQL's cast: x::date
+                type_, modifiers = self.type_with_modifiers()
+                expr = n.Cast(expr, type_, modifiers)
+            elif self.accept_op("["):  # a[1], j['key']
+                index = self.expr()
+                self.expect_op("]")
+                expr = n.Subscript(expr, index)
+            else:
+                return expr
 
     def primary(self):
         tok = self.tok
@@ -874,6 +995,12 @@ class _Parser:
             expr = self.expr()
             self.expect_op(")")
             return expr
+        if tok.kind == WORD and tok.value.upper() == "ARRAY" and self.peek().kind == OP and self.peek().value == "[":
+            self.advance()
+            self.advance()
+            items = [] if self.is_op("]") else self.comma_list(self.expr)
+            self.expect_op("]")
+            return n.ArrayLiteral(items)
         if tok.kind == WORD and tok.value.upper() in _TYPED_LITERALS and self.peek().kind == STRING:
             self.advance()  # DATE '2024-01-31', INTERVAL '7 days': a string read as that type
             return n.Cast(n.Literal(self.advance().value), TYPES[tok.value.upper()])

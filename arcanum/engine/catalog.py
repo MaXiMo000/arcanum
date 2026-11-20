@@ -28,11 +28,10 @@ from ..storage import BTree, decode, encode
 from ..storage.btree import MAX_ENTRY
 from .expr import (
     BOOLEAN,
-    DATE,
-    DECIMAL,
+    INTEGER,
     INTERVAL,
     REAL,
-    TIMESTAMP,
+    TEXT,
     assignable,
     cast,
     literal_type,
@@ -534,8 +533,8 @@ class Catalog:
                     raise ConstraintError(f"NULL value in column {column.name} of table {table.name} violates NOT NULL")
             elif column.type == REAL and not isinstance(value, float):
                 value = float(value)
-            elif column.type in (DECIMAL, DATE, TIMESTAMP) and literal_type(value) != column.type:
-                value = cast(value, column.type)
+            elif column.type not in (INTEGER, TEXT, BOOLEAN) and literal_type(value) != column.type:
+                value = cast(value, column.type)  # text to dates, numerics, arrays and JSONB; array elements
             if value is not None and column.scale is not None:
                 value = scale_decimal(value, column.scale, column.precision)
             out.append(value)

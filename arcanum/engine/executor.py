@@ -22,6 +22,7 @@ from decimal import Decimal
 
 from ..errors import ExecutionError
 from ..storage import decode, encode
+from . import containers as ct
 from . import plan as p
 from .expr import (
     BOOLEAN,
@@ -29,6 +30,7 @@ from .expr import (
     FUNCTIONS,
     REAL,
     STABLE,
+    VARIADIC,
     Col,
     Const,
     Op,
@@ -157,6 +159,9 @@ _BINARY = {
     "~": regex_match, "~*": lambda a, b: regex_match(a, b, True),
     "!~": lambda a, b: not regex_match(a, b), "!~*": lambda a, b: not regex_match(a, b, True),
     "DT+": temporal_plus, "DT-": temporal_minus, "IV*": interval_times, "IV/": interval_divide,
+    "->": ct.json_get, "->>": ct.json_get_text, "#>": ct.json_path, "#>>": ct.json_path_text,
+    "@>": ct.contains, "<@": lambda a, b: ct.contains(b, a), "&&": ct.overlaps, "?": ct.json_has,
+    "?|": ct.json_has_any, "?&": ct.json_has_all, "ARR||": ct.concat, "J-": ct.json_delete, "[]": ct.subscript,
 }
 
 
@@ -264,6 +269,27 @@ def _compile(e, ctx):
         return _strict(lambda v: cast(v, target), fns)
     if op in ("CONCAT", "CONCAT_WS", "GREATEST", "LEAST"):
         return _variadic(op, fns)
+    if op == "ARRAY":
+        return lambda row, outer: tuple(f(row, outer) for f in fns)
+    if op in ("ANY", "ALL"):
+        compare, every, (fv, fa) = _BINARY[e.args[2].value], op == "ALL", fns[:2]
+
+        def quantified(row, outer):
+            array = fa(row, outer)
+            return None if array is None else ct.any_compare(compare, fv(row, outer), array, every)
+        return quantified
+    if op in VARIADIC:
+        build = VARIADIC[op]
+        return lambda row, outer: build(*(f(row, outer) for f in fns))
+    if op == "GROUPING":
+        (fm,), positions, count = fns[:1], e.args[1].value, e.args[2].value
+
+        def grouping(row, outer):
+            mask, bits = fm(row, outer), 0
+            for gi in positions:
+                bits = bits << 1 | (mask >> (count - 1 - gi)) & 1
+            return bits
+        return grouping
     if op in STABLE:
         value = FUNCTIONS[op][2]()  # once per statement: every row sees the same moment
         return lambda row, outer: value
@@ -520,30 +546,75 @@ def _aggregate(plan, ctx, outer):
         return [make_accumulator(a.name, a.distinct, a.order) for a in plan.aggs]
 
     groups = {}
+    sets = plan.sets
+    width = len(group_fns)
     for row in run(plan.input, ctx, outer):
-        key = tuple(f(row, outer) for f in group_fns)
-        accs = groups.get(key)
-        if accs is None:
-            ctx.hold()
-            accs = groups[key] = accumulators()
-        for acc, (args, keep, order) in zip(accs, specs, strict=True):
-            if keep is not None and keep(row, outer) is not True:
-                continue
-            if not args:
-                value = 1  # COUNT(*) counts a non-NULL 1 per row
-            elif len(args) == 1:
-                value = args[0](row, outer)
-            else:
-                value = tuple(f(row, outer) for f in args)
-            if order:
+        full = tuple(f(row, outer) for f in group_fns)
+        for s in (sets or (None,)):
+            key = full if s is None else (s, tuple(v if i in s else None for i, v in enumerate(full)))
+            accs = groups.get(key)
+            if accs is None:
                 ctx.hold()
-                acc.add(value, [f(row, outer) for f in order])
-            else:
-                acc.add(value)
+                accs = groups[key] = accumulators()
+            _accumulate(accs, specs, row, outer, ctx)
+    if sets is not None:
+        if not groups:
+            for s in sets:  # the grand total () still has a row over no input, as in PostgreSQL
+                if not s:
+                    groups[(s, (None,) * width)] = accumulators()
+        for (s, key), accs in groups.items():
+            mask = sum(1 << (width - 1 - i) for i in range(width) if i not in s)
+            yield (*key, mask, *(acc.result() for acc in accs))
+        return
     if not groups and not plan.groups:  # aggregates over no rows still produce one row
         groups[()] = accumulators()
-    for key, accumulators in groups.items():
-        yield key + tuple(acc.result() for acc in accumulators)
+    for key, accs in groups.items():
+        yield key + tuple(acc.result() for acc in accs)
+
+
+class Args(tuple):
+    """The arguments of a multi-argument aggregate call for one row (string_agg's value and delimiter)."""
+
+
+def _accumulate(accs, specs, row, outer, ctx):
+    for acc, (args, keep, order) in zip(accs, specs, strict=True):
+        if keep is not None and keep(row, outer) is not True:
+            continue
+        if not args:
+            value = 1  # COUNT(*) counts a non-NULL 1 per row
+        elif len(args) == 1:
+            value = args[0](row, outer)
+        else:
+            value = Args(f(row, outer) for f in args)
+        if order:
+            ctx.hold()
+            acc.add(value, [f(row, outer) for f in order])
+        else:
+            acc.add(value)
+
+
+def _lateral_join(plan, ctx, outer):
+    """For each left row, run the right side with the left row as its innermost outer row."""
+    check = ctx.compile(plan.condition) if plan.condition is not None else None
+    missing = (None,) * len(plan.right.columns)
+    for left in run(plan.left, ctx, outer):
+        matched = False
+        for right in run(plan.right, ctx, (*outer, left)):
+            row = left + right
+            if check is None or check(row, outer) is True:
+                matched = True
+                yield row
+        if not matched and plan.kind == "LEFT":
+            yield left + missing
+
+
+def _function_scan(plan, ctx, outer):
+    args = [ctx.compile(a)((), outer) for a in plan.args]
+    if plan.name != "UNNEST" and any(a is None for a in args):
+        return  # a NULL argument gives no rows, as PostgreSQL's strict functions do
+    rows = ct.TABLE_FUNCTIONS[plan.name][0](*[() if a is None else a for a in args])
+    for row in rows:
+        yield tuple(row)
 
 
 def _window(plan, ctx, outer):
@@ -627,7 +698,7 @@ def sort_key(values, directions, types):
     parts = []
     for v, (desc, nulls_first), t in zip(values, directions, types, strict=True):
         if nulls_first is None:
-            nulls_first = not desc
+            nulls_first = desc  # as in PostgreSQL: NULL is larger than every value
         if v is None:
             parts.append(b"\x00" if nulls_first else b"\x02")
             continue
@@ -736,6 +807,7 @@ _RUNNERS = {
     p.OneRow: _one_row, p.TableScan: _table_scan, p.IndexScan: _index_scan, p.WorkTableScan: _work_table_scan, p.Values: _values,
     p.Filter: _filter, p.Project: _project, p.Join: _join, p.Aggregate: _aggregate, p.Window: _window,
     p.Sort: _sort, p.Limit: _limit, p.Distinct: _distinct, p.SetOp: _set_op, p.RecursiveCTE: _recursive_cte,
+    p.LateralJoin: _lateral_join, p.FunctionScan: _function_scan,
 }
 
 
@@ -749,7 +821,7 @@ def sort_items(items, key, directions):
     for j in reversed(range(len(directions))):
         desc, nulls_first = directions[j]
         if nulls_first is None:
-            nulls_first = not desc
+            nulls_first = desc  # as in PostgreSQL: NULL is larger than every value
         null_rank_high = desc == nulls_first  # NULL must sort as the largest value in this pass
 
         def pass_key(item, j=j, high=null_rank_high):
@@ -857,7 +929,7 @@ class _Accumulator:
         self.reset()
 
     def add(self, v):
-        if v is None or (type(v) is tuple and v[0] is None):  # aggregates ignore NULL inputs
+        if v is None or (type(v) is Args and v[0] is None):  # aggregates ignore NULL inputs
             return
         if self.seen is not None:
             if v in self.seen:
@@ -968,8 +1040,45 @@ class _Ordered:
         return self.inner.result()
 
 
+class _ArrayAgg(_Accumulator):
+    """array_agg and jsonb_agg keep NULL inputs, as PostgreSQL's do; no rows at all give NULL."""
+
+    def add(self, v):
+        if self.seen is not None:
+            if v in self.seen:
+                return
+            self.seen.add(v)
+        self.items.append(v)
+
+    def reset(self):
+        self.items = []
+
+    def result(self):
+        return tuple(self.items) if self.items else None
+
+
+class _JsonbAgg(_ArrayAgg):
+    def result(self):
+        return ct.build_array(*self.items) if self.items else None
+
+
+class _JsonbObjectAgg(_Accumulator):
+    def add(self, v):
+        if v[0] is None:
+            raise ExecutionError("jsonb_object_agg: a key cannot be NULL")
+        self.pairs.extend(v)
+
+    def reset(self):
+        self.pairs = []
+
+    def result(self):
+        return ct.build_object(*self.pairs) if self.pairs else None
+
+
 _ACCUMULATORS = {"COUNT": _Count, "SUM": _Sum, "AVG": _Avg, "MIN": _Min, "MAX": _Max, "STRING_AGG": _StringAgg,
-                 "BOOL_AND": _BoolAnd, "EVERY": _BoolAnd, "BOOL_OR": _BoolOr}
+                 "BOOL_AND": _BoolAnd, "EVERY": _BoolAnd, "BOOL_OR": _BoolOr, "ARRAY_AGG": _ArrayAgg,
+                 "JSONB_AGG": _JsonbAgg, "JSON_AGG": _JsonbAgg, "JSONB_OBJECT_AGG": _JsonbObjectAgg,
+                 "JSON_OBJECT_AGG": _JsonbObjectAgg}
 
 
 def make_accumulator(name, distinct, order=()):

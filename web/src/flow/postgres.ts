@@ -35,6 +35,8 @@ const ABOUT = {
   indexOnly: "Every column the query needs is in the index entries (index columns plus the primary key), so rows are built from the index alone: the table is never read.",
   hashJoin: "Builds a hash table from its second input (the Hash node), then probes it once per row of the first: linear in both inputs.",
   semi: "Hashes the second input once, then keeps each row of the first that has a match (Anti: that has none). A rewritten EXISTS / IN subquery runs as this.",
+  lateral: "Runs its right side once per row of its left side, which that side may read (LATERAL): a correlated subquery or a function over each row.",
+  function: "Calls a function that returns rows (unnest, generate_series, jsonb_each...) and streams them.",
   nested: "Pairs every row of one input with every row of the other and tests the condition: the only strategy without an equality to hash on.",
   hash: "Reads its whole input into an in-memory hash table keyed by the join columns, for the join above to probe.",
   hashAgg: "Keeps one hash-table entry per group and updates its aggregates as rows stream in.",
@@ -165,11 +167,22 @@ export function toPostgres(root: PlanNode, spilled = false): PgNode {
         if (residual) details.push(["Join Filter", strip(residual)]);
         return withSubplans(make(node, { name: `Nested Loop${JOIN_WORD[kind] ? ` ${JOIN_WORD[kind]}Join` : ""}`.trimEnd(), family: "join", relation: null, details, about: ABOUT.nested, children: [left!, right!] }), node);
       }
+      case "LateralJoin": {
+        const on = /^Nested Loop (\w+) Lateral(?: on (.*))?$/.exec(node.label);
+        const details: [string, string][] = on?.[2] ? [["Join Filter", strip(on[2])]] : [];
+        const word = on?.[1] === "Left" ? " Left Join" : "";
+        return withSubplans(make(node, { name: `Nested Loop${word} (lateral)`, family: "join", relation: null, details, about: ABOUT.lateral, children: kids() }), node);
+      }
+      case "FunctionScan": {
+        const call = node.label.replace(/^Function Scan /, "");
+        return withSubplans(make(node, { name: "Function Scan", family: "scan", relation: call.replace(/\(.*$/, ""), details: [["Function Call", call]], about: ABOUT.function, children: [] }), node);
+      }
       case "Aggregate": {
         const m = /^HashAggregate(?: group by (.*?))?(?: compute (.*))?$/.exec(node.label);
         const groups = m?.[1];
         const details: [string, string][] = [];
-        if (groups) details.push(["Group Key", groups]);
+        if (groups?.includes("(")) for (const set of groups.split("; ")) details.push(["Group Key", set === "()" ? "() (grand total)" : set.slice(1, -1)]);
+        else if (groups) details.push(["Group Key", groups]);
         if (m?.[2]) details.push(["Aggregates", m[2]]);
         return withSubplans(make(node, { name: groups ? "HashAggregate" : "Aggregate", family: "aggregate", relation: null, details, about: groups ? ABOUT.hashAgg : ABOUT.agg, children: kids() }), node);
       }

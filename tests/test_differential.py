@@ -139,14 +139,14 @@ CORPUS = [
     ("SELECT 1 + 2 * 3, 7 / 2, -7 / 2, 7 % -3, -7 % 3, 'a' || 'b', NULL + 1, 2.5 * 2", True),
     # sorting and limits
     ("SELECT id, name FROM emp ORDER BY id DESC LIMIT 5", True),
-    ("SELECT id, salary FROM emp ORDER BY salary, id LIMIT 10 OFFSET 3", True),
+    ("SELECT id, salary FROM emp ORDER BY salary NULLS FIRST, id LIMIT 10 OFFSET 3", True),
     ("SELECT id, salary FROM emp ORDER BY salary DESC NULLS FIRST, id", True),
     ("SELECT id, salary FROM emp ORDER BY salary NULLS LAST, id DESC", True),
-    ("SELECT id, dept FROM emp ORDER BY dept DESC, 1", True),
+    ("SELECT id, dept FROM emp ORDER BY dept DESC NULLS LAST, 1", True),
     ("SELECT name AS n, id FROM emp ORDER BY n, id", True),
     ("SELECT id FROM emp ORDER BY hired * -1, id", True),
     ("SELECT DISTINCT dept FROM emp", False),
-    ("SELECT DISTINCT dept, active FROM emp ORDER BY dept, active", True),
+    ("SELECT DISTINCT dept, active FROM emp ORDER BY dept NULLS FIRST, active NULLS FIRST", True),
     # aggregation
     ("SELECT count(*), count(salary), count(DISTINCT dept), sum(hired), avg(salary), min(name), max(salary) FROM emp", False),
     ("SELECT dept, count(*), sum(salary), avg(salary), min(hired), max(hired) FROM emp GROUP BY dept", False),
@@ -190,7 +190,7 @@ CORPUS = [
     ("SELECT dept FROM emp UNION ALL SELECT name FROM dept", False),
     ("SELECT dept FROM emp INTERSECT SELECT name FROM dept", False),
     ("SELECT name FROM dept EXCEPT SELECT dept FROM emp", False),
-    ("SELECT id FROM emp WHERE id < 10 UNION SELECT emp_id FROM sales WHERE day = 3 ORDER BY 1", True),
+    ("SELECT id FROM emp WHERE id < 10 UNION SELECT emp_id FROM sales WHERE day = 3 ORDER BY 1 NULLS FIRST", True),
     ("SELECT id, name FROM emp WHERE id < 5 UNION ALL SELECT id, region FROM sales WHERE id < 5 ORDER BY id, name", True),
     ("VALUES (1, 'a'), (2, NULL), (3, 'c')", False),
     # CTEs
@@ -206,8 +206,8 @@ CORPUS = [
      "SELECT a FROM fib ORDER BY k", True),
     # window functions
     ("SELECT id, row_number() OVER (ORDER BY hired, id) FROM emp", False),
-    ("SELECT id, rank() OVER (PARTITION BY dept ORDER BY salary DESC), "
-     "dense_rank() OVER (PARTITION BY dept ORDER BY salary DESC) FROM emp", False),
+    ("SELECT id, rank() OVER (PARTITION BY dept ORDER BY salary DESC NULLS LAST), "
+     "dense_rank() OVER (PARTITION BY dept ORDER BY salary DESC NULLS LAST) FROM emp", False),
     ("SELECT id, sum(amount) OVER (PARTITION BY emp_id ORDER BY day, id) FROM sales", False),
     ("SELECT id, sum(amount) OVER (ORDER BY day) FROM sales", False),
     ("SELECT id, avg(amount) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) FROM sales", False),
@@ -216,10 +216,10 @@ CORPUS = [
     ("SELECT id, first_value(name) OVER (PARTITION BY dept ORDER BY id), "
      "last_value(name) OVER (PARTITION BY dept ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM emp", False),
     ("SELECT id, min(salary) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) FROM emp", False),
-    ("SELECT id, sum(hired) OVER (ORDER BY dept RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM emp", False),
+    ("SELECT id, sum(hired) OVER (ORDER BY dept NULLS FIRST RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM emp", False),
     ("SELECT dept, sum(salary), rank() OVER (ORDER BY sum(salary) DESC) FROM emp GROUP BY dept", False),
-    ("SELECT * FROM (SELECT id, dept, rank() OVER (PARTITION BY dept ORDER BY salary DESC, id) AS r FROM emp) x WHERE r <= 2", False),
-    ("SELECT id, row_number() OVER (ORDER BY salary DESC, id) AS rn FROM emp ORDER BY rn LIMIT 5", True),
+    ("SELECT * FROM (SELECT id, dept, rank() OVER (PARTITION BY dept ORDER BY salary DESC NULLS LAST, id) AS r FROM emp) x WHERE r <= 2", False),
+    ("SELECT id, row_number() OVER (ORDER BY salary DESC NULLS LAST, id) AS rn FROM emp ORDER BY rn LIMIT 5", True),
     # shapes the optimizer rewrites: index ranges, correlated lookups, comma joins, pushdown
     ("SELECT id FROM emp WHERE id >= 40 AND id < 47", False),
     ("SELECT id FROM emp WHERE id > 115 OR id < 3", False),
@@ -250,8 +250,8 @@ CORPUS = [
      "(SELECT max(amount) FROM sales s WHERE s.emp_id = e.id AND s.region = 'north') FROM emp e", False),
     ("SELECT name FROM emp e WHERE (SELECT count(*) FROM sales s WHERE s.emp_id = e.id) = 0", False),
     ("SELECT d.name, (SELECT avg(salary) FROM emp e WHERE e.dept = d.name) FROM dept d", False),
-    ("SELECT id, amount, region FROM sales ORDER BY region DESC NULLS LAST, amount, id", True),
-    ("SELECT emp_id, day, amount FROM sales ORDER BY amount DESC, day, id LIMIT 40", True),
+    ("SELECT id, amount, region FROM sales ORDER BY region DESC NULLS LAST, amount NULLS FIRST, id", True),
+    ("SELECT emp_id, day, amount FROM sales ORDER BY amount DESC NULLS LAST, day NULLS FIRST, id LIMIT 40", True),
 ]
 
 

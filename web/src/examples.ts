@@ -50,6 +50,19 @@ SELECT DISTINCT ON (customer_id) customer_id, id AS biggest_order, amount
 FROM orders ORDER BY customer_id, amount DESC LIMIT 5;`,
   },
   {
+    label: "Arrays & JSON",
+    hint: "array_agg, unnest with LATERAL, JSONB operators, and ROLLUP subtotals",
+    sql: `SELECT c.city, array_agg(o.id ORDER BY o.amount DESC) AS orders,
+       jsonb_build_object('count', count(*), 'top', max(o.amount)) AS summary
+FROM customers c JOIN orders o ON o.customer_id = c.id
+GROUP BY ROLLUP (c.city) ORDER BY c.city;
+SELECT c.name, big.id, big.amount
+FROM customers c
+CROSS JOIN LATERAL (SELECT id, amount FROM orders o WHERE o.customer_id = c.id
+                    ORDER BY amount DESC LIMIT 2) big
+WHERE c.id <= 3;`,
+  },
+  {
     label: "Point lookup",
     hint: "One root-to-leaf path through the primary key",
     sql: "SELECT * FROM customers WHERE id = 7;",

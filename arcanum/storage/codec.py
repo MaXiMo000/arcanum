@@ -12,6 +12,9 @@ Each value is a tag byte followed by its payload:
     DATE     0x05 + 8 bytes            days since 1970-01-01, like INTEGER
     TIMESTAMP 0x06 + 8 bytes           microseconds since 1970-01-01 00:00 (UTC), like INTEGER
     NUMERIC  0x07 + class + ...        see _encode_decimal: exponent then digits, inverted when negative
+    ARRAY    0x08 + elements + 0x00    each element in this format; 0x00 sorts before any element, so a
+                                       prefix sorts first ({1,2} < {1,2,3}), as PostgreSQL orders arrays
+    JSONB    0x09 + text as TEXT       the canonical text (see values.py)
 
 A shorter tuple sorts before any longer tuple it is a prefix of. A column holds
 one type, so INTEGER and REAL values never meet at the same position.
@@ -21,7 +24,9 @@ import datetime
 import struct
 from decimal import Decimal
 
-NULL, INTEGER, REAL, TEXT, DATE, TIMESTAMP, NUMERIC = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+from ..values import Jsonb
+
+NULL, INTEGER, REAL, TEXT, DATE, TIMESTAMP, NUMERIC, ARRAY, JSONB = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09
 EPOCH = datetime.datetime(1970, 1, 1)
 _EPOCH_DAY = EPOCH.date().toordinal()
 _MICRO = datetime.timedelta(microseconds=1)
@@ -34,6 +39,11 @@ _MASK = (1 << 64) - 1
 
 def encode(values) -> bytes:
     out = bytearray()
+    _encode_into(out, values)
+    return bytes(out)
+
+
+def _encode_into(out, values):
     for v in values:
         if v is None:
             out.append(NULL)
@@ -48,8 +58,14 @@ def encode(values) -> bytes:
             out += _U64.pack((~bits & _MASK) if bits & _SIGN else bits | _SIGN)
         elif isinstance(v, str):
             out.append(TEXT)
-            out += v.encode().replace(b"\x00", b"\x00\xff")
-            out += b"\x00\x00"
+            _text_into(out, v)
+        elif isinstance(v, tuple):
+            out.append(ARRAY)
+            _encode_into(out, v)
+            out.append(0)
+        elif isinstance(v, Jsonb):
+            out.append(JSONB)
+            _text_into(out, v.text)
         elif isinstance(v, datetime.datetime):  # before date: a datetime is also a date
             out.append(TIMESTAMP)
             out += _U64.pack((v - EPOCH) // _MICRO + _SIGN)
@@ -61,45 +77,60 @@ def encode(values) -> bytes:
             out += _encode_decimal(v)
         else:
             raise TypeError(f"cannot store a value of type {type(v).__name__}")
-    return bytes(out)
+
+
+def _text_into(out, text):
+    out += text.encode().replace(b"\x00", b"\x00\xff")
+    out += b"\x00\x00"
 
 
 def decode(data: bytes) -> tuple:
     values, i = [], 0
     while i < len(data):
-        tag = data[i]
-        i += 1
-        if tag == NULL:
-            values.append(None)
-        elif tag == INTEGER:
-            values.append(_U64.unpack_from(data, i)[0] - _SIGN)
-            i += 8
-        elif tag == REAL:
-            bits = _U64.unpack_from(data, i)[0]
-            i += 8
-            values.append(_F64.unpack(_U64.pack(bits ^ _SIGN if bits & _SIGN else ~bits & _MASK))[0])
-        elif tag == TEXT:
-            text = bytearray()
-            while True:
-                end = data.index(b"\x00", i)
-                text += data[i:end]
-                i = end + 2
-                if data[end + 1] != 0xFF:
-                    break
-                text.append(0)
-            values.append(text.decode())
-        elif tag == TIMESTAMP:
-            values.append(EPOCH + (_U64.unpack_from(data, i)[0] - _SIGN) * _MICRO)
-            i += 8
-        elif tag == DATE:
-            values.append(datetime.date.fromordinal(_U64.unpack_from(data, i)[0] - _SIGN + _EPOCH_DAY))
-            i += 8
-        elif tag == NUMERIC:
-            value, i = _decode_decimal(data, i)
-            values.append(value)
-        else:
-            raise ValueError(f"corrupt value: unknown tag {tag:#04x} at byte {i - 1}")
+        value, i = _decode_one(data, i)
+        values.append(value)
     return tuple(values)
+
+
+def _decode_text(data, i):
+    text = bytearray()
+    while True:
+        end = data.index(b"\x00", i)
+        text += data[i:end]
+        i = end + 2
+        if data[end + 1] != 0xFF:
+            return text.decode(), i
+        text.append(0)
+
+
+def _decode_one(data, i):
+    tag = data[i]
+    i += 1
+    if tag == NULL:
+        return None, i
+    if tag == INTEGER:
+        return _U64.unpack_from(data, i)[0] - _SIGN, i + 8
+    if tag == REAL:
+        bits = _U64.unpack_from(data, i)[0]
+        return _F64.unpack(_U64.pack(bits ^ _SIGN if bits & _SIGN else ~bits & _MASK))[0], i + 8
+    if tag == TEXT:
+        return _decode_text(data, i)
+    if tag == TIMESTAMP:
+        return EPOCH + (_U64.unpack_from(data, i)[0] - _SIGN) * _MICRO, i + 8
+    if tag == DATE:
+        return datetime.date.fromordinal(_U64.unpack_from(data, i)[0] - _SIGN + _EPOCH_DAY), i + 8
+    if tag == NUMERIC:
+        return _decode_decimal(data, i)
+    if tag == ARRAY:
+        items = []
+        while data[i] != 0:
+            value, i = _decode_one(data, i)
+            items.append(value)
+        return tuple(items), i + 1
+    if tag == JSONB:
+        text, i = _decode_text(data, i)
+        return Jsonb.parse(text), i
+    raise ValueError(f"corrupt value: unknown tag {tag:#04x} at byte {i - 1}")
 
 
 # NUMERIC: a non-zero value is 0.d1d2d3... x 10^exponent. Byte order must match numeric order and no

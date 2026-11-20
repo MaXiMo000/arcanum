@@ -14,15 +14,26 @@ from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
 
 from ..errors import ExecutionError
+from ..values import Jsonb, array_text, parse_array
+from . import containers as ct
 from . import datetimes as dt
 from .datetimes import Interval
 
 INTEGER, REAL, TEXT, BOOLEAN, NULL = "INTEGER", "REAL", "TEXT", "BOOLEAN", "NULL"
-DECIMAL, DATE, TIMESTAMP, INTERVAL = "NUMERIC", "DATE", "TIMESTAMP", "INTERVAL"
+DECIMAL, DATE, TIMESTAMP, INTERVAL, JSONB = "NUMERIC", "DATE", "TIMESTAMP", "INTERVAL", "JSONB"
 NUMERIC = (INTEGER, REAL, DECIMAL)
 TEMPORAL = (DATE, TIMESTAMP)
 
 _INT_MIN, _INT_MAX = -(2**63), 2**63 - 1
+
+
+def is_array(t):
+    return t.endswith("[]")
+
+
+def element(t):
+    """The element type of an array type: INTEGER for INTEGER[]."""
+    return t[:-2]
 
 
 def unify(a, b):
@@ -31,6 +42,9 @@ def unify(a, b):
         return b
     if b in (NULL, a):
         return a
+    if is_array(a) and is_array(b):
+        inner = unify(element(a), element(b))
+        return inner + "[]" if inner is not None else None
     if a in NUMERIC and b in NUMERIC:
         return REAL if REAL in (a, b) else DECIMAL  # as in PostgreSQL: numeric with float8 is float8
     if a in TEMPORAL and b in TEMPORAL:
@@ -55,6 +69,13 @@ def literal_type(value):
         return DATE
     if isinstance(value, Interval):
         return INTERVAL
+    if isinstance(value, Jsonb):
+        return JSONB
+    if isinstance(value, tuple):
+        inner = NULL
+        for item in value:
+            inner = unify(inner, literal_type(item)) or inner
+        return (TEXT if inner == NULL else inner) + "[]"
     return TEXT
 
 
@@ -64,6 +85,10 @@ def assignable(source, target):
     string literals do."""
     if source in (target, NULL):
         return True
+    if is_array(target):
+        return source == TEXT or (is_array(source) and assignable(element(source), element(target)))
+    if target == JSONB:
+        return source == TEXT
     if target in (REAL, DECIMAL):
         return source in NUMERIC or (target == DECIMAL and source == TEXT)
     if target in TEMPORAL:
@@ -220,8 +245,9 @@ def column_indexes(e):
 # ---- formatting (EXPLAIN) --------------------------------------------------------
 
 _INFIX = {"AND", "OR", "=", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "||", "LIKE", "ILIKE", "~", "~*",
-          "!~", "!~*"}
-_SHOWN_AS = {"DT+": "+", "DT-": "-", "IV*": "*", "IV/": "/"}  # internal operators and the SQL they came from
+          "!~", "!~*", "->", "->>", "#>", "#>>", "@>", "<@", "&&", "?", "?|", "?&"}
+# internal operators and the SQL they came from
+_SHOWN_AS = {"DT+": "+", "DT-": "-", "IV*": "*", "IV/": "/", "ARR||": "||", "J-": "-"}
 
 
 def format_expr(e):
@@ -268,6 +294,12 @@ def format_expr(e):
         return f"{args[0]} IN ({', '.join(args[1:])})"
     if e.op == "CAST":
         return f"CAST({args[0]} AS {e.type})"
+    if e.op == "[]":
+        return f"{args[0]}[{args[1]}]"
+    if e.op == "ARRAY":
+        return f"ARRAY[{', '.join(args)}]"
+    if e.op in ("ANY", "ALL"):
+        return f"{args[0]} {e.args[2].value} {e.op} ({args[1]})"
     if e.op == "CASE":
         whens = " ".join(f"WHEN {c} THEN {r}" for c, r in zip(args[:-1:2], args[1:-1:2], strict=True))
         return f"CASE {whens} ELSE {args[-1]} END"
@@ -318,6 +350,8 @@ def to_text(v):
         return dt.format_timestamp(v)
     if isinstance(v, datetime.date):
         return v.isoformat()
+    if isinstance(v, tuple):
+        return array_text(v, to_text)
     return str(v)
 
 
@@ -342,6 +376,23 @@ def cast(v, target):
     try:
         if target == TEXT:
             return to_text(v)
+        if is_array(target):
+            inner = element(target)
+            if isinstance(v, str):
+                return parse_array(v, lambda item: cast(item, inner))
+            if isinstance(v, tuple):
+                return tuple(None if item is None else cast(item, inner) for item in v)
+            raise ValueError
+        if target == JSONB:
+            if isinstance(v, str):
+                return Jsonb.parse(v)
+            if isinstance(v, Jsonb):
+                return v
+            raise ValueError
+        if isinstance(v, Jsonb):
+            return ct.json_scalar(v, target)
+        if isinstance(v, tuple):
+            raise ValueError
         if target == DECIMAL:
             return to_decimal(v)
         if target == DATE:
@@ -571,8 +622,31 @@ def _btrim(s, chars=" "):
 
 
 # name -> (accepted argument signatures, result type or "same", implementation)
-# Signature letters: N numeric, I integer, T text, D date, S date or timestamp, V interval, A any.
+# Signature letters: N numeric, I integer, T text, D date, S date or timestamp, V interval, R an array,
+# J jsonb, B boolean, A any. Results that depend on an argument's type are worked out by the binder.
 FUNCTIONS = {
+    "ARRAY_LENGTH": (("RI",), INTEGER, ct.array_length),
+    "ARRAY_UPPER": (("RI",), INTEGER, ct.array_length),
+    "ARRAY_LOWER": (("RI",), INTEGER, lambda a, d: 1 if d == 1 and a else None),
+    "CARDINALITY": (("R",), INTEGER, len),
+    "ARRAY_APPEND": (("RA",), "same", lambda a, x: (*a, x)),
+    "ARRAY_PREPEND": (("AR",), "array", lambda x, a: (x, *a)),
+    "ARRAY_CAT": (("RR",), "same", lambda a, b: a + b),
+    "ARRAY_REMOVE": (("RA",), "same", ct.array_remove),
+    "ARRAY_POSITION": (("RA",), INTEGER, ct.array_position),
+    "ARRAY_TO_STRING": (("RT", "RTT"), TEXT, ct.array_to_string),
+    "STRING_TO_ARRAY": (("TT", "TTT"), "TEXT[]", ct.string_to_array),
+    "TO_JSONB": (("A",), JSONB, ct.to_jsonb),
+    "TO_JSON": (("A",), JSONB, ct.to_jsonb),
+    "JSONB_TYPEOF": (("J",), TEXT, ct.json_typeof),
+    "JSON_TYPEOF": (("J",), TEXT, ct.json_typeof),
+    "JSONB_ARRAY_LENGTH": (("J",), INTEGER, ct.json_array_length),
+    "JSON_ARRAY_LENGTH": (("J",), INTEGER, ct.json_array_length),
+    "JSONB_SET": (("JRJ", "JRJB"), JSONB, ct.json_set),
+    "JSONB_PRETTY": (("J",), TEXT, ct.json_pretty),
+    "JSONB_STRIP_NULLS": (("J",), JSONB, ct.json_strip_nulls),
+    "JSONB_EXTRACT_PATH": (("JR",), JSONB, ct.json_path),
+    "JSONB_EXTRACT_PATH_TEXT": (("JR",), TEXT, ct.json_path_text),
     "CEIL": (("N",), "same", _integral(ROUND_CEILING, math.ceil)),
     "CEILING": (("N",), "same", _integral(ROUND_CEILING, math.ceil)),
     "FLOOR": (("N",), "same", _integral(ROUND_FLOOR, math.floor)),
@@ -630,7 +704,11 @@ FUNCTIONS = {
     "ROUND": (("N", "NI"), REAL, _round),
 }
 
-AGGREGATES = {"COUNT", "SUM", "AVG", "MIN", "MAX", "STRING_AGG", "BOOL_AND", "BOOL_OR", "EVERY"}
+AGGREGATES = {"COUNT", "SUM", "AVG", "MIN", "MAX", "STRING_AGG", "BOOL_AND", "BOOL_OR", "EVERY", "ARRAY_AGG",
+              "JSONB_AGG", "JSON_AGG", "JSONB_OBJECT_AGG", "JSON_OBJECT_AGG"}
+# Functions that accept any number of arguments and NULLs among them.
+VARIADIC = {"JSONB_BUILD_OBJECT": ct.build_object, "JSON_BUILD_OBJECT": ct.build_object,
+            "JSONB_BUILD_ARRAY": ct.build_array, "JSON_BUILD_ARRAY": ct.build_array}
 # Functions evaluated once per statement, so every row sees the same moment (PostgreSQL fixes it per transaction).
 STABLE = {"NOW", "CURRENT_TIMESTAMP", "LOCALTIMESTAMP", "CURRENT_DATE"}
 RANKING = {"ROW_NUMBER", "RANK", "DENSE_RANK"}

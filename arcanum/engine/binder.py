@@ -21,6 +21,7 @@ from ..errors import ExecutionError, SqlError
 from ..sql import nodes as n
 from ..sql.parser import parse
 from . import plan as p
+from .containers import TABLE_FUNCTIONS
 from .executor import evaluate_constant
 from .expr import (
     AGGREGATES,
@@ -30,6 +31,7 @@ from .expr import (
     FUNCTIONS,
     INTEGER,
     INTERVAL,
+    JSONB,
     NULL,
     NUMERIC,
     RANKING,
@@ -38,6 +40,7 @@ from .expr import (
     TEMPORAL,
     TEXT,
     TIMESTAMP,
+    VARIADIC,
     WINDOW_ONLY,
     AggCall,
     Col,
@@ -53,7 +56,9 @@ from .expr import (
     column_indexes,
     conjuncts,
     contains,
+    element,
     format_expr,
+    is_array,
     literal_type,
     map_children,
     shift,
@@ -63,8 +68,10 @@ from .expr import (
 )
 
 _COMPARISONS = {"=", "!=", "<", "<=", ">", ">="}
-_SIGNATURE_TYPES = {"N": "NUMERIC", "I": INTEGER, "T": TEXT, "D": DATE, "S": "TIMESTAMP", "V": INTERVAL, "A": "ANY"}
-_SIGNATURE_ALLOWS = {"N": NUMERIC, "I": (INTEGER,), "T": (TEXT,), "D": (DATE,), "S": TEMPORAL, "V": (INTERVAL,)}
+_SIGNATURE_TYPES = {"N": "NUMERIC", "I": INTEGER, "T": TEXT, "D": DATE, "S": "TIMESTAMP", "V": INTERVAL, "A": "ANY",
+                    "R": "ARRAY", "J": JSONB, "B": BOOLEAN}
+_SIGNATURE_ALLOWS = {"N": NUMERIC, "I": (INTEGER,), "T": (TEXT,), "D": (DATE,), "S": TEMPORAL, "V": (INTERVAL,),
+                     "J": (JSONB,), "B": (BOOLEAN,)}
 _RUNTIME_CASTS = {(DATE, TIMESTAMP), (DECIMAL, REAL)}  # conversions Python needs to mix the two at run time
 _CONVERTIBLE = (DECIMAL, DATE, TIMESTAMP, INTERVAL)  # types a text literal converts to where one is expected
 _TEMPORAL_RESULTS = {  # (op, left, right) -> result type of date and time arithmetic
@@ -376,18 +383,25 @@ class Binder:
 
         exprs = [e for e, _ in items]
         order_exprs = [k for k, _, _ in order if not isinstance(k, int)]
-        if groups or having is not None or any(contains(e, AggCall) for e in exprs + order_exprs):
+        sets = None
+        if s.grouping_sets is not None:
+            sets = [tuple(sorted({s.group_by.index(g) for g in grouping_set})) for grouping_set in s.grouping_sets]
+        if (groups or sets is not None or having is not None
+                or any(contains(e, AggCall) for e in exprs + order_exprs)):
             aggs = []
 
             def rewrite(e):
-                return self.rewrite_grouped(e, groups, aggs)
+                return self.rewrite_grouped(e, groups, aggs, sets is not None)
 
             exprs = [rewrite(e) for e in exprs]
             order = [(k if isinstance(k, int) else rewrite(k), d, nf) for k, d, nf in order]
             distinct_on = [k if isinstance(k, int) else rewrite(k) for k in distinct_on]
             having = rewrite(having) if having is not None else None
-            columns = [p.Column(format_expr(e), e.type) for e in groups + aggs]
-            plan = p.Aggregate(plan, groups, aggs, columns)
+            columns = [p.Column(format_expr(e), e.type) for e in groups]
+            if sets is not None:
+                columns.append(p.Column("grouping", INTEGER))
+            columns += [p.Column(format_expr(e), e.type) for e in aggs]
+            plan = p.Aggregate(plan, groups, aggs, columns, sets)
             if having is not None:
                 plan = p.Filter(plan, having, plan.columns)
 
@@ -488,22 +502,33 @@ class Binder:
             raise self.error("aggregate and window functions are not allowed in GROUP BY", node)
         return e
 
-    def rewrite_grouped(self, e, groups, aggs):
-        """Re-express e over the Aggregate operator's output row: group values, then aggregates."""
+    def rewrite_grouped(self, e, groups, aggs, sets=False):
+        """Re-express e over the Aggregate operator's output row: group values, (with grouping sets) the
+        GROUPING() bits, then aggregates."""
         for i, g in enumerate(groups):
             if e == g:
                 return Col(i, g.type, format_expr(g))
+        if isinstance(e, Op) and e.op == "GROUPING_CALL":
+            positions = []
+            for a in e.args:
+                if a not in groups:
+                    raise self.error(f"the arguments of grouping must be GROUP BY expressions, not {format_expr(a)}")
+                positions.append(groups.index(a))
+            if not sets:
+                return Const(0, INTEGER)
+            return Op("GROUPING", (Col(len(groups), INTEGER, "grouping"), Const(tuple(positions), TEXT),
+                                   Const(len(groups), INTEGER)), INTEGER)
         if isinstance(e, AggCall):
             if any(contains(a, AggCall) or contains(a, WindowCall) for a in e.args):
                 raise self.error("aggregate function calls cannot be nested")
             if e not in aggs:
                 aggs.append(e)
-            return Col(len(groups) + aggs.index(e), e.type, format_expr(e))
+            return Col(len(groups) + sets + aggs.index(e), e.type, format_expr(e))
         if isinstance(e, Col):
             raise self.error(f"column {e.name} must appear in GROUP BY or be used in an aggregate function")
         if isinstance(e, SubqueryExpr) and e.correlated:
             raise self.error("Arcanum doesn't support correlated subqueries in grouped queries yet")
-        return map_children(e, lambda c: self.rewrite_grouped(c, groups, aggs))
+        return map_children(e, lambda c: self.rewrite_grouped(c, groups, aggs, sets))
 
     # ---- FROM ------------------------------------------------------------------------
 
@@ -524,11 +549,80 @@ class Binder:
             return plan, [Entry(alias, c.name, c.type, Col(i, c.type, c.name)) for i, c in enumerate(columns)]
         if isinstance(item, n.SubqueryRef):
             plan = self.query(self.derived_level(level), item.query)
-            return plan, [Entry(item.alias, c.name, c.type, Col(i, c.type, c.name)) for i, c in enumerate(plan.columns)]
+            return self.aliased(plan, item.alias, item.columns, item)
+        if isinstance(item, n.FunctionRef):
+            return self.function_scan(self.derived_level(level), item)
         return self.join(level, item)
+
+    def aliased(self, plan, alias, names, node):
+        """FROM entries for plan's columns under alias, renamed by AS alias (a, b, ...)."""
+        names = list(names or [])
+        if len(names) > len(plan.columns):
+            raise self.error(f"{alias} has {len(plan.columns)} columns but {len(names)} names were given", node)
+        names += [c.name for c in plan.columns[len(names):]]
+        return plan, [Entry(alias, name, c.type, Col(i, c.type, name))
+                      for i, (name, c) in enumerate(zip(names, plan.columns, strict=True))]
+
+    def function_scan(self, level, item):
+        """A set-returning function in FROM; its arguments are bound in level (which sees the FROM items
+        before it when it is the right side of a join)."""
+        if item.name not in TABLE_FUNCTIONS:
+            raise self.error(f"function {item.name.lower()} does not return rows; only unnest, generate_series, "
+                             "jsonb_each, jsonb_array_elements, ... can be used in FROM", item)
+        args = [self.plain_expr(level, a, "FROM") for a in item.args]
+        types = [a.type for a in args]
+        _, names, column_types = TABLE_FUNCTIONS[item.name]
+        if item.name == "UNNEST":
+            args = [self.coerce(a, "TEXT[]", node) if isinstance(a, Const) and a.type == TEXT else a
+                    for a, node in zip(args, item.args, strict=True)]
+            if not args or not all(is_array(a.type) or a.type == NULL for a in args):
+                raise self.error("unnest takes one or more arrays", item)
+            column_types = [element(a.type) if is_array(a.type) else TEXT for a in args]
+            names = ["unnest"] * len(args)
+        elif item.name == "GENERATE_SERIES":
+            if len(args) not in (2, 3):
+                raise self.error("generate_series takes a start, a stop and an optional step", item)
+            if all(t in (INTEGER, NULL) for t in types):
+                column_types = [INTEGER]
+            elif types[0] in TEMPORAL or types[1] in TEMPORAL:
+                args = [self.coerce(a, TIMESTAMP, node) if i < 2 else self.coerce(a, INTERVAL, node)
+                        for i, (a, node) in enumerate(zip(args, item.args, strict=True))]
+                if len(args) != 3 or args[2].type not in (INTERVAL, NULL):
+                    raise self.error("generate_series over timestamps needs an interval step", item)
+                column_types = [TIMESTAMP]
+            elif all(t in NUMERIC for t in types):
+                column_types = [DECIMAL if DECIMAL in types else REAL if REAL in types else INTEGER]
+            else:
+                raise self.error(f"generate_series({', '.join(types)}) is not supported", item)
+        else:
+            want = [JSONB] if item.name.startswith(("JSON", "JSONB")) else [TEXT, TEXT]
+            if len(args) != len(want):
+                raise self.error(f"{item.name.lower()} takes {len(want)} argument{'s' if len(want) > 1 else ''}",
+                                 item)
+            args = [self.coerce(a, t, node) for a, t, node in zip(args, want, item.args, strict=True)]
+            for a, t, node in zip(args, want, item.args, strict=True):
+                self.require(a, (t,), node, item.name.lower())
+        alias = item.alias or item.name.lower()
+        if item.alias and not item.columns and len(column_types) == 1:
+            names = [item.alias]  # unnest(tags) AS tag: the column is called tag, as in PostgreSQL
+        plan = p.FunctionScan(item.name, args, [p.Column(name, t) for name, t in zip(names, column_types,
+                                                                                      strict=True)])
+        return self.aliased(plan, alias, item.columns, item)
+
+    def lateral(self, level, item, left_entries):
+        """The right side of a join that may refer to the left side's columns (LATERAL, or a function)."""
+        left_level = Level(parent=level.parent, owner=level.owner, cte_parent=level)
+        left_level.entries = left_entries
+        sub = self.subexpr_level(left_level)
+        if isinstance(item, n.FunctionRef):
+            return self.function_scan(sub, item)
+        plan = self.query(sub, item.query)
+        return self.aliased(plan, item.alias, item.columns, item)
 
     def join(self, level, item):
         left, left_entries = self.from_item(level, item.left)
+        if isinstance(item.right, n.FunctionRef) or (isinstance(item.right, n.SubqueryRef) and item.right.lateral):
+            return self.lateral_join(level, item, left, left_entries)
         right, right_entries = self.from_item(level, item.right)
         repeated = {e.table for e in left_entries if e.table} & {e.table for e in right_entries if e.table}
         if repeated:
@@ -575,6 +669,25 @@ class Binder:
         plan = p.Join(item.kind, left, right, left_keys, right_keys, and_all(residual), left.columns + right.columns)
         return plan, entries
 
+    def lateral_join(self, level, item, left, left_entries):
+        if item.kind not in ("INNER", "LEFT", "CROSS"):
+            raise self.error(f"{item.kind} JOIN cannot be LATERAL; use an inner or left join")
+        right, right_entries = self.lateral(level, item.right, left_entries)
+        repeated = {e.table for e in left_entries if e.table} & {e.table for e in right_entries if e.table}
+        if repeated:
+            raise self.error(f"table name {sorted(repeated)[0]} appears more than once in FROM; give one an alias")
+        width = len(left.columns)
+        entries = left_entries + [replace(e, expr=shift(e.expr, width)) for e in right_entries]
+        condition = None
+        if item.using is not None:
+            raise self.error("Arcanum doesn't support USING with LATERAL yet; write ON")
+        if item.on is not None:
+            saved, level.entries = level.entries, entries
+            condition = self.condition(level, item.on, "ON")
+            level.entries = saved
+        kind = "LEFT" if item.kind == "LEFT" else "INNER"
+        return p.LateralJoin(left, right, kind, condition, left.columns + right.columns), entries
+
     # ---- expressions -----------------------------------------------------------------
 
     def condition(self, level, node, clause, aggregates=False):
@@ -615,7 +728,7 @@ class Binder:
 
     def common_type(self, a, b):
         for x, y in ((a, b), (b, a)):
-            if isinstance(x, Const) and x.type == TEXT and y.type in _CONVERTIBLE:
+            if isinstance(x, Const) and x.type == TEXT and _convertible(y.type):
                 return y.type
             if isinstance(x, Const) and x.type in NUMERIC and y.type == DECIMAL:
                 return DECIMAL  # price = 9.99: compare exactly (and keep the index usable)
@@ -625,7 +738,7 @@ class Binder:
         """e as a value of type t: constants are converted now, a few pairs at run time, the rest as they are."""
         if e.type in (t, NULL) or t == NULL:
             return e
-        if isinstance(e, Const) and ((e.type == TEXT and t in _CONVERTIBLE) or (e.type, t) in _RUNTIME_CASTS
+        if isinstance(e, Const) and ((e.type == TEXT and _convertible(t)) or (e.type, t) in _RUNTIME_CASTS
                                      or (e.type in NUMERIC and t == DECIMAL)):
             try:
                 return Const(cast(e.value, t), t)
@@ -695,12 +808,15 @@ class Binder:
         if op in _COMPARISONS:
             left, right, _ = self.comparable(left, right, node)
             return Op(op, (left, right), BOOLEAN)
+        container = self.container_operator(op, left, right, node)
+        if container is not None:
+            return container
         if op in ("~", "~*", "!~", "!~*"):
             self.require(left, (TEXT,), node.left, f"operator {op}")
             self.require(right, (TEXT,), node.right, f"operator {op}")
             return Op(op, (left, right), BOOLEAN)
         if op == "||":
-            self.require(left, (TEXT, INTEGER, REAL, DECIMAL, DATE, TIMESTAMP, INTERVAL), node, "||")
+            self.require(left, (TEXT, INTEGER, REAL, DECIMAL, DATE, TIMESTAMP, INTERVAL), node, "||")  # (arrays above)
             self.require(right, (TEXT, INTEGER, REAL, DECIMAL, DATE, TIMESTAMP, INTERVAL), node, "||")
             return Op("||", (left, right), TEXT)
         temporal = self.temporal_arithmetic(op, left, right, node)
@@ -713,6 +829,74 @@ class Binder:
         if t == NULL:
             return Op(op, (left, right), NULL)
         return Op(op, (self.coerce(left, t, node), self.coerce(right, t, node)), t)
+
+    def container_operator(self, op, left, right, node):
+        """Array and JSONB operators, or None when op is not one of them for these operands."""
+        if op in ("->", "->>", "#>", "#>>", "?", "?|", "?&") or (op == "-" and left.type == JSONB):
+            left = self.coerce(left, JSONB, node.left)
+            self.require(left, (JSONB,), node.left, f"operator {op}")
+            if op in ("#>", "#>>", "?|", "?&"):
+                right = self.coerce(right, "TEXT[]", node.right)
+                if right.type not in ("TEXT[]", NULL):
+                    raise self.error(f"operator {op} expects a text array, not {right.type}", node.right)
+            elif op == "?":
+                self.require(right, (TEXT,), node.right, "operator ?")
+            else:
+                self.require(right, (TEXT, INTEGER), node.right, f"operator {op}")
+            result = {"->": JSONB, "#>": JSONB, "->>": TEXT, "#>>": TEXT, "-": JSONB}.get(op, BOOLEAN)
+            return Op("J-" if op == "-" else op, (left, right), result)
+        if op in ("@>", "<@", "&&"):
+            t = self.common_type(left, right)
+            if t is None or not ((t == JSONB and op != "&&") or is_array(t)):
+                raise self.error(f"operator {op} does not apply to {left.type} and {right.type}", node)
+            return Op(op, (self.coerce(left, t, node.left), self.coerce(right, t, node.right)), BOOLEAN)
+        if op == "||" and (JSONB in (left.type, right.type) or is_array(left.type) or is_array(right.type)):
+            if JSONB in (left.type, right.type):
+                return Op("ARR||", (self.coerce(left, JSONB, node.left), self.coerce(right, JSONB, node.right)), JSONB)
+            if is_array(left.type) and is_array(right.type):
+                t = unify(left.type, right.type)
+            elif is_array(left.type):
+                t = left.type if unify(element(left.type), right.type) else None
+            else:
+                t = right.type if unify(left.type, element(right.type)) else None
+            if t is None:
+                raise self.error(f"operator || cannot combine {left.type} and {right.type}", node)
+            return Op("ARR||", (left, right), t)
+        return None
+
+    def _bind_Subscript(self, level, node):
+        base, index = self.expr(level, node.expr), self.expr(level, node.index)
+        if base.type == JSONB:
+            self.require(index, (TEXT, INTEGER), node.index, "a jsonb subscript")
+            return Op("->", (base, index), JSONB)
+        if not is_array(base.type):
+            raise self.error(f"cannot subscript type {base.type}: it is not an array", node.expr)
+        self.require(index, (INTEGER,), node.index, "an array subscript")
+        return Op("[]", (base, index), element(base.type))
+
+    def _bind_ArrayLiteral(self, level, node):
+        items = [self.expr(level, item) for item in node.items]
+        if not items:
+            raise self.error("cannot tell the type of an empty array; write ARRAY[]::integer[]")
+        t = NULL
+        for item in items:
+            if not (isinstance(item, Const) and item.type == TEXT and t not in (NULL, TEXT)):
+                t = unify(t, item.type)
+                if t is None:
+                    raise self.error(f"ARRAY elements mix {item.type} with other types", node)
+        if is_array(t) or t in (INTERVAL, JSONB):
+            raise self.error(f"Arcanum doesn't support arrays of {t} yet", node)
+        t = TEXT if t == NULL else t
+        return Op("ARRAY", tuple(self.coerce(item, t) for item in items), t + "[]")
+
+    def _bind_Quantified(self, level, node):
+        left, right = self.expr(level, node.left), self.expr(level, node.right)
+        if isinstance(right, Const) and right.type == TEXT:
+            right = self.coerce(right, (left.type if left.type != NULL else TEXT) + "[]", node.right)
+        if not is_array(right.type):
+            raise self.error(f"{'ALL' if node.all else 'ANY'} expects an array, not {right.type}", node.right)
+        left, _, _ = self.comparable(left, Const(None, element(right.type)), node.left)
+        return Op("ALL" if node.all else "ANY", (left, right, Const(node.op, TEXT)), BOOLEAN)
 
     def temporal_arithmetic(self, op, left, right, node):
         """Date, timestamp and interval arithmetic, or None when neither side is one of them."""
@@ -808,6 +992,10 @@ class Binder:
         return result
 
     def _bind_Cast(self, level, node):
+        if isinstance(node.expr, n.ArrayLiteral) and not node.expr.items:
+            if not is_array(node.type):
+                raise self.error(f"cannot cast an empty array to {node.type}", node)
+            return Const((), node.type)
         e = self.expr(level, node.expr)
         if node.type == INTERVAL and e.type not in (TEXT, INTERVAL, NULL):
             raise self.error(f"cannot cast {e.type} to INTERVAL", node.expr)
@@ -842,6 +1030,12 @@ class Binder:
                     raise self.error(f"{name.lower()} arguments mix incompatible types", a_node)
             args = [self.coerce(a, t, a_node) for a, a_node in zip(args, node.args, strict=True)]
             return Op("COALESCE" if name == "IFNULL" else name, tuple(args), t)
+        if name in VARIADIC:
+            return Op(name, tuple(args), JSONB)
+        if name == "GROUPING":
+            if not args:
+                raise self.error("grouping needs at least one argument", node)
+            return Op("GROUPING_CALL", tuple(args), INTEGER)
         if name in ("CONCAT", "CONCAT_WS"):
             if not args or (name == "CONCAT_WS" and len(args) < 2):
                 raise self.error(f"{name.lower()} needs {'a separator and values' if name == 'CONCAT_WS' else 'arguments'}",
@@ -858,15 +1052,33 @@ class Binder:
                 for i, (a, a_node) in enumerate(zip(args, node.args, strict=True))]
         spec = FUNCTIONS.get(name)
         if spec is None:
+            if name in TABLE_FUNCTIONS:
+                raise self.error(f"{name.lower()}() returns rows: use it in FROM, as in SELECT ... FROM "
+                                 f"{name.lower()}(...) AS t", node)
             raise self.error(f"function {name.lower()} does not exist", node)
         signatures, result, _ = spec
+        # A text literal where every signature wants jsonb or an array reads as one ('{a,b}' as a path).
+        for i, a in enumerate(args):
+            if isinstance(a, Const) and a.type == TEXT:
+                wanted = {sig[i] for sig in signatures if i < len(sig)}
+                if wanted == {"J"}:
+                    args[i] = self.coerce(a, JSONB, node.args[i])
+                elif wanted == {"R"}:
+                    args[i] = self.coerce(a, "TEXT[]", node.args[i])
         types = [a.type for a in args]
         if not any(_matches(sig, types) for sig in signatures):
             expected = " or ".join(f"{name.lower()}({', '.join(_SIGNATURE_TYPES[c] for c in sig)})" for sig in signatures)
             raise self.error(f"{name.lower()}({', '.join(types)}) does not match {expected}", node)
         if name in STABLE:
             return Op(name, (), result)
-        t = types[0] if result == "same" else result
+        types = [a.type for a in args]
+        t = types[0] if result == "same" else types[1] if result == "array" else result
+        if name in ("ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_REMOVE", "ARRAY_POSITION") and NULL not in types:
+            array, item = (types[1], types[0]) if name == "ARRAY_PREPEND" else (types[0], types[1])
+            if unify(element(array), item) is None:
+                raise self.error(f"{name.lower()}: {item} does not go in {array}", node)
+        if name == "ARRAY_CAT" and unify(types[0], types[1]) is None:
+            raise self.error(f"array_cat cannot combine {types[0]} and {types[1]}", node)
         if name in ("ROUND", "TRUNC") and types[0] == DECIMAL:
             t = DECIMAL  # exact in, exact out
         if name == "DATE_PART":
@@ -886,6 +1098,12 @@ class Binder:
             if name != "COUNT":
                 raise self.error(f"{name.lower()}(*) is not valid; only count(*) is", node)
             return AggCall("COUNT", (), False, INTEGER, order, keep)
+        if name in ("JSONB_OBJECT_AGG", "JSON_OBJECT_AGG"):
+            if len(node.args) != 2:
+                raise self.error(f"{name.lower()} takes a key and a value", node)
+            args = tuple(self.expr(level, a) for a in node.args)
+            self.require(args[0], (TEXT,), node.args[0], name.lower())
+            return AggCall(name, args, node.distinct, JSONB, order, keep)
         if name == "STRING_AGG":
             if len(node.args) != 2:
                 raise self.error("string_agg takes a value and a delimiter", node)
@@ -900,6 +1118,12 @@ class Binder:
             self.require(arg, NUMERIC, node, name.lower())
         if name in ("BOOL_AND", "BOOL_OR", "EVERY"):
             self.require(arg, (BOOLEAN,), node, name.lower())
+        if name == "ARRAY_AGG":
+            if is_array(arg.type) or arg.type in (INTERVAL, JSONB):
+                raise self.error(f"Arcanum doesn't support array_agg over {arg.type} yet", node)
+            return AggCall(name, (arg,), node.distinct, (TEXT if arg.type == NULL else arg.type) + "[]", order, keep)
+        if name in ("JSONB_AGG", "JSON_AGG"):
+            return AggCall(name, (arg,), node.distinct, JSONB, order, keep)
         t = INTEGER if name == "COUNT" else (DECIMAL if arg.type == DECIMAL else REAL) if name == "AVG" else arg.type
         return AggCall(name, (arg,), node.distinct, t, order, keep)
 
@@ -909,7 +1133,8 @@ class Binder:
             raise self.error(f"{name.lower()} is not a window function", node)
         if node.distinct:
             raise self.error("Arcanum doesn't support DISTINCT in window functions yet", node)
-        if node.order_by or node.filter is not None or name == "STRING_AGG":
+        if node.order_by or node.filter is not None or name in ("STRING_AGG", "ARRAY_AGG", "JSONB_AGG", "JSON_AGG",
+                                                                 "JSONB_OBJECT_AGG", "JSON_OBJECT_AGG"):
             raise self.error(f"Arcanum doesn't support {name.lower()} with ORDER BY, FILTER or as a window function yet",
                              node)
         partition = tuple(self.plain_expr_or_agg(level, e) for e in spec.partition_by)
@@ -966,7 +1191,13 @@ class Binder:
 def _matches(signature, types):
     if len(signature) != len(types):
         return False
-    return all(t == NULL or c == "A" or t in _SIGNATURE_ALLOWS[c] for c, t in zip(signature, types, strict=True))
+    return all(t == NULL or c == "A" or (is_array(t) if c == "R" else t in _SIGNATURE_ALLOWS[c])
+               for c, t in zip(signature, types, strict=True))
+
+
+def _convertible(t):
+    """Types a text literal converts to where one is expected, as PostgreSQL's untyped literals do."""
+    return t in _CONVERTIBLE or t == JSONB or is_array(t)
 
 
 def _from_outer(e):
