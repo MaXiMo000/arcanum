@@ -12,24 +12,31 @@ A SELECT is planned in SQL's logical order:
     -> select list (+ hidden ORDER BY keys) -> DISTINCT -> ORDER BY -> LIMIT
 """
 
+import contextlib
 import itertools
 import math
 from dataclasses import dataclass, fields, is_dataclass, replace
 
-from ..errors import SqlError
+from ..errors import ExecutionError, SqlError
 from ..sql import nodes as n
 from . import plan as p
 from .executor import evaluate_constant
 from .expr import (
     AGGREGATES,
     BOOLEAN,
+    DATE,
+    DECIMAL,
     FUNCTIONS,
     INTEGER,
+    INTERVAL,
     NULL,
     NUMERIC,
     RANKING,
     REAL,
+    STABLE,
+    TEMPORAL,
     TEXT,
+    TIMESTAMP,
     WINDOW_ONLY,
     AggCall,
     Col,
@@ -39,6 +46,7 @@ from .expr import (
     WindowCall,
     and_all,
     assignable,
+    cast,
     children,
     column_indexes,
     conjuncts,
@@ -53,7 +61,17 @@ from .expr import (
 )
 
 _COMPARISONS = {"=", "!=", "<", "<=", ">", ">="}
-_SIGNATURE_TYPES = {"N": "NUMERIC", "I": INTEGER, "T": TEXT, "A": "ANY"}
+_SIGNATURE_TYPES = {"N": "NUMERIC", "I": INTEGER, "T": TEXT, "D": DATE, "S": "TIMESTAMP", "V": INTERVAL, "A": "ANY"}
+_SIGNATURE_ALLOWS = {"N": NUMERIC, "I": (INTEGER,), "T": (TEXT,), "D": (DATE,), "S": TEMPORAL, "V": (INTERVAL,)}
+_RUNTIME_CASTS = {(DATE, TIMESTAMP), (DECIMAL, REAL)}  # conversions Python needs to mix the two at run time
+_CONVERTIBLE = (DECIMAL, DATE, TIMESTAMP, INTERVAL)  # types a text literal converts to where one is expected
+_TEMPORAL_RESULTS = {  # (op, left, right) -> result type of date and time arithmetic
+    ("+", DATE, INTEGER): DATE, ("+", INTEGER, DATE): DATE, ("-", DATE, INTEGER): DATE, ("-", DATE, DATE): INTEGER,
+    ("-", TIMESTAMP, TIMESTAMP): INTERVAL, ("-", TIMESTAMP, DATE): INTERVAL, ("-", DATE, TIMESTAMP): INTERVAL,
+    ("+", DATE, INTERVAL): TIMESTAMP, ("+", TIMESTAMP, INTERVAL): TIMESTAMP, ("+", INTERVAL, DATE): TIMESTAMP,
+    ("+", INTERVAL, TIMESTAMP): TIMESTAMP, ("-", DATE, INTERVAL): TIMESTAMP, ("-", TIMESTAMP, INTERVAL): TIMESTAMP,
+    ("+", INTERVAL, INTERVAL): INTERVAL, ("-", INTERVAL, INTERVAL): INTERVAL,
+}
 
 
 @dataclass
@@ -210,13 +228,26 @@ class Binder:
         for row in v.rows:
             if len(row) != width:
                 raise self.error("all VALUES rows must have the same number of columns")
-            bound = [self.plain_expr(level, e, "VALUES") for e in row]
-            for i, b in enumerate(bound):
-                t = unify(types[i], b.type)
-                if t is None:
-                    raise self.error(f"VALUES column {i + 1} mixes {types[i]} and {b.type}")
-                types[i] = t
-            rows.append(bound)
+            rows.append([self.plain_expr(level, e, "VALUES") for e in row])
+        for i in range(width):
+            # Text literals take the type of the rest of their column, as PostgreSQL's untyped literals do:
+            # VALUES (19.99), ('5') is a numeric column.
+            for b in rows:
+                if not _text_literal(b[i]):
+                    t = unify(types[i], b[i].type)
+                    if t is None:
+                        raise self.error(f"VALUES column {i + 1} mixes {types[i]} and {b[i].type}")
+                    types[i] = t
+            if any(_text_literal(b[i]) for b in rows):
+                if types[i] in (NULL, TEXT):
+                    types[i] = TEXT
+                else:
+                    for b in rows:
+                        if _text_literal(b[i]):
+                            try:
+                                b[i] = Const(cast(b[i].value, types[i]), types[i])
+                            except ExecutionError as error:
+                                raise self.error(f"VALUES column {i + 1}: {error}") from None
         return p.Values(rows, [p.Column(f"column{i + 1}", t) for i, t in enumerate(types)])
 
     def limit(self, plan, limit, offset):
@@ -295,6 +326,7 @@ class Binder:
             else:
                 items.append((self.expr(level, item.expr), item.alias or _default_name(item.expr)))
         groups = [self.group_key(level, g, items) for g in s.group_by]
+        distinct_on = [self.order_key(level, e, items) for e in s.distinct_on]
         having = self.condition(level, s.having, "HAVING", aggregates=True) if s.having is not None else None
         order = [(self.order_key(level, o.expr, items), o.desc, o.nulls_first) for o in order_by]
 
@@ -308,13 +340,19 @@ class Binder:
 
             exprs = [rewrite(e) for e in exprs]
             order = [(k if isinstance(k, int) else rewrite(k), d, nf) for k, d, nf in order]
+            distinct_on = [k if isinstance(k, int) else rewrite(k) for k in distinct_on]
             having = rewrite(having) if having is not None else None
             columns = [p.Column(format_expr(e), e.type) for e in groups + aggs]
             plan = p.Aggregate(plan, groups, aggs, columns)
             if having is not None:
                 plan = p.Filter(plan, having, plan.columns)
 
-        calls = []
+        first = None
+        if distinct_on:
+            on = tuple(exprs[k] if isinstance(k, int) else k for k in distinct_on)
+            by = tuple((exprs[k] if isinstance(k, int) else k, d, nf) for k, d, nf in order)
+            first = WindowCall("ROW_NUMBER", (), on, by, None, INTEGER)
+        calls = [first] if first is not None else []
         for e in exprs + [k for k, _, _ in order if not isinstance(k, int)]:
             for node in walk(e):
                 if isinstance(node, WindowCall):
@@ -328,6 +366,10 @@ class Binder:
 
             def replace_calls(e):
                 return _replace_windows(e, calls, base)
+
+            if first is not None:  # DISTINCT ON keeps the first row of each group in ORDER BY order
+                plan = p.Filter(plan, Op("=", (Col(base, INTEGER, "row_number"), Const(1, INTEGER)), BOOLEAN),
+                                plan.columns)
 
             exprs = [replace_calls(e) for e in exprs]
             order = [(k if isinstance(k, int) else replace_calls(k), d, nf) for k, d, nf in order]
@@ -512,13 +554,39 @@ class Binder:
 
     def require(self, e, allowed, node, what):
         if e.type != NULL and e.type not in allowed:
-            raise self.error(f"{what} expects {' or '.join(allowed)}, not {e.type}", node)
+            names = ", ".join(allowed[:-1]) + " or " + allowed[-1] if len(allowed) > 1 else allowed[0]
+            raise self.error(f"{what} expects {names}, not {e.type}", node)
 
     def comparable(self, a, b, node):
-        t = unify(a.type, b.type)
+        """a and b made comparable: their common type, with a text literal read as the other side's type
+        (d > '2024-01-01'), numeric literals kept exact next to NUMERIC, and dates widened to timestamps.
+        Returns (a, b, type)."""
+        t = self.common_type(a, b)
         if t is None:
             raise self.error(f"cannot compare {a.type} with {b.type}", node)
-        return t
+        return self.coerce(a, t, node), self.coerce(b, t, node), t
+
+    def common_type(self, a, b):
+        for x, y in ((a, b), (b, a)):
+            if isinstance(x, Const) and x.type == TEXT and y.type in _CONVERTIBLE:
+                return y.type
+            if isinstance(x, Const) and x.type in NUMERIC and y.type == DECIMAL:
+                return DECIMAL  # price = 9.99: compare exactly (and keep the index usable)
+        return unify(a.type, b.type)
+
+    def coerce(self, e, t, node=None):
+        """e as a value of type t: constants are converted now, a few pairs at run time, the rest as they are."""
+        if e.type in (t, NULL) or t == NULL:
+            return e
+        if isinstance(e, Const) and ((e.type == TEXT and t in _CONVERTIBLE) or (e.type, t) in _RUNTIME_CASTS
+                                     or (e.type in NUMERIC and t == DECIMAL)):
+            try:
+                return Const(cast(e.value, t), t)
+            except ExecutionError as error:
+                raise self.error(str(error), node) from None
+        if (e.type, t) in _RUNTIME_CASTS:
+            return Op("CAST", (e,), t)
+        return e
 
     def resolve(self, level, ref):
         crossed, depth, current = [], 0, level
@@ -567,7 +635,7 @@ class Binder:
         if node.op == "NOT":
             self.require(operand, (BOOLEAN,), node, "NOT")
             return Op("NOT", (operand,), BOOLEAN)
-        self.require(operand, NUMERIC, node, f"unary {node.op}")
+        self.require(operand, (*NUMERIC, INTERVAL), node, f"unary {node.op}")
         return operand if node.op == "+" else Op("NEG", (operand,), operand.type)
 
     def _bind_Binary(self, level, node):
@@ -578,34 +646,66 @@ class Binder:
             self.require(right, (BOOLEAN,), node, op)
             return Op(op, (left, right), BOOLEAN)
         if op in _COMPARISONS:
-            self.comparable(left, right, node)
+            left, right, _ = self.comparable(left, right, node)
+            return Op(op, (left, right), BOOLEAN)
+        if op in ("~", "~*", "!~", "!~*"):
+            self.require(left, (TEXT,), node.left, f"operator {op}")
+            self.require(right, (TEXT,), node.right, f"operator {op}")
             return Op(op, (left, right), BOOLEAN)
         if op == "||":
-            self.require(left, (TEXT, INTEGER, REAL), node, "||")
-            self.require(right, (TEXT, INTEGER, REAL), node, "||")
+            self.require(left, (TEXT, INTEGER, REAL, DECIMAL, DATE, TIMESTAMP, INTERVAL), node, "||")
+            self.require(right, (TEXT, INTEGER, REAL, DECIMAL, DATE, TIMESTAMP, INTERVAL), node, "||")
             return Op("||", (left, right), TEXT)
-        allowed = (INTEGER,) if op == "%" else NUMERIC
+        temporal = self.temporal_arithmetic(op, left, right, node)
+        if temporal is not None:
+            return temporal
+        allowed = (INTEGER, DECIMAL) if op == "%" else NUMERIC
         self.require(left, allowed, node, f"operator {op}")
         self.require(right, allowed, node, f"operator {op}")
+        t = self.common_type(left, right)
+        if t == NULL:
+            return Op(op, (left, right), NULL)
+        return Op(op, (self.coerce(left, t, node), self.coerce(right, t, node)), t)
+
+    def temporal_arithmetic(self, op, left, right, node):
+        """Date, timestamp and interval arithmetic, or None when neither side is one of them."""
         types = (left.type, right.type)
-        t = REAL if REAL in types else INTEGER if INTEGER in types else NULL
-        return Op(op, (left, right), t)
+        if not any(t in (DATE, TIMESTAMP, INTERVAL) for t in types):
+            return None
+        # A text literal next to a date or interval is an interval ('1 day') or, for date - '...', a date.
+        if isinstance(right, Const) and right.type == TEXT:
+            right = self.coerce(right, INTERVAL, node)
+        if isinstance(left, Const) and left.type == TEXT:
+            left = self.coerce(left, INTERVAL, node)
+        types = (left.type, right.type)
+        if op in ("*", "/") and INTERVAL in types:
+            other = right if left.type == INTERVAL else left
+            if other.type not in NUMERIC or (op == "/" and right.type == INTERVAL):
+                raise self.error(f"cannot apply {op} to {types[0]} and {types[1]}", node)
+            return Op("IV*" if op == "*" else "IV/", (left, right), INTERVAL)
+        result = _TEMPORAL_RESULTS.get((op, *types))
+        if result is None:
+            raise self.error(f"operator {op} does not apply to {types[0]} and {types[1]}", node)
+        return Op("DT+" if op == "+" else "DT-", (left, right), result)
 
     def _bind_IsNull(self, level, node):
         return Op("NOTNULL" if node.negated else "ISNULL", (self.expr(level, node.expr),), BOOLEAN)
 
     def _bind_Between(self, level, node):
         e, low, high = (self.expr(level, x) for x in (node.expr, node.low, node.high))
-        self.comparable(e, low, node.low)
-        self.comparable(e, high, node.high)
+        e, low, _ = self.comparable(e, low, node.low)
+        e, high, _ = self.comparable(e, high, node.high)
         result = Op("AND", (Op(">=", (e, low), BOOLEAN), Op("<=", (e, high), BOOLEAN)), BOOLEAN)
         return Op("NOT", (result,), BOOLEAN) if node.negated else result
 
     def _bind_InList(self, level, node):
         needle = self.expr(level, node.expr)
         items = [self.expr(level, item) for item in node.items]
+        t = needle.type
         for item, item_node in zip(items, node.items, strict=True):
-            self.comparable(needle, item, item_node)
+            t = self.comparable(Const(None, t) if t != needle.type else needle, item, item_node)[2]
+        needle = self.coerce(needle, t, node.expr)
+        items = [self.coerce(item, t, item_node) for item, item_node in zip(items, node.items, strict=True)]
         result = Op("IN", (needle, *items), BOOLEAN)
         return Op("NOT", (result,), BOOLEAN) if node.negated else result
 
@@ -614,7 +714,7 @@ class Binder:
         plan, correlated = self.subquery(level, node.query, node)
         if len(plan.columns) != 1:
             raise self.error("a subquery after IN must return exactly one column")
-        self.comparable(needle, plan.columns[0], node.expr)
+        needle = self.comparable(needle, Col(0, plan.columns[0].type), node.expr)[0]
         result = SubqueryExpr("IN", plan, BOOLEAN, needle, correlated)
         return Op("NOT", (result,), BOOLEAN) if node.negated else result
 
@@ -630,9 +730,10 @@ class Binder:
 
     def _bind_Like(self, level, node):
         e, pattern = self.expr(level, node.expr), self.expr(level, node.pattern)
-        self.require(e, (TEXT,), node.expr, "LIKE")
-        self.require(pattern, (TEXT,), node.pattern, "LIKE")
-        result = Op("LIKE", (e, pattern), BOOLEAN)
+        word = "ILIKE" if node.insensitive else "LIKE"
+        self.require(e, (TEXT,), node.expr, word)
+        self.require(pattern, (TEXT,), node.pattern, word)
+        result = Op(word, (e, pattern), BOOLEAN)
         return Op("NOT", (result,), BOOLEAN) if node.negated else result
 
     def _bind_Case(self, level, node):
@@ -641,8 +742,8 @@ class Binder:
         for when, result in node.whens:
             condition = self.expr(level, when)
             if operand is not None:
-                self.comparable(operand, condition, when)
-                condition = Op("=", (operand, condition), BOOLEAN)
+                left, right, _ = self.comparable(operand, condition, when)
+                condition = Op("=", (left, right), BOOLEAN)
             else:
                 self.require(condition, (BOOLEAN,), when, "CASE WHEN")
             value = self.expr(level, result)
@@ -650,7 +751,8 @@ class Binder:
             args += [condition, value]
         default = self.expr(level, node.else_) if node.else_ is not None else Const(None, NULL)
         t = self._unify_branch(t, default, node.else_)
-        return Op("CASE", (*args, default), t)
+        args[1::2] = [self.coerce(v, t) for v in args[1::2]]
+        return Op("CASE", (*args, self.coerce(default, t)), t)
 
     def _unify_branch(self, t, value, node):
         result = unify(t, value.type)
@@ -659,7 +761,16 @@ class Binder:
         return result
 
     def _bind_Cast(self, level, node):
-        return Op("CAST", (self.expr(level, node.expr),), node.type)
+        e = self.expr(level, node.expr)
+        if node.type == INTERVAL and e.type not in (TEXT, INTERVAL, NULL):
+            raise self.error(f"cannot cast {e.type} to INTERVAL", node.expr)
+        result = Op("CAST", (e,), node.type)
+        if isinstance(e, Const):  # constant: convert now when it can be (a bad one fails when it runs)
+            with contextlib.suppress(ExecutionError):
+                result = Const(None if e.value is None else cast(e.value, node.type), node.type)
+        if node.modifiers:  # NUMERIC(p, s): round to s digits after the point
+            result = Op("ROUND", (result, Const(node.modifiers[1], INTEGER)), DECIMAL)
+        return result
 
     def _bind_Call(self, level, node):
         name = node.name
@@ -671,21 +782,33 @@ class Binder:
             raise self.error(f"{name.lower()} requires an OVER clause", node)
         if node.star or node.distinct:
             raise self.error(f"{name.lower()}() does not accept * or DISTINCT", node)
+        if node.order_by or node.filter is not None:
+            raise self.error(f"ORDER BY and FILTER only apply to aggregate functions, not {name.lower()}", node)
         args = [self.expr(level, a) for a in node.args]
-        if name in ("COALESCE", "IFNULL"):
+        if name in ("COALESCE", "IFNULL", "GREATEST", "LEAST"):
             if not args or (name == "IFNULL" and len(args) != 2):
                 raise self.error(f"{name.lower()} needs {'two arguments' if name == 'IFNULL' else 'arguments'}", node)
             t = NULL
             for a, a_node in zip(args, node.args, strict=True):
-                t = unify(t, a.type)
+                t = unify(t, a.type) if not (isinstance(a, Const) and a.type == TEXT and t in _CONVERTIBLE) else t
                 if t is None:
                     raise self.error(f"{name.lower()} arguments mix incompatible types", a_node)
-            return Op("COALESCE", tuple(args), t)
+            args = [self.coerce(a, t, a_node) for a, a_node in zip(args, node.args, strict=True)]
+            return Op("COALESCE" if name == "IFNULL" else name, tuple(args), t)
+        if name in ("CONCAT", "CONCAT_WS"):
+            if not args or (name == "CONCAT_WS" and len(args) < 2):
+                raise self.error(f"{name.lower()} needs {'a separator and values' if name == 'CONCAT_WS' else 'arguments'}",
+                                 node)
+            return Op(name, tuple(args), TEXT)
         if name == "NULLIF":
             if len(args) != 2:
                 raise self.error("nullif needs two arguments", node)
-            self.comparable(args[0], args[1], node)
-            return Op("NULLIF", tuple(args), args[0].type)
+            a, b, _ = self.comparable(args[0], args[1], node)
+            return Op("NULLIF", (a, b), args[0].type)
+        # date_part / EXTRACT and date_trunc take a field name; a timestamp field given as text converts.
+        stamps = {"DATE_PART": (1,), "DATE_TRUNC": (1,), "TO_CHAR": (0,), "AGE": (0, 1)}.get(name, ())
+        args = [self.coerce(a, TIMESTAMP, a_node) if i in stamps and isinstance(a, Const) and a.type == TEXT else a
+                for i, (a, a_node) in enumerate(zip(args, node.args, strict=True))]
         spec = FUNCTIONS.get(name)
         if spec is None:
             raise self.error(f"function {name.lower()} does not exist", node)
@@ -694,21 +817,44 @@ class Binder:
         if not any(_matches(sig, types) for sig in signatures):
             expected = " or ".join(f"{name.lower()}({', '.join(_SIGNATURE_TYPES[c] for c in sig)})" for sig in signatures)
             raise self.error(f"{name.lower()}({', '.join(types)}) does not match {expected}", node)
-        return Op(name, tuple(args), types[0] if result == "same" else result)
+        if name in STABLE:
+            return Op(name, (), result)
+        t = types[0] if result == "same" else result
+        if name in ("ROUND", "TRUNC") and types[0] == DECIMAL:
+            t = DECIMAL  # exact in, exact out
+        if name == "DATE_PART":
+            t = _date_part_type(args[0])
+        return Op(name, tuple(args), t)
 
     def aggregate(self, level, node):
         name = node.name
+        order = tuple((self.expr(level, o.expr), o.desc, o.nulls_first) for o in node.order_by)
+        keep = self.condition(level, node.filter, "FILTER") if node.filter is not None else None
+        if any(contains(x, AggCall) for x, _, _ in order) or (keep is not None and contains(keep, AggCall)):
+            raise self.error("aggregate function calls cannot be nested", node)
+        if node.distinct and order and any(x not in [self.expr(level, a) for a in node.args] for x, _, _ in order):
+            raise self.error("in an aggregate with DISTINCT, ORDER BY expressions must appear in the argument list",
+                             node)
         if node.star:
             if name != "COUNT":
                 raise self.error(f"{name.lower()}(*) is not valid; only count(*) is", node)
-            return AggCall("COUNT", (), False, INTEGER)
+            return AggCall("COUNT", (), False, INTEGER, order, keep)
+        if name == "STRING_AGG":
+            if len(node.args) != 2:
+                raise self.error("string_agg takes a value and a delimiter", node)
+            args = tuple(self.expr(level, a) for a in node.args)
+            for a, a_node in zip(args, node.args, strict=True):
+                self.require(a, (TEXT,), a_node, "string_agg")
+            return AggCall(name, args, node.distinct, TEXT, order, keep)
         if len(node.args) != 1:
             raise self.error(f"{name.lower()} takes exactly one argument", node)
         arg = self.expr(level, node.args[0])
         if name in ("SUM", "AVG"):
             self.require(arg, NUMERIC, node, name.lower())
-        t = INTEGER if name == "COUNT" else REAL if name == "AVG" else arg.type
-        return AggCall(name, (arg,), node.distinct, t)
+        if name in ("BOOL_AND", "BOOL_OR", "EVERY"):
+            self.require(arg, (BOOLEAN,), node, name.lower())
+        t = INTEGER if name == "COUNT" else (DECIMAL if arg.type == DECIMAL else REAL) if name == "AVG" else arg.type
+        return AggCall(name, (arg,), node.distinct, t, order, keep)
 
     def window_call(self, level, node):
         name, spec = node.name, node.over
@@ -716,6 +862,9 @@ class Binder:
             raise self.error(f"{name.lower()} is not a window function", node)
         if node.distinct:
             raise self.error("Arcanum doesn't support DISTINCT in window functions yet", node)
+        if node.order_by or node.filter is not None or name == "STRING_AGG":
+            raise self.error(f"Arcanum doesn't support {name.lower()} with ORDER BY, FILTER or as a window function yet",
+                             node)
         partition = tuple(self.plain_expr_or_agg(level, e) for e in spec.partition_by)
         order = tuple((self.plain_expr_or_agg(level, o.expr), o.desc, o.nulls_first) for o in spec.order_by)
         frame = self.frame(spec.frame) if spec.frame is not None else None
@@ -770,8 +919,23 @@ class Binder:
 def _matches(signature, types):
     if len(signature) != len(types):
         return False
-    allowed = {"N": NUMERIC, "I": (INTEGER,), "T": (TEXT,)}
-    return all(t == NULL or c == "A" or t in allowed[c] for c, t in zip(signature, types, strict=True))
+    return all(t == NULL or c == "A" or t in _SIGNATURE_ALLOWS[c] for c, t in zip(signature, types, strict=True))
+
+
+def _text_literal(e):
+    return isinstance(e, Const) and e.type == TEXT
+
+
+def _date_part_type(field):
+    """EXTRACT(year ...) is a whole number; seconds and epochs have fractions."""
+    from .datetimes import FIELDS, INTEGRAL_FIELDS  # noqa: PLC0415 (only needed here)
+
+    if isinstance(field, Const) and isinstance(field.value, str):
+        name = field.value.lower()
+        if name not in FIELDS:
+            raise SqlError(f"unit {name!r} is not recognized; use one of {', '.join(sorted(FIELDS))}")
+        return INTEGER if name in INTEGRAL_FIELDS else REAL
+    return REAL
 
 
 def _replace_windows(e, calls, base):

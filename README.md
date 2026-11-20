@@ -81,23 +81,39 @@ with Database("company.db") as db:
   types and `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`; `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`
 - `INSERT ... VALUES` / `INSERT ... SELECT` with `ON CONFLICT [(columns)] DO NOTHING | DO UPDATE SET ...
   [WHERE ...]` (the proposed row as `EXCLUDED`), `UPDATE`, `DELETE`; all three with `RETURNING`
-- `SELECT` with `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... NULLS FIRST|LAST`, `LIMIT` and `OFFSET`
+- `SELECT` with `DISTINCT`, `DISTINCT ON`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... NULLS FIRST|LAST`, `LIMIT` and `OFFSET`
 - `INNER`, `LEFT`, `RIGHT`, `FULL` and `CROSS` joins, with `ON` or `USING`
 - Scalar, `IN`, `EXISTS`, correlated and `FROM` subqueries
 - `WITH` and `WITH RECURSIVE`
 - Window functions `row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`, `last_value` and
   every aggregate, with `PARTITION BY`, `ORDER BY` and `ROWS` / `RANGE` frames
 - `UNION`, `INTERSECT` and `EXCEPT`, each with or without `ALL`
-- Aggregates `count`, `sum`, `avg`, `min` and `max` (with `DISTINCT`)
-- Functions `abs`, `round`, `length`, `lower`, `upper`, `trim`, `ltrim`, `rtrim`, `replace`, `substr`,
-  `coalesce`, `ifnull` and `nullif`; `CASE`, `CAST`, `BETWEEN`, `LIKE`, `IN`, `IS [NOT] NULL` and `||`
+- Aggregates `count`, `sum`, `avg`, `min`, `max`, `string_agg`, `bool_and`, `bool_or` and `every`, with
+  `DISTINCT`, `ORDER BY` inside the call and `FILTER (WHERE ...)`
+- Dates and times:
+  - Typed literals (`DATE '2024-01-31'`, `INTERVAL '7 days'`) and `x::type` casts.
+  - `CURRENT_DATE`, `CURRENT_TIMESTAMP` and `now()`, fixed for the whole statement.
+  - Arithmetic: date ± days, date − date, timestamp ± interval, timestamp − timestamp, interval × number.
+  - `EXTRACT` / `date_part`, `date_trunc`, `age`, `to_char`, `to_date`, `to_timestamp`, `make_date`.
+- Text: `length`, `lower`, `upper`, `trim`/`ltrim`/`rtrim`/`btrim`, `replace`, `substr`, `left`, `right`,
+  `lpad`/`rpad`, `position`/`strpos`, `split_part`, `initcap`, `repeat`, `reverse`, `starts_with`, `concat`,
+  `concat_ws`, `translate`, `chr`/`ascii` and `regexp_replace`.
+- Pattern matching: `LIKE`, `ILIKE`, and the regular expression operators `~`, `~*`, `!~` and `!~*`.
+- Numbers: `abs`, `round`, `trunc`, `ceil`, `floor`, `mod`, `power`, `sqrt`, `exp`, `ln`, `log`, `sign`,
+  `pi` and `random`.
+- Other: `coalesce`, `ifnull`, `nullif`, `greatest` and `least`; `CASE`, `CAST`, `BETWEEN`, `IN`,
+  `IS [NOT] NULL` and `||`.
 - `BEGIN [ISOLATION LEVEL READ COMMITTED | REPEATABLE READ | SERIALIZABLE]`, `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]`,
   `ANALYZE [table]`
 
 ### Semantics
 
-- Types are `INTEGER`, `REAL`, `TEXT` and `BOOLEAN`, checked before a query runs: comparing a number
-  with text, or storing text in an `INTEGER` column, is an error rather than a silent conversion.
+- Types are `INTEGER`, `REAL`, `NUMERIC(p, s)`, `TEXT`, `BOOLEAN`, `DATE` and `TIMESTAMP`, with `INTERVAL`
+  in expressions. They are checked before a query runs: comparing a number with text, or storing text
+  in an `INTEGER` column, is an error rather than a silent conversion.
+- As in PostgreSQL, a text literal takes the type it is compared with or stored into
+  (`WHERE day > '2024-01-01'`). `NUMERIC` is exact decimal arithmetic. Timestamps have no time zone and
+  are read as UTC.
 - `NULL` follows SQL's three-valued logic, sorts first in ascending order and last in descending order.
 - Integer division truncates toward zero; `%` takes integers; dividing by zero and integer overflow are errors.
 - `LIKE` is case-sensitive.

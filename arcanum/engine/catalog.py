@@ -18,6 +18,7 @@ import json
 from bisect import bisect_left
 from collections import Counter
 from dataclasses import dataclass, field
+from decimal import Decimal
 from functools import cached_property
 
 from ..errors import ConstraintError, ExecutionError, LockWaitError, SerializationError, SqlError
@@ -25,7 +26,19 @@ from ..sql import nodes as n
 from ..sql.parser import parse
 from ..storage import BTree, decode, encode
 from ..storage.btree import MAX_ENTRY
-from .expr import BOOLEAN, REAL, assignable, literal_type, to_text
+from .expr import (
+    BOOLEAN,
+    DATE,
+    DECIMAL,
+    INTERVAL,
+    REAL,
+    TIMESTAMP,
+    assignable,
+    cast,
+    literal_type,
+    scale_decimal,
+    to_text,
+)
 from .mvcc import FROZEN, pack, prune, settled, unpack
 
 CATALOG_ROOT = 1
@@ -41,6 +54,9 @@ class ColumnSchema:
     not_null: bool = False
     default: object = None
     identity: str | None = None  # "ALWAYS" or "BY DEFAULT": filled from the column's sequence
+    default_expr: object = None  # a default that is an expression, such as now(): evaluated per row
+    precision: int | None = None  # NUMERIC(precision, scale)
+    scale: int | None = None
 
 
 @dataclass(eq=False)
@@ -80,6 +96,11 @@ class TableSchema:
     def booleans(self):
         """Positions of BOOLEAN columns, whose stored integers are returned as True/False."""
         return frozenset(i for i, c in enumerate(self.columns) if c.type == BOOLEAN)
+
+    @cached_property
+    def scales(self):
+        """{position: scale} of NUMERIC(p, s) columns: stored values lose trailing zeros, reads restore them."""
+        return {i: c.scale for i, c in enumerate(self.columns) if c.scale is not None}
 
     def column(self, name):
         for i, c in enumerate(self.columns):
@@ -170,7 +191,7 @@ class Catalog:
                 table.indexes.append(index)
                 self.indexes[name] = index
             elif kind == "stats":
-                stats.setdefault(name, {})[root] = json.loads(sql)  # root holds the column (-1 = row count)
+                stats.setdefault(name, {})[root] = json.loads(sql, object_hook=_stat_value)  # root: column, -1: rows
         for name, parts in stats.items():
             table = self.tables[name]
             table.stats = TableStats(parts[-1]["rows"], [ColumnStats(**parts[i]) for i in range(len(table.columns))])
@@ -346,7 +367,8 @@ class Catalog:
         parts = [(-1, {"rows": len(rows)})] + [(i, vars(c)) for i, c in enumerate(columns)]
         for column, data in parts:
             self.tree.insert(encode((table.name, "stats", column)),
-                             encode(("stats", table.name, json.dumps(data), column)), replace=True)
+                             encode(("stats", table.name, json.dumps(data, default=_stat_json), column)),
+                             replace=True)
 
     # ---- rows: chains of versions (see mvcc.py) ------------------------------------------------
 
@@ -438,10 +460,14 @@ class Catalog:
     def _typed(self, table, row):
         if table.booleans:
             row = tuple(bool(v) if v is not None and i in table.booleans else v for i, v in enumerate(row))
+        if table.scales:
+            row = tuple(v.quantize(Decimal(1).scaleb(-table.scales[i])) if v is not None and i in table.scales else v
+                        for i, v in enumerate(row))
         return row
 
     def check_row(self, table, row):
-        """Apply NOT NULL and store REAL columns as floats. Returns the row to store."""
+        """Apply NOT NULL and convert values to their column's type (REAL to floats, text to dates and
+        numerics, NUMERIC(p, s) rounded to s digits). Returns the row to store."""
         out = []
         for column, value in zip(table.columns, row, strict=True):
             if value is None:
@@ -449,6 +475,10 @@ class Catalog:
                     raise ConstraintError(f"NULL value in column {column.name} of table {table.name} violates NOT NULL")
             elif column.type == REAL and not isinstance(value, float):
                 value = float(value)
+            elif column.type in (DECIMAL, DATE, TIMESTAMP) and literal_type(value) != column.type:
+                value = cast(value, column.type)
+            if value is not None and column.scale is not None:
+                value = scale_decimal(value, column.scale, column.precision)
             out.append(value)
         return tuple(out)
 
@@ -708,18 +738,21 @@ def _table_from_ast(stmt, root, sql):
     for c in stmt.columns:
         if any(existing.name == c.name for existing in columns):
             raise SqlError(f"column {c.name} is defined twice in table {stmt.name}")
-        default = None
-        if c.default is not None:
-            if not isinstance(c.default, n.Literal):
-                raise SqlError(f"the default of column {c.name} must be a constant")
+        if c.type == INTERVAL:
+            raise SqlError(f"column {c.name}: Arcanum can't store INTERVAL columns yet; INTERVAL works in expressions")
+        default, default_expr = None, None
+        if isinstance(c.default, n.Literal):
             default = c.default.value
             if not assignable(literal_type(default), c.type):
                 raise SqlError(f"default {_show(default)} does not fit column {c.name} of type {c.type}")
             if c.type == REAL and default is not None:
                 default = float(default)
+        elif c.default is not None:
+            default_expr = c.default  # bound when the table is created, evaluated for each row
         if c.identity and c.default is not None:
             raise SqlError(f"both default and identity specified for column {c.name} of table {stmt.name}")
-        columns.append(ColumnSchema(c.name, c.type, c.not_null, default, c.identity))
+        precision, scale = c.modifiers if c.modifiers else (None, None)
+        columns.append(ColumnSchema(c.name, c.type, c.not_null, default, c.identity, default_expr, precision, scale))
     table = TableSchema(stmt.name, columns, [], root, sql)
     names = set()
     for i, check in enumerate(stmt.checks):
@@ -758,3 +791,12 @@ def _check_size(size, what):
 
 def _show(value):
     return "NULL" if value is None else to_text(value)
+
+
+def _stat_json(value):
+    """Statistics hold column values; those JSON cannot carry (dates, numerics) travel in the value codec."""
+    return {"$": encode((value,)).hex()}
+
+
+def _stat_value(obj):
+    return decode(bytes.fromhex(obj["$"]))[0] if set(obj) == {"$"} else obj

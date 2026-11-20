@@ -20,7 +20,12 @@ TYPES = {
     "REAL": "REAL", "FLOAT": "REAL", "DOUBLE": "REAL",
     "TEXT": "TEXT", "VARCHAR": "TEXT", "CHAR": "TEXT",
     "BOOLEAN": "BOOLEAN", "BOOL": "BOOLEAN",
+    "NUMERIC": "NUMERIC", "DECIMAL": "NUMERIC",
+    "DATE": "DATE", "TIMESTAMP": "TIMESTAMP", "TIMESTAMPTZ": "TIMESTAMP", "INTERVAL": "INTERVAL",
 }
+# Words that are values without parentheses, as in standard SQL.
+_NILADIC = ("CURRENT_DATE", "CURRENT_TIMESTAMP", "LOCALTIMESTAMP")
+_TYPED_LITERALS = ("DATE", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL", "NUMERIC", "DECIMAL")
 
 _QUERY_START = ("SELECT", "WITH", "VALUES")
 _COMPARISONS = ("=", "!=", "<>", "<", "<=", ">", ">=")
@@ -366,7 +371,8 @@ class _Parser:
             self.advance()
             column = n.ColumnDef(name, "INTEGER", not_null=True, identity="BY DEFAULT")
         else:
-            column = n.ColumnDef(name, self.type_name())
+            type_, modifiers = self.type_with_modifiers()
+            column = n.ColumnDef(name, type_, modifiers=modifiers)
         is_pk = False
         while True:
             constraint = self.ident("a constraint name") if self.accept_kw("CONSTRAINT") else None
@@ -401,15 +407,35 @@ class _Parser:
                 return column, is_pk
 
     def type_name(self):
+        return self.type_with_modifiers()[0]
+
+    def type_with_modifiers(self):
+        """A type name and its numbers: NUMERIC(10, 2) is ("NUMERIC", (10, 2)). VARCHAR(255) and TIMESTAMP(3)
+        accept a size, which is ignored."""
         tok = self.tok
         if tok.kind != WORD or tok.value.upper() not in TYPES:
-            supported = "INTEGER, REAL, TEXT and BOOLEAN"
+            supported = "INTEGER, REAL, NUMERIC, TEXT, BOOLEAN, DATE, TIMESTAMP and INTERVAL"
             raise self.error(f"expected a type ({supported}), got {self.describe()}")
         self.advance()
-        if self.accept_op("("):  # VARCHAR(255) and similar: the size is accepted and ignored
-            self.comma_list(self.expect_int)
+        word = tok.value.upper()
+        if word == "DOUBLE":
+            self.accept_kw("PRECISION")
+        if word in ("CHAR", "CHARACTER"):
+            self.accept_kw("VARYING")
+        modifiers = ()
+        if self.accept_op("("):
+            modifiers = tuple(self.comma_list(self.expect_int))
             self.expect_op(")")
-        return TYPES[tok.value.upper()]
+        if word == "TIMESTAMP" and self.accept_kw("WITH", "WITHOUT"):
+            self.expect_kw("TIME")
+            self.expect_kw("ZONE")
+        type_ = TYPES[word]
+        if type_ == "NUMERIC" and modifiers:
+            precision, scale = (*modifiers, 0)[:2]
+            if len(modifiers) > 2 or not 1 <= precision <= 1000 or not 0 <= scale <= precision:
+                raise self.error(f"NUMERIC({', '.join(map(str, modifiers))}) is not a valid precision and scale", tok)
+            return type_, (precision, scale)
+        return type_, ()
 
     def expect_int(self):
         if self.tok.kind != INT:
@@ -505,6 +531,11 @@ class _Parser:
     def select(self):
         self.expect_kw("SELECT")
         distinct = self.accept_kw("DISTINCT", "ALL") == "DISTINCT"
+        distinct_on = []
+        if distinct and self.accept_kw("ON"):
+            self.expect_op("(")
+            distinct_on = self.comma_list(self.expr)
+            self.expect_op(")")
         columns = self.comma_list(self.select_item)
         from_ = self.from_clause() if self.accept_kw("FROM") else None
         where = self.expr() if self.accept_kw("WHERE") else None
@@ -515,7 +546,7 @@ class _Parser:
         having = self.expr() if self.accept_kw("HAVING") else None
         if self.is_kw("WINDOW"):
             raise self.unsupported("named windows")
-        return n.Select(columns, from_, where, group_by, having, distinct)
+        return n.Select(columns, from_, where, group_by, having, distinct and not distinct_on, distinct_on)
 
     def select_item(self):
         if self.accept_op("*"):
@@ -633,7 +664,7 @@ class _Parser:
     def comparison(self):
         left = self.concat()
         while True:
-            if op := self.accept_op(*_COMPARISONS):
+            if op := self.accept_op(*_COMPARISONS, "~", "~*", "!~", "!~*"):
                 pos = self.prev_pos
                 left = n.Binary("!=" if op == "<>" else op, left, self.concat(), pos)
             elif self.accept_kw("IS"):
@@ -641,7 +672,7 @@ class _Parser:
                 self.expect_kw("NULL")
                 left = n.IsNull(left, negated)
             else:
-                negated = self.is_kw("NOT") and self.is_kw("IN", "BETWEEN", "LIKE", tok=self.peek())
+                negated = self.is_kw("NOT") and self.is_kw("IN", "BETWEEN", "LIKE", "ILIKE", tok=self.peek())
                 if negated:
                     self.advance()
                 if self.accept_kw("IN"):
@@ -650,8 +681,8 @@ class _Parser:
                     low = self.concat()
                     self.expect_kw("AND")
                     left = n.Between(left, low, self.concat(), negated)
-                elif self.accept_kw("LIKE"):
-                    left = n.Like(left, self.concat(), negated)
+                elif word := self.accept_kw("LIKE", "ILIKE"):
+                    left = n.Like(left, self.concat(), negated, word == "ILIKE")
                 else:
                     return left
 
@@ -697,7 +728,11 @@ class _Parser:
             if op == "-" and isinstance(operand, n.Literal) and type(operand.value) in (int, float):
                 return n.Literal(-operand.value)  # so -9223372036854775808 stays in range
             return n.Unary(op, operand, pos)
-        return self.primary()
+        expr = self.primary()
+        while self.accept_op("::"):  # PostgreSQL's cast: x::date
+            type_, modifiers = self.type_with_modifiers()
+            expr = n.Cast(expr, type_, modifiers)
+        return expr
 
     def primary(self):
         tok = self.tok
@@ -718,6 +753,13 @@ class _Parser:
             expr = self.expr()
             self.expect_op(")")
             return expr
+        if tok.kind == WORD and tok.value.upper() in _TYPED_LITERALS and self.peek().kind == STRING:
+            self.advance()  # DATE '2024-01-31', INTERVAL '7 days': a string read as that type
+            return n.Cast(n.Literal(self.advance().value), TYPES[tok.value.upper()])
+        if tok.kind == WORD and tok.value.upper() in _NILADIC and not (self.peek().kind == OP
+                                                                       and self.peek().value == "("):
+            self.advance()
+            return n.Call(tok.value.upper(), pos=tok.pos)
         word = self.accept_kw("NULL", "TRUE", "FALSE", "CASE", "CAST", "EXISTS")
         if word in ("NULL", "TRUE", "FALSE"):
             return n.Literal({"NULL": None, "TRUE": True, "FALSE": False}[word])
@@ -727,15 +769,16 @@ class _Parser:
             self.expect_op("(")
             expr = self.expr()
             self.expect_kw("AS")
-            type_ = self.type_name()
+            type_, modifiers = self.type_with_modifiers()
             self.expect_op(")")
-            return n.Cast(expr, type_)
+            return n.Cast(expr, type_, modifiers)
         if word == "EXISTS":
             self.expect_op("(")
             query = self.query()
             self.expect_op(")")
             return n.Exists(query)
-        if tok.kind == WORD and self.is_name() and self.peek().kind == OP and self.peek().value == "(":
+        if (tok.kind == WORD and (self.is_name() or tok.value.upper() in ("LEFT", "RIGHT"))
+                and self.peek().kind == OP and self.peek().value == "("):
             return self.call(self.advance().value.upper(), tok.pos)
         if self.is_name():
             name = self.ident()
@@ -760,12 +803,29 @@ class _Parser:
     def call(self, name, pos):
         self.expect_op("(")
         call = n.Call(name, pos=pos)
-        if self.accept_op("*"):
+        if name == "EXTRACT":  # EXTRACT(field FROM value) is date_part('field', value)
+            field = self.advance()
+            if field.kind not in (WORD, STRING):
+                raise self.error(f"expected a field such as YEAR, got {self.describe(field)}", field)
+            self.expect_kw("FROM")
+            call = n.Call("DATE_PART", [n.Literal(field.value.lower()), self.expr()], pos=pos)
+        elif name == "POSITION":  # POSITION(sub IN text) is strpos(text, sub)
+            sub = self.concat()
+            self.expect_kw("IN")
+            call = n.Call("STRPOS", [self.concat(), sub], pos=pos)
+        elif self.accept_op("*"):
             call.star = True
         elif not self.is_op(")"):
             call.distinct = self.accept_kw("DISTINCT", "ALL") == "DISTINCT"
             call.args = self.comma_list(self.expr)
+            if self.accept_kw("ORDER"):
+                call.order_by = self.order_by()
         self.expect_op(")")
+        if self.accept_kw("FILTER"):
+            self.expect_op("(")
+            self.expect_kw("WHERE")
+            call.filter = self.expr()
+            self.expect_op(")")
         if self.accept_kw("OVER"):
             call.over = self.window_spec()
         return call

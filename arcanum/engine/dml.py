@@ -24,7 +24,7 @@ from collections import Counter
 from ..errors import ConstraintError, SqlError
 from ..sql import nodes as n
 from ..storage import encode
-from .binder import Entry, _default_name
+from .binder import Entry, Level, _default_name
 from .executor import run
 from .expr import Col, SubqueryExpr, assignable, contains, to_text
 
@@ -63,6 +63,7 @@ class Writer:
             self.ctx.hold()
             rows.append(values)  # read every source row first: INSERT ... SELECT never sees its own rows
         generated = [i for i, c in enumerate(table.columns) if c.identity and i not in positions]
+        computed = [(i, f) for i, f in self.defaults(table) if i not in positions]
         written, out, touched = [], [], set()
         for values in rows:
             row = [c.default for c in table.columns]
@@ -70,6 +71,8 @@ class Writer:
                 row[pos] = value
             for pos in generated:
                 row[pos] = self.next_value(table, pos)
+            for pos, f in computed:
+                row[pos] = f((), ())
             row = self.catalog.check_row(table, row)
             self.check(table, row)
             hit = self.conflicting(table, row, conflict) if conflict else None
@@ -242,6 +245,25 @@ class Writer:
         value = self.catalog.nextval(table, pos)
         self.sequences.setdefault((table.name, table.columns[pos].name), [value, value])[1] = value
         return value
+
+    def validate(self, table):
+        """Bind a new table's CHECK constraints and default expressions, so mistakes fail its CREATE TABLE."""
+        self.checks(table)
+        self.defaults(table)
+
+    def defaults(self, table):
+        """[(position, compiled default)] for columns whose default is an expression, such as now()."""
+        out = []
+        for i, column in enumerate(table.columns):
+            if column.default_expr is None:
+                continue
+            e = self.binder.plain_expr(Level(), column.default_expr, "DEFAULT")
+            if contains(e, SubqueryExpr):
+                raise self.binder.error(f"the default of column {column.name} cannot use a subquery")
+            if not assignable(e.type, column.type):
+                raise self.binder.error(f"the default of column {column.name} is {e.type}, not {column.type}")
+            out.append((i, self.ctx.compile(e)))
+        return out
 
     def checks(self, table):
         compiled = self._checks.get(table.name)

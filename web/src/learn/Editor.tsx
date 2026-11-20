@@ -7,9 +7,13 @@ const KEYWORDS = `SELECT FROM WHERE GROUP BY HAVING ORDER LIMIT OFFSET JOIN LEFT
 AS AND OR NOT NULL IS IN EXISTS BETWEEN LIKE DISTINCT UNION ALL INTERSECT EXCEPT WITH RECURSIVE CASE WHEN THEN
 ELSE END ASC DESC NULLS FIRST LAST INSERT INTO VALUES UPDATE SET DELETE CREATE TABLE INDEX UNIQUE PRIMARY KEY
 DROP IF DEFAULT BEGIN COMMIT ROLLBACK EXPLAIN ANALYZE OVER PARTITION ROWS RANGE PRECEDING FOLLOWING CURRENT ROW
-UNBOUNDED TRUE FALSE CAST INTEGER REAL TEXT BOOLEAN`.split(/\s+/);
+UNBOUNDED TRUE FALSE CAST INTEGER REAL TEXT BOOLEAN NUMERIC DECIMAL DATE TIMESTAMP INTERVAL SERIAL ILIKE
+CHECK CONSTRAINT FOREIGN REFERENCES CASCADE RESTRICT RETURNING CONFLICT DO NOTHING EXCLUDED GENERATED ALWAYS
+IDENTITY FILTER EXTRACT CURRENT_DATE CURRENT_TIMESTAMP ISOLATION LEVEL SERIALIZABLE REPEATABLE READ COMMITTED`.split(/\s+/);
 const FUNCTIONS = `count sum avg min max abs length lower upper trim ltrim rtrim replace substr round coalesce ifnull
-nullif row_number rank dense_rank lag lead first_value last_value`.split(/\s+/);
+nullif row_number rank dense_rank lag lead first_value last_value string_agg bool_and bool_or now date_trunc
+date_part to_char to_date to_timestamp make_date age concat concat_ws greatest least left right lpad rpad strpos
+split_part initcap repeat reverse starts_with regexp_replace ceil floor trunc mod power sqrt sign`.split(/\s+/);
 const KEYWORD_SET = new Set(KEYWORDS);
 const MAX_SUGGESTIONS = 6;
 const INDENT = "  ";

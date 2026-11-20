@@ -79,6 +79,7 @@ class Like:
     expr: object
     pattern: object
     negated: bool = False
+    insensitive: bool = False  # ILIKE
 
 
 @dataclass(slots=True)
@@ -103,6 +104,7 @@ class Case:
 class Cast:
     expr: object
     type: str
+    modifiers: tuple = ()  # NUMERIC(precision, scale)
 
 
 @dataclass(slots=True)
@@ -133,6 +135,8 @@ class Call:
     star: bool = False  # COUNT(*)
     over: WindowSpec | None = None
     pos: int | None = field(default=None, compare=False, repr=False)  # offset in the SQL text
+    order_by: list = field(default_factory=list)  # string_agg(x, ',' ORDER BY y)
+    filter: object = None  # count(*) FILTER (WHERE ...)
 
 
 # ---- queries -------------------------------------------------------------------
@@ -181,6 +185,7 @@ class Select:
     group_by: list = field(default_factory=list)
     having: object = None
     distinct: bool = False
+    distinct_on: list = field(default_factory=list)  # DISTINCT ON (exprs)
 
 
 @dataclass(slots=True)
@@ -248,6 +253,7 @@ class ColumnDef:
     unique: bool = False
     default: object = None
     identity: str | None = None  # "ALWAYS" or "BY DEFAULT" (SERIAL types are BY DEFAULT)
+    modifiers: tuple = ()  # NUMERIC(precision, scale)
 
 
 @dataclass(slots=True)

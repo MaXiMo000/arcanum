@@ -18,14 +18,17 @@ import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass
+from decimal import Decimal
 
 from ..errors import ExecutionError
 from ..storage import decode, encode
 from . import plan as p
 from .expr import (
     BOOLEAN,
+    DECIMAL,
     FUNCTIONS,
     REAL,
+    STABLE,
     Col,
     Const,
     Op,
@@ -34,8 +37,14 @@ from .expr import (
     cast,
     check_int,
     divide,
+    interval_divide,
+    interval_times,
     like,
     modulo,
+    regex_match,
+    temporal_minus,
+    temporal_plus,
+    to_decimal,
     to_text,
 )
 
@@ -144,7 +153,32 @@ _BINARY = {
     "=": operator.eq, "!=": operator.ne, "<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge,
     "+": lambda a, b: check_int(a + b), "-": lambda a, b: check_int(a - b), "*": lambda a, b: check_int(a * b),
     "/": divide, "%": modulo, "||": lambda a, b: to_text(a) + to_text(b), "LIKE": like,
+    "ILIKE": lambda a, b: like(a.lower(), b.lower()),
+    "~": regex_match, "~*": lambda a, b: regex_match(a, b, True),
+    "!~": lambda a, b: not regex_match(a, b), "!~*": lambda a, b: not regex_match(a, b, True),
+    "DT+": temporal_plus, "DT-": temporal_minus, "IV*": interval_times, "IV/": interval_divide,
 }
+
+
+def _variadic(op, fns):
+    """CONCAT, CONCAT_WS, GREATEST and LEAST, which skip NULL arguments instead of returning NULL."""
+    if op == "CONCAT":
+        return lambda row, outer: "".join(to_text(v) for f in fns if (v := f(row, outer)) is not None)
+    if op == "CONCAT_WS":
+        first, rest = fns[0], fns[1:]
+
+        def concat_ws(row, outer):
+            sep = first(row, outer)
+            if sep is None:
+                return None
+            return to_text(sep).join(to_text(v) for f in rest if (v := f(row, outer)) is not None)
+        return concat_ws
+    pick = max if op == "GREATEST" else min
+
+    def extreme(row, outer):
+        values = [v for f in fns if (v := f(row, outer)) is not None]
+        return pick(values) if values else None
+    return extreme
 
 
 def _compile(e, ctx):
@@ -228,6 +262,11 @@ def _compile(e, ctx):
     if op == "CAST":
         target = e.type
         return _strict(lambda v: cast(v, target), fns)
+    if op in ("CONCAT", "CONCAT_WS", "GREATEST", "LEAST"):
+        return _variadic(op, fns)
+    if op in STABLE:
+        value = FUNCTIONS[op][2]()  # once per statement: every row sees the same moment
+        return lambda row, outer: value
     if op in _BINARY:
         return _strict(_BINARY[op], fns)
     return _strict(FUNCTIONS[op][2], fns)
@@ -471,18 +510,38 @@ def _join(plan, ctx, outer):
 
 def _aggregate(plan, ctx, outer):
     group_fns = [ctx.compile(g) for g in plan.groups]
-    arg_fns = [ctx.compile(a.args[0]) if a.args else None for a in plan.aggs]
+    specs = []  # per aggregate: argument functions, FILTER function, ORDER BY functions
+    for a in plan.aggs:
+        args = [ctx.compile(x) for x in a.args]
+        specs.append((args, ctx.compile(a.filter) if a.filter is not None else None,
+                      [ctx.compile(x) for x, _, _ in a.order]))
+
+    def accumulators():
+        return [make_accumulator(a.name, a.distinct, a.order) for a in plan.aggs]
+
     groups = {}
     for row in run(plan.input, ctx, outer):
         key = tuple(f(row, outer) for f in group_fns)
-        accumulators = groups.get(key)
-        if accumulators is None:
+        accs = groups.get(key)
+        if accs is None:
             ctx.hold()
-            accumulators = groups[key] = [make_accumulator(a.name, a.distinct) for a in plan.aggs]
-        for acc, f in zip(accumulators, arg_fns, strict=True):
-            acc.add(f(row, outer) if f is not None else 1)  # COUNT(*) counts a non-NULL 1 per row
+            accs = groups[key] = accumulators()
+        for acc, (args, keep, order) in zip(accs, specs, strict=True):
+            if keep is not None and keep(row, outer) is not True:
+                continue
+            if not args:
+                value = 1  # COUNT(*) counts a non-NULL 1 per row
+            elif len(args) == 1:
+                value = args[0](row, outer)
+            else:
+                value = tuple(f(row, outer) for f in args)
+            if order:
+                ctx.hold()
+                acc.add(value, [f(row, outer) for f in order])
+            else:
+                acc.add(value)
     if not groups and not plan.groups:  # aggregates over no rows still produce one row
-        groups[()] = [make_accumulator(a.name, a.distinct) for a in plan.aggs]
+        groups[()] = accumulators()
     for key, accumulators in groups.items():
         yield key + tuple(acc.result() for acc in accumulators)
 
@@ -574,6 +633,8 @@ def sort_key(values, directions, types):
             continue
         if t == REAL and not isinstance(v, float):
             v = float(v)  # an INTEGER branch of a REAL expression must sort among the floats
+        elif t == DECIMAL and not isinstance(v, Decimal):
+            v = to_decimal(v)
         encoded = encode((v,))
         parts.append(b"\x01" + (encoded.translate(_INVERT) if desc else encoded))
     return b"".join(parts)
@@ -796,7 +857,7 @@ class _Accumulator:
         self.reset()
 
     def add(self, v):
-        if v is None:  # aggregates ignore NULL inputs
+        if v is None or (type(v) is tuple and v[0] is None):  # aggregates ignore NULL inputs
             return
         if self.seen is not None:
             if v in self.seen:
@@ -857,8 +918,60 @@ class _Max(_Min):
             self.value = v
 
 
-_ACCUMULATORS = {"COUNT": _Count, "SUM": _Sum, "AVG": _Avg, "MIN": _Min, "MAX": _Max}
+class _StringAgg(_Accumulator):
+    """string_agg(value, delimiter): the values joined, each after the first preceded by its delimiter."""
+
+    def reset(self):
+        self.parts = []
+
+    def step(self, v):
+        value, delimiter = v
+        if self.parts:
+            self.parts.append(delimiter or "")
+        self.parts.append(value)
+
+    def result(self):
+        return "".join(self.parts) if self.parts else None
 
 
-def make_accumulator(name, distinct):
-    return _ACCUMULATORS[name](distinct)
+class _BoolAnd(_Accumulator):
+    def reset(self):
+        self.value = None
+
+    def step(self, v):
+        self.value = v if self.value is None else self.value and v
+
+    def result(self):
+        return self.value
+
+
+class _BoolOr(_BoolAnd):
+    def step(self, v):
+        self.value = v if self.value is None else self.value or v
+
+
+class _Ordered:
+    """An aggregate with ORDER BY inside its call: buffers its inputs, then feeds them in that order."""
+
+    def __init__(self, inner, order):
+        self.inner = inner
+        self.directions = [(desc, nulls_first) for _, desc, nulls_first in order]
+        self.types = [x.type for x, _, _ in order]
+        self.rows = []
+
+    def add(self, v, keys):
+        self.rows.append((sort_key(keys, self.directions, self.types), len(self.rows), v))
+
+    def result(self):
+        for _, _, v in sorted(self.rows, key=operator.itemgetter(0, 1)):
+            self.inner.add(v)
+        return self.inner.result()
+
+
+_ACCUMULATORS = {"COUNT": _Count, "SUM": _Sum, "AVG": _Avg, "MIN": _Min, "MAX": _Max, "STRING_AGG": _StringAgg,
+                 "BOOL_AND": _BoolAnd, "EVERY": _BoolAnd, "BOOL_OR": _BoolOr}
+
+
+def make_accumulator(name, distinct, order=()):
+    accumulator = _ACCUMULATORS[name](distinct)
+    return _Ordered(accumulator, order) if order else accumulator

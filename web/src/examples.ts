@@ -39,6 +39,17 @@ INSERT INTO order_tags SELECT o.id, t.id FROM orders o, tags t WHERE o.id <= 3 O
 DELETE FROM tags WHERE name = 'rush' RETURNING *;`,
   },
   {
+    label: "Dates & numerics",
+    hint: "DATE, NUMERIC, date_trunc, FILTER, string_agg ORDER BY and DISTINCT ON",
+    sql: `SELECT date_trunc('week', DATE '2024-03-01' + id % 30) AS week,
+       count(*) FILTER (WHERE amount > 300) AS big,
+       sum(amount::numeric(12, 2)) AS total,
+       string_agg(DISTINCT status, ', ' ORDER BY status) AS statuses
+FROM orders GROUP BY 1 ORDER BY 1 LIMIT 5;
+SELECT DISTINCT ON (customer_id) customer_id, id AS biggest_order, amount
+FROM orders ORDER BY customer_id, amount DESC LIMIT 5;`,
+  },
+  {
     label: "Point lookup",
     hint: "One root-to-leaf path through the primary key",
     sql: "SELECT * FROM customers WHERE id = 7;",

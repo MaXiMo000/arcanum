@@ -17,6 +17,7 @@ from collections import Counter
 
 from ..engine import Database, QueryLimits
 from ..engine.doctor import diagnose
+from ..engine.expr import to_text
 from ..errors import (
     ArcanumError,
     ConstraintError,
@@ -134,12 +135,20 @@ class EventPump:
 def _json_value(v):
     if isinstance(v, bytes):
         try:
-            return list(decode(v))  # B+tree keys use the value codec
+            return [_cell(x) for x in decode(v)]  # B+tree keys use the value codec
         except (ValueError, IndexError):
             return v.hex()
     if isinstance(v, tuple):
-        return list(v)
-    return v
+        return [_cell(x) for x in v]
+    return _cell(v)
+
+
+def _cell(v):
+    """A value as JSON: dates, timestamps, numerics and intervals as their SQL text (as PostgreSQL clients
+    receive them), so no precision is lost to floats."""
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    return to_text(v)
 
 
 def error_json(e):
@@ -408,7 +417,8 @@ class Jobs:
 
 
 def _result_json(r):
-    return {"columns": r.columns, "rows": [list(row) for row in r.rows], "truncated": r.row_total > len(r.rows),
+    return {"columns": r.columns, "rows": [[_cell(v) for v in row] for row in r.rows],
+            "truncated": r.row_total > len(r.rows),
             "row_total": r.row_total, "rowcount": r.rowcount, "status": r.status, "plan": r.plan,
             "advice": r.advice, "statement": r.statement, "planner": r.planner,
             "planning_ms": r.planning_ms, "execution_ms": r.execution_ms}

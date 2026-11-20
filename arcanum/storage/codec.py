@@ -9,14 +9,22 @@ Each value is a tag byte followed by its payload:
     INTEGER  0x02 + 8 bytes            big-endian with the sign bit flipped
     REAL     0x03 + 8 bytes            IEEE 754 bits, transformed so byte order = numeric order
     TEXT     0x04 + UTF-8 + 0x00 0x00  a 0x00 inside the text is written as 0x00 0xFF
+    DATE     0x05 + 8 bytes            days since 1970-01-01, like INTEGER
+    TIMESTAMP 0x06 + 8 bytes           microseconds since 1970-01-01 00:00 (UTC), like INTEGER
+    NUMERIC  0x07 + class + ...        see _encode_decimal: exponent then digits, inverted when negative
 
 A shorter tuple sorts before any longer tuple it is a prefix of. A column holds
 one type, so INTEGER and REAL values never meet at the same position.
 """
 
+import datetime
 import struct
+from decimal import Decimal
 
-NULL, INTEGER, REAL, TEXT = 0x01, 0x02, 0x03, 0x04
+NULL, INTEGER, REAL, TEXT, DATE, TIMESTAMP, NUMERIC = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+EPOCH = datetime.datetime(1970, 1, 1)
+_EPOCH_DAY = EPOCH.date().toordinal()
+_MICRO = datetime.timedelta(microseconds=1)
 
 _U64 = struct.Struct(">Q")
 _F64 = struct.Struct(">d")
@@ -42,6 +50,15 @@ def encode(values) -> bytes:
             out.append(TEXT)
             out += v.encode().replace(b"\x00", b"\x00\xff")
             out += b"\x00\x00"
+        elif isinstance(v, datetime.datetime):  # before date: a datetime is also a date
+            out.append(TIMESTAMP)
+            out += _U64.pack((v - EPOCH) // _MICRO + _SIGN)
+        elif isinstance(v, datetime.date):
+            out.append(DATE)
+            out += _U64.pack(v.toordinal() - _EPOCH_DAY + _SIGN)
+        elif isinstance(v, Decimal):
+            out.append(NUMERIC)
+            out += _encode_decimal(v)
         else:
             raise TypeError(f"cannot store a value of type {type(v).__name__}")
     return bytes(out)
@@ -71,6 +88,50 @@ def decode(data: bytes) -> tuple:
                     break
                 text.append(0)
             values.append(text.decode())
+        elif tag == TIMESTAMP:
+            values.append(EPOCH + (_U64.unpack_from(data, i)[0] - _SIGN) * _MICRO)
+            i += 8
+        elif tag == DATE:
+            values.append(datetime.date.fromordinal(_U64.unpack_from(data, i)[0] - _SIGN + _EPOCH_DAY))
+            i += 8
+        elif tag == NUMERIC:
+            value, i = _decode_decimal(data, i)
+            values.append(value)
         else:
             raise ValueError(f"corrupt value: unknown tag {tag:#04x} at byte {i - 1}")
     return tuple(values)
+
+
+# NUMERIC: a non-zero value is 0.d1d2d3... x 10^exponent. Byte order must match numeric order and no
+# encoding may be a prefix of another, so: a class byte (negative < zero < positive), then for positives
+# the exponent (biased, big-endian) and the digits as ASCII ending in 0x00, which sorts before any digit
+# (0.12 < 0.123). Negatives store every byte inverted and end in 0xFF, so larger magnitudes sort first.
+_NEGATIVE, _ZERO, _POSITIVE = 0x01, 0x02, 0x03
+_EXP = struct.Struct(">I")
+_EXP_BIAS = 1 << 31
+
+
+def _encode_decimal(v):
+    if not v.is_finite():
+        raise ValueError("NUMERIC values must be finite")
+    if not v:
+        return bytes([_ZERO])
+    sign, digits, exponent = v.normalize().as_tuple()
+    body = _EXP.pack(len(digits) + exponent + _EXP_BIAS) + bytes(48 + d for d in digits)
+    if sign:
+        return bytes([_NEGATIVE]) + bytes(255 - b for b in body) + b"\xff"
+    return bytes([_POSITIVE]) + body + b"\x00"
+
+
+def _decode_decimal(data, i):
+    kind = data[i]
+    i += 1
+    if kind == _ZERO:
+        return Decimal(0), i
+    negative = kind == _NEGATIVE
+    # The exponent's 4 bytes may contain the terminator byte, so the search starts after them.
+    end = data.index(b"\xff" if negative else b"\x00", i + 4)
+    body = bytes(255 - b for b in data[i:end]) if negative else data[i:end]
+    point = _EXP.unpack_from(body)[0] - _EXP_BIAS
+    digits = tuple(b - 48 for b in body[4:])
+    return Decimal((int(negative), digits, point - len(digits))), end + 1

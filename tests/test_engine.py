@@ -184,7 +184,7 @@ def test_events_show_the_engine_working(db):
     ("SELECT * FROM missing", "line 1, col 15: table missing does not exist"),
     ("SELECT x.id FROM users", "line 1, col 8: missing FROM entry for table x"),
     ("SELECT id FROM users a JOIN users b ON a.id = b.id", "column reference id is ambiguous"),
-    ("SELECT email + 1 FROM users", "line 1, col 14: operator + expects INTEGER or REAL, not TEXT"),
+    ("SELECT email + 1 FROM users", "line 1, col 14: operator + expects INTEGER, REAL or NUMERIC, not TEXT"),
     ("SELECT * FROM users WHERE id = 'one'", "line 1, col 30: cannot compare INTEGER with TEXT"),
     ("SELECT * FROM users WHERE age", "WHERE must be a boolean condition, not INTEGER"),
     ("SELECT age, count(*) FROM users", "column age must appear in GROUP BY"),
@@ -198,7 +198,7 @@ def test_events_show_the_engine_working(db):
     ("INSERT INTO users (id) VALUES (1, 2)", "1 target columns but the values have 2"),
     ("SELECT DISTINCT email FROM users ORDER BY age", "ORDER BY expressions must appear in the select list"),
     ("SELECT * FROM users LIMIT -1", "LIMIT must not be negative"),
-    ("SELECT 2.5 % 2", "operator % expects INTEGER, not REAL"),
+    ("SELECT 2.5 % 2", "operator % expects INTEGER or NUMERIC, not REAL"),
     ("CREATE TABLE users (x INTEGER)", "table users already exists"),
     ("WITH RECURSIVE r(n) AS (SELECT n FROM r UNION SELECT 1) SELECT * FROM r", "anchor part"),
 ])

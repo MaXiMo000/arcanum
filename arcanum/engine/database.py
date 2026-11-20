@@ -262,7 +262,7 @@ class Database:
             if statement.name in self.catalog.tables and statement.if_not_exists:
                 return Result(status="CREATE TABLE")
             table = self.catalog.create_table(statement, text)
-            Writer(self, binder).checks(table)  # bind the CHECK constraints now, so mistakes fail the CREATE
+            Writer(self, binder).validate(table)  # bind CHECKs and default expressions now
             return Result(status="CREATE TABLE")
         if isinstance(statement, n.CreateIndex):
             if statement.name in self.catalog.indexes and statement.if_not_exists:
