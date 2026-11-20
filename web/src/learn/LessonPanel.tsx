@@ -2,14 +2,14 @@ import { useRef, useState } from "react";
 import { ApiError, type CrashSummary, type EngineState } from "../api";
 import { RichText } from "./RichText";
 import { LESSONS, type Lesson, type Step } from "./lessons";
-import type { CheckContext, Outcome } from "./outcome";
+import { isWaiting, type CheckContext, type Outcome, type Waiting } from "./outcome";
 import type { Progress } from "./progress";
 
 interface Props {
   progress: Progress;
   onOpen: (lesson: string | null, step?: number) => void;
   onPassed: (lesson: string, step: string) => void;
-  run: (sql: string, step: Step) => Promise<Outcome | ApiError | null>;
+  run: (sql: string, step: Step) => Promise<Outcome | ApiError | Waiting | null>;
   crash: () => Promise<CrashSummary | null>;
   state: EngineState | null;
   onTryInPlayground: (sql: string) => void;
@@ -86,13 +86,25 @@ function LessonView({ lesson, progress, onOpen, onPassed, run, crash, state, onT
     let outcome: Outcome | null = null;
     let error: ApiError | null = null;
     let summary: CrashSummary | null = null;
+    let waited = false;
     if (step.sql) {
-      const result = await run(step.sql, step);
+      let result = await run(step.sql, step);
+      if (isWaiting(result)) {
+        waited = true;
+        // A step that is about making a session wait passes once it waits; the statement finishes
+        // later, when a following step ends the transaction it waits for.
+        if (!step.expectWait) result = await result.done;
+      }
       if (result instanceof ApiError) error = result;
-      else outcome = result;
+      else if (!isWaiting(result)) outcome = result;
     }
     if (step.action === "crash") summary = await crash();
-    if (step.expectError) {
+    if (step.expectWait) {
+      if (!waited) {
+        setStatus({ kind: "failed", message: step.hint ?? "This step should wait for the other session. Run it again." });
+        return;
+      }
+    } else if (step.expectError) {
       if (error?.body.type !== step.expectError) {
         setStatus({ kind: "failed", message: step.hint ?? `This step should fail with ${step.expectError}. Run it again.` });
         return;

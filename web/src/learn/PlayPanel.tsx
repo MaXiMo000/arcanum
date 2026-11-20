@@ -4,7 +4,7 @@ import { formatValue } from "../format";
 import { EXAMPLES } from "../examples";
 import { CHALLENGES } from "./challenges";
 import { Editor } from "./Editor";
-import type { Outcome } from "./outcome";
+import { isWaiting, type Outcome, type Waiting } from "./outcome";
 
 export const SECOND_SESSION_SQL = "SELECT id, name, city FROM customers WHERE id = 1;";
 
@@ -16,7 +16,8 @@ interface Props {
   onShare: () => void;
   sql: string;
   onSql: (sql: string) => void;
-  onRun: (sql: string, session: SessionName) => Promise<Outcome | ApiError | null>;
+  onRun: (sql: string, session: SessionName) => Promise<Outcome | ApiError | Waiting | null>;
+  onCancel: (ticket: string) => void;
   sessions: Record<SessionName, SessionTxn> | null;
   maxSqlBytes: number | null;
   disabled: boolean;
@@ -83,6 +84,7 @@ export function PlayPanel(props: Props) {
         sql={sql}
         onSql={onSql}
         onRun={onRun}
+        onCancel={props.onCancel}
         txn={sessions?.A ?? null}
         maxSqlBytes={maxSqlBytes}
         disabled={disabled}
@@ -96,6 +98,7 @@ export function PlayPanel(props: Props) {
           sql={sqlB}
           onSql={setSqlB}
           onRun={onRun}
+          onCancel={props.onCancel}
           txn={sessions?.B ?? null}
           maxSqlBytes={maxSqlBytes}
           disabled={disabled}
@@ -141,12 +144,13 @@ export function PlayPanel(props: Props) {
   );
 }
 
-function SessionEditor({ name, label, sql, onSql, onRun, txn, maxSqlBytes, disabled, tables, error }: {
+function SessionEditor({ name, label, sql, onSql, onRun, onCancel, txn, maxSqlBytes, disabled, tables, error }: {
   name: SessionName;
   label: string | null;
   sql: string;
   onSql: (sql: string) => void;
-  onRun: (sql: string, session: SessionName) => Promise<Outcome | ApiError | null>;
+  onRun: (sql: string, session: SessionName) => Promise<Outcome | ApiError | Waiting | null>;
+  onCancel: (ticket: string) => void;
   txn: SessionTxn | null;
   maxSqlBytes: number | null;
   disabled: boolean;
@@ -155,15 +159,27 @@ function SessionEditor({ name, label, sql, onSql, onRun, txn, maxSqlBytes, disab
 }) {
   const [running, setRunning] = useState(false);
   const [last, setLast] = useState<{ text: string; error: boolean } | null>(null);
+  const [waiting, setWaiting] = useState<Waiting["waiting"] | null>(null);
   const tooLong = maxSqlBytes !== null && new TextEncoder().encode(sql).length > maxSqlBytes;
 
   const run = async () => {
     if (running || disabled || tooLong || !sql.trim()) return;
     setRunning(true);
     try {
-      setLast(summary(await onRun(sql, name)));
+      const result = await onRun(sql, name);
+      if (isWaiting(result)) {
+        // The statement queues behind another transaction's lock, as in PostgreSQL; the other
+        // session stays free to commit or roll back.
+        setWaiting(result.waiting);
+        setLast(null);
+        setLast(summary(await result.done));
+        setWaiting(null);
+      } else {
+        setLast(summary(result));
+      }
     } finally {
       setRunning(false);
+      setWaiting(null);
     }
   };
 
@@ -185,11 +201,23 @@ function SessionEditor({ name, label, sql, onSql, onRun, txn, maxSqlBytes, disab
       <Editor id={`sql-editor-${name}`} value={sql} onChange={onSql} onRun={() => void run()} tables={tables} error={error} />
       <div className="run-row">
         <button className="button primary" onClick={() => void run()} disabled={disabled || running || tooLong}>
-          {running ? "Running…" : label ? `Run in ${name}` : "Run"}
+          {waiting ? "Waiting…" : running ? "Running…" : label ? `Run in ${name}` : "Run"}
         </button>
+        {waiting && (
+          <button className="button ghost small" onClick={() => onCancel(waiting.ticket)}>
+            Cancel
+          </button>
+        )}
         {tooLong && <span className="muted small">SQL is limited to {maxSqlBytes?.toLocaleString()} bytes</span>}
       </div>
-      {label && last && <p className={`session-last small ${last.error ? "error" : ""}`}>{last.text}</p>}
+      {waiting && (
+        <p className="session-last small waiting" role="status">
+          <span className="spinner" aria-hidden="true" />
+          {` Waiting for ${waiting.what}, held by transaction ${waiting.holder} of session ${waiting.holder_session}. `}
+          It goes ahead as soon as that transaction commits or rolls back.
+        </p>
+      )}
+      {label && last && !waiting && <p className={`session-last small ${last.error ? "error" : ""}`}>{last.text}</p>}
     </div>
   );
 }

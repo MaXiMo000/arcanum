@@ -85,7 +85,7 @@ class Session:
         options = {"max_keys": s.max_keys, "max_pages": s.max_pages, "pool_size": s.pool_size,
                    "event_limit": s.event_limit, "memory_rows": s.memory_rows, "spill_bytes": s.spill_bytes,
                    "sort_memory_rows": s.sort_memory_rows, "recursive_rows": s.recursive_rows,
-                   "memory_mb": s.worker_memory_mb}
+                   "memory_mb": s.worker_memory_mb, "lock_timeout": s.lock_timeout}
         self.process = context.Process(target=worker_main, args=(str(self.path), child_conn, event_writer, options),
                                        daemon=True)
         self.process.start()

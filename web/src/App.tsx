@@ -1,6 +1,15 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Comparison } from "./advisor/Advisor";
-import { api, ApiError, type AdviceFix, type CrashSummary, type EngineState, type QueryResult, type SessionName } from "./api";
+import {
+  api,
+  ApiError,
+  type AdviceFix,
+  type CrashSummary,
+  type EngineState,
+  type QueryResult,
+  type QueryStats,
+  type SessionName,
+} from "./api";
 import { CrashOverlay } from "./components/CrashOverlay";
 import { Inspector } from "./components/Inspector";
 import { Intro } from "./components/Intro";
@@ -15,7 +24,7 @@ import { FLASH_MS, replayFrame, useEngineFeed } from "./feed";
 import { CHALLENGES } from "./learn/challenges";
 import { LessonPanel } from "./learn/LessonPanel";
 import type { InspectorTab, Step } from "./learn/lessons";
-import { plural, type CheckContext, type Outcome } from "./learn/outcome";
+import { plural, type CheckContext, type Outcome, type Waiting } from "./learn/outcome";
 import { PlayPanel, SECOND_SESSION_SQL } from "./learn/PlayPanel";
 import { MAX_LINK, clearShared, readShared, shareLink, type SharedState } from "./share";
 import { useProgress } from "./learn/progress";
@@ -30,6 +39,7 @@ const MAX_SETUP = 200;
 // Statuses of statements that change the database (or a transaction), which a shared link replays.
 const CHANGES = /^(INSERT|UPDATE|DELETE|CREATE|DROP|ANALYZE|BEGIN|COMMIT|ROLLBACK)/;
 const EXPLAIN_PREFIX = /^\s*EXPLAIN\s+(ANALYZE\s+)?/i;
+const WAIT_POLL_MS = 400; // how often a waiting statement's ticket is checked
 
 // The 3D view (three.js) is a separate download, fetched the first time someone opens it.
 const Vault = lazy(() => import("./vault/Vault"));
@@ -323,14 +333,26 @@ export default function App() {
   );
 
   /** Run SQL in one of the two database sessions; the outcome, or the error it failed with. */
+  const cancelled = useRef(new Set<string>());
+  const cancelWait = useCallback((ticket: string) => cancelled.current.add(ticket), []);
+
   const execute = useCallback(
-    async (sql: string, focus?: InspectorTab, session: SessionName = "A"): Promise<Outcome | ApiError | null> => {
+    async (sql: string, focus?: InspectorTab, session: SessionName = "A"): Promise<Outcome | ApiError | Waiting | null> => {
       const id = idRef.current;
       if (!id) return null;
       setRunError(null);
       setComparison(null);
-      try {
-        const { results, stats } = await api.query(id, sql, session);
+
+      const fail = (e: unknown): ApiError => {
+        if (e instanceof ApiError && e.status === 404) onSessionGone();
+        const error = e instanceof ApiError ? e : new ApiError(0, { type: "Error", message: String(e) });
+        setRunError({ error, sql });
+        setTab("explain");
+        void refresh(); // earlier statements of the script, or the transaction, may have changed things
+        return error;
+      };
+
+      const finish = async ({ results, stats }: { results: QueryResult[]; stats: QueryStats }): Promise<Outcome> => {
         let after: EngineState | null = null;
         try {
           after = await api.state(id);
@@ -348,21 +370,40 @@ export default function App() {
         setTab(focus && focus !== "pages" && focus !== "log" ? focus : mode === "play" ? "results" : "explain");
         judge({ outcome: next, crash: null, state: after, earlier: () => undefined });
         return next;
+      };
+
+      try {
+        let reply = await api.query(id, sql, session);
+        if (!reply.waiting) return await finish(reply);
+        // A statement is waiting for another session's transaction: show the lock, then follow the
+        // ticket until the holder finishes (or the wait is cancelled or times out).
+        void refresh();
+        const first = reply.waiting;
+        const done = (async () => {
+          try {
+            while (reply.waiting) {
+              await new Promise((resolve) => window.setTimeout(resolve, WAIT_POLL_MS));
+              if (idRef.current !== id) return null;
+              const ticket = reply.waiting.ticket;
+              reply = cancelled.current.has(ticket) ? await api.cancel(id, ticket) : await api.ticket(id, ticket);
+            }
+            return await finish(reply);
+          } catch (e) {
+            return fail(e);
+          }
+        })();
+        return { waiting: first, done };
       } catch (e) {
-        if (e instanceof ApiError && e.status === 404) onSessionGone();
-        const error = e instanceof ApiError ? e : new ApiError(0, { type: "Error", message: String(e) });
-        setRunError({ error, sql });
-        setTab("explain");
-        void refresh(); // earlier statements of the script, or the transaction, may have changed things
-        return error;
+        return fail(e);
       }
     },
-    [mode, judge, onSessionGone, refresh],
+    [mode, judge, onSessionGone, refresh, remember],
   );
 
   const runQuery = useCallback(
     async (sql: string, focus?: InspectorTab, session: SessionName = "A"): Promise<Outcome | null> => {
-      const result = await execute(sql, focus, session);
+      let result = await execute(sql, focus, session);
+      if (result && "waiting" in result) result = await result.done;
       return result instanceof ApiError ? null : result;
     },
     [execute],
@@ -539,6 +580,7 @@ export default function App() {
             sql={playSql}
             onSql={setPlaySql}
             onRun={(sql, session) => execute(sql, undefined, session)}
+            onCancel={cancelWait}
             two={twoSessions}
             onTwo={setTwoSessions}
             sqlB={playSqlB}

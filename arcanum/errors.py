@@ -41,9 +41,24 @@ class ExecutionError(ArcanumError):
 class LockWaitError(ExecutionError):
     """A write needs a row (or the schema) that another session's open transaction holds.
 
-    PostgreSQL would make the statement wait until that transaction ends; here
-    sessions take turns, so the statement fails instead and can be retried.
+    PostgreSQL makes the statement wait until that transaction ends. The
+    Database API runs one statement at a time, so it fails instead (and can be
+    retried); the server parks such a statement and resumes it once `xid`, the
+    holding transaction, ends.
     """
+
+    def __init__(self, message, xid=None, what=None):
+        super().__init__(message)
+        self.xid = xid  # the transaction holding what the statement needs
+        self.what = what  # what it needs, e.g. "row (id = 1)"
+
+
+class DeadlockError(ExecutionError):
+    """Two transactions wait for each other. As in PostgreSQL, one of them is rolled back."""
+
+
+class LockTimeoutError(ExecutionError):
+    """A statement waited for a lock longer than the lock timeout and was cancelled."""
 
 
 class SerializationError(ExecutionError):

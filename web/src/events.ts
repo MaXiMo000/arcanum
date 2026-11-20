@@ -29,6 +29,16 @@ export function describeEvent(e: EngineEvent): { text: string; tone: Tone } {
       return { text: `allocate page ${num(e.page)}`, tone: "write" };
     case "page_free":
       return { text: `free page ${num(e.page)}`, tone: "muted" };
+    case "lock_wait":
+      return { text: `session ${e.session} waits for transaction ${num(e.holder)} of session ${e.holder_session}`, tone: "danger" };
+    case "lock_granted":
+      return { text: `session ${e.session} got its lock after ${num(e.waited_ms)} ms and goes on`, tone: "ok" };
+    case "deadlock":
+      return { text: `deadlock detected: session ${e.session}'s transaction ${num(e.victim)} rolled back`, tone: "danger" };
+    case "lock_timeout":
+      return { text: `session ${e.session} gave up waiting for transaction ${num(e.holder)} (lock timeout)`, tone: "danger" };
+    case "lock_cancel":
+      return { text: `session ${e.session} cancelled its wait for transaction ${num(e.holder)}`, tone: "muted" };
     case "node_visit":
       return { text: `visit ${e.leaf ? "leaf" : "internal"} node on page ${num(e.page)}`, tone: "tree" };
     case "node_split":

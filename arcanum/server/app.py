@@ -20,6 +20,7 @@ stopped before they reach the app (a reverse proxy or CDN); see SECURITY.md.
 import asyncio
 import logging
 import os
+import re
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -57,6 +58,7 @@ class Settings:
     max_sessions_per_client: int = 2
     session_ttl: float = 1800  # seconds a session may sit idle before it is closed
     query_timeout: float = 10  # seconds before a statement's worker is stopped
+    lock_timeout: float = 60  # seconds a statement may wait for another transaction's lock
     queue_timeout: float = 5  # seconds a request may wait for a free statement slot
     max_concurrent_queries: int = field(default_factory=lambda: max(2, os.cpu_count() or 2))
     max_pages: int = 2500  # per-session database size, in 4 KB pages (10 MB)
@@ -88,7 +90,7 @@ class Settings:
                       "max_sql_bytes", "memory_rows", "sort_memory_rows", "spill_bytes", "recursive_rows",
                       "worker_memory_mb", "max_keys", "pool_size", "event_limit", "rate_burst", "sessions_per_minute",
                       "crashes_per_minute", "max_websockets", "max_websockets_per_client", "max_websockets_per_session"]
-        float_fields = ["session_ttl", "query_timeout", "queue_timeout", "rate_per_second"]
+        float_fields = ["session_ttl", "query_timeout", "lock_timeout", "queue_timeout", "rate_per_second"]
         values = {name: _env(f"ARCANUM_{name.upper()}", getattr(d, name), int) for name in int_fields}
         values |= {name: _env(f"ARCANUM_{name.upper()}", getattr(d, name), float) for name in float_fields}
         origins = _env("ARCANUM_ALLOWED_ORIGINS", ",".join(d.allowed_origins))
@@ -127,6 +129,18 @@ class QueryRequest(BaseModel):
 
 class CrashRequest(BaseModel):
     during_write: bool = True
+
+
+TICKET = re.compile(r"^t[0-9]{1,9}$")
+
+
+def _query_reply(reply):
+    if not reply["ok"]:
+        return JSONResponse({"error": reply["error"]}, status_code=400)
+    body = {"results": reply["results"], "stats": reply["stats"]}
+    if "waiting" in reply:
+        return JSONResponse({**body, "waiting": reply["waiting"]}, status_code=202)
+    return body
 
 
 def _error(status, error_type, message, headers=None):
@@ -253,9 +267,23 @@ def create_app(settings=None):
             return _error(413, "SqlTooLong", f"SQL is limited to {settings.max_sql_bytes} bytes")
         reply = await session.request({"op": "query", "sql": body.sql, "session": body.session,
                                        "max_rows": settings.max_rows})
-        if not reply["ok"]:
-            return JSONResponse({"error": reply["error"]}, status_code=400)
-        return {"results": reply["results"], "stats": reply["stats"]}
+        return _query_reply(reply)
+
+    # A statement waiting for another transaction's lock answers 202 with a ticket; fetch the ticket
+    # until it finishes (200 with the results, or 400 with the error), or cancel it.
+    @app.get("/sessions/{session_id}/tickets/{ticket}")
+    async def ticket(session_id: str, ticket: str):
+        session = manager.get(session_id)
+        if not TICKET.match(ticket):
+            return _error(404, "UnknownTicket", "no such ticket")
+        return _query_reply(await session.request({"op": "ticket", "ticket": ticket}))
+
+    @app.post("/sessions/{session_id}/tickets/{ticket}/cancel")
+    async def cancel(session_id: str, ticket: str):
+        session = manager.get(session_id)
+        if not TICKET.match(ticket):
+            return _error(404, "UnknownTicket", "no such ticket")
+        return _query_reply(await session.request({"op": "cancel", "ticket": ticket}))
 
     @app.get("/sessions/{session_id}/state")
     async def state(session_id: str):

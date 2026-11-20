@@ -214,8 +214,13 @@ b.execute("SELECT balance FROM account").rows  # [(0,)]
 ```
 
 - Readers never wait for writers, and writers never wait for readers.
-- A write to a row another open transaction changed is a write-write conflict. PostgreSQL makes the second
-  writer wait; sessions here take turns, so it fails with `LockWaitError` and can be retried.
+- A write to a row another open transaction changed is a write-write conflict. Called directly from
+  Python, as above, the statement fails with `LockWaitError` and can be retried. The server waits instead,
+  as PostgreSQL does: the statement is parked and goes ahead when the holder commits or rolls back
+  (under `READ COMMITTED` it then applies to the newest version of the row).
+- While waiting, the server follows who waits for whom. A wait that would close a cycle is a deadlock:
+  the transaction that detects it is rolled back with `DeadlockError`, and the others go on. A wait
+  longer than the lock timeout fails with `LockTimeoutError`, and a waiting statement can be cancelled.
 - Under `REPEATABLE READ`, changing a row that changed after the snapshot fails with PostgreSQL's
   "could not serialize access due to concurrent update", so updates are never lost.
 - Primary key and `UNIQUE` checks consider every live version, including those of open transactions.
@@ -349,7 +354,9 @@ python -m arcanum.server
 | Endpoint | |
 |---|---|
 | `POST /sessions` | Create a session with its own database. Returns its `id`. |
-| `POST /sessions/{id}/query` | Run SQL (`{"sql": "..."}`; several statements allowed). Each result has `columns`, `rows`, `status` and the executed `plan` as a tree with estimated and actual rows per operator. |
+| `POST /sessions/{id}/query` | Run SQL (`{"sql": "...", "session": "A"}`; several statements allowed; `session` is `A` or `B`, two connections to the same database). Each result has `columns`, `rows`, `status` and the executed `plan` as a tree with estimated and actual rows per operator. |
+| `GET /sessions/{id}/tickets/{ticket}` | A statement waiting for another session's lock. `query` answers `202` with `waiting` (its `ticket`, the transaction it waits for and what it needs) when a statement has to wait; fetch the ticket until it returns the results. |
+| `POST /sessions/{id}/tickets/{ticket}/cancel` | Cancel a waiting statement. |
 | `GET /sessions/{id}/state` | Every B+tree (nodes, keys, children), the buffer pool (cached and dirty pages) and the log, for drawing the database. |
 | `POST /sessions/{id}/crash` | Pull the plug: kill the engine process, by default in the middle of a stream of write transactions, then restart it. The reply compares the rows acknowledged before the crash with the rows after recovery. |
 | `WS /sessions/{id}/events` | Live engine events in batches: `page_read`, `page_write`, `cache_evict`, `node_visit`, `node_split`, `node_merge`, `root_grow`, `wal_append`, `commit`, `checkpoint`, `sort_spill`, `crash`, `recovery`, `recovered`. |
@@ -495,11 +502,7 @@ tests/
 
 Arcanum aims to be the clearest way to see how a database works from the inside. Next:
 
-- **Waiting instead of failing**: true concurrent sessions, so a conflicting write waits for the other
-  transaction as in PostgreSQL, with a lock graph and deadlock detection drawn live.
 - **SERIALIZABLE**: serializable snapshot isolation, with the read/write dependencies that cause an abort shown.
-- **Lock manager and deadlock visualizer**: lock queues per row and table, a waits-for graph, and the
-  victim the detector picks.
 - **An LSM-tree engine beside the B+tree**: memtable, flushes and compaction, with the same workload
   replayed on both to compare write and read amplification.
 - **Replication**: a Raft-replicated log across three engines, with leader election, network partitions

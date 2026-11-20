@@ -513,7 +513,7 @@ class Catalog:
     def _held_error(self, xid, what="a row with that key"):
         owner = self.mvcc.running[xid].owner
         return LockWaitError(f"{what} is held by the open transaction {xid} in session {owner}; PostgreSQL "
-                             "would make this statement wait until that transaction commits or rolls back")
+                             "would make this statement wait until that transaction commits or rolls back", xid, what)
 
     def _describe(self, table, key):
         values = decode(key)

@@ -129,7 +129,8 @@ class Database:
     def _execute(self, conn, statement, text, sql, trace=False, max_rows=None):
         if self.exclusive is not None and self.exclusive is not conn:
             raise LockWaitError(f"session {self.exclusive.name} changed the schema in a transaction that is still "
-                                "open; PostgreSQL would make this statement wait until it commits or rolls back")
+                                "open; PostgreSQL would make this statement wait until it commits or rolls back",
+                                self.exclusive.txn.xid, "the schema")
         if isinstance(statement, n.Begin):
             if conn.txn is not None:
                 raise SqlError("a transaction is already in progress")
@@ -143,10 +144,10 @@ class Database:
             return Result(status="COMMIT" if commit else "ROLLBACK")
 
         if isinstance(statement, _DDL):
-            others = [c.name for c in self.connections.values() if c is not conn and c.txn is not None]
+            others = [c for c in self.connections.values() if c is not conn and c.txn is not None]
             if others:
-                raise LockWaitError(f"session {others[0]} has a transaction open; PostgreSQL would make this schema "
-                                    "change wait until it ends")
+                raise LockWaitError(f"session {others[0].name} has a transaction open; PostgreSQL would make this "
+                                    "schema change wait until it ends", others[0].txn.xid, "the tables it uses")
             if conn.txn is not None and not conn.ddl:
                 # Schema changes are not versioned: undo them, if the transaction rolls back, by restoring pages.
                 # No other session may run meanwhile, so the restore cannot touch anyone else's work.

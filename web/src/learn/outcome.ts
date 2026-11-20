@@ -1,5 +1,5 @@
 // What happened when a statement ran, and helpers lessons and challenges use to judge it.
-import type { ApiError, CrashSummary, EngineState, PlanNode, QueryResult, QueryStats, SessionName, Tree } from "../api";
+import type { ApiError, CrashSummary, EngineState, PlanNode, QueryResult, QueryStats, SessionName, Tree, WaitInfo } from "../api";
 
 export interface Outcome {
   id: number;
@@ -11,6 +11,15 @@ export interface Outcome {
   /** The database right after the statement (fetched once it finished). */
   state: EngineState | null;
 }
+
+/** A run whose statement is waiting for another transaction's lock; done settles when it finishes. */
+export interface Waiting {
+  waiting: WaitInfo;
+  done: Promise<Outcome | ApiError | null>;
+}
+
+export const isWaiting = (result: unknown): result is Waiting =>
+  typeof result === "object" && result !== null && "waiting" in result && "done" in result;
 
 export interface CheckContext {
   outcome: Outcome | null;

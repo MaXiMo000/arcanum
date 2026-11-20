@@ -38,8 +38,34 @@ function Version({ version, current }: { version: RowVersion; current: boolean }
   );
 }
 
+/** Who waits for whom: each waiting session, the transaction it waits for and what it needs. */
+function LockGraph({ waits }: { waits: EngineState["waits"] }) {
+  return (
+    <ul className="lock-graph" aria-label="Lock waits">
+      {waits.map((w) => (
+        <li key={w.ticket}>
+          <span className={`session-badge s-${w.session}`}>
+            <span aria-hidden="true">{w.session}</span>
+            {w.xid ? ` txn ${w.xid}` : " statement"}
+          </span>
+          <span className="lock-arrow" aria-hidden="true">
+            waits for ⟶
+          </span>
+          <span className={`session-badge s-${w.holder_session ?? "A"}`}>
+            <span aria-hidden="true">{w.holder_session}</span> txn {w.holder}
+          </span>
+          <span className="muted small">
+            {w.what} · {(w.waited_ms / 1000).toFixed(1)} s
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export function Versions({ state }: { state: EngineState }) {
   const rows = state.versions ?? [];
+  const waits = state.waits ?? [];
   const sessions = Object.entries(state.sessions ?? {}) as [SessionName, EngineState["sessions"][SessionName]][];
   return (
     <section className="map-card versions-card" aria-label="Row versions">
@@ -63,6 +89,7 @@ export function Versions({ state }: { state: EngineState }) {
           <span className="txn-chip muted" title="the id the next transaction gets">next {state.next_xid}</span>
         </div>
       </header>
+      {waits.length > 0 && <LockGraph waits={waits} />}
       {rows.length > 0 && (
         <ul className="version-rows">
           {rows.slice(0, SHOWN).map((r) => (

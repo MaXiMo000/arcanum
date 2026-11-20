@@ -17,8 +17,17 @@ from collections import Counter
 
 from ..engine import Database, QueryLimits
 from ..engine.doctor import diagnose
-from ..errors import ArcanumError, ConstraintError, ExecutionError, SqlError
+from ..errors import (
+    ArcanumError,
+    ConstraintError,
+    DeadlockError,
+    ExecutionError,
+    LockTimeoutError,
+    LockWaitError,
+    SqlError,
+)
 from ..events import EventBus
+from ..sql.parser import parse_statements
 from ..storage import PAGE_SIZE, decode
 
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024
@@ -70,11 +79,13 @@ class EventPump:
         self.kinds = Counter()
         self.started = time.perf_counter()
 
-    def request_stats(self):
-        """What the engine did for the current request, for explanations and lesson checks."""
-        k = self.kinds
+    def request_stats(self, kinds=None, elapsed=None):
+        """What the engine did for the current request (or the given counts and seconds), for explanations
+        and lesson checks."""
+        k = self.kinds if kinds is None else kinds
+        seconds = time.perf_counter() - self.started if elapsed is None else elapsed
         return {
-            "elapsed_ms": round((time.perf_counter() - self.started) * 1000, 2),
+            "elapsed_ms": round(seconds * 1000, 2),
             "cache_hits": k["read:cache"],
             "disk_reads": k["read:disk"],
             "nodes_visited": k["node_visit"],
@@ -173,7 +184,14 @@ def worker_main(path, conn, event_conn, options):
         return
     pump.flush()
     send(conn, {"ready": True, "recovered_frames": db.recovered_frames})
-    handlers = {"query": _query, "state": _state, "workload": _workload}
+    jobs = Jobs(db, pump, options["lock_timeout"])
+    handlers = {
+        "query": jobs.start,
+        "ticket": lambda m: jobs.ticket(m["ticket"]),
+        "cancel": lambda m: jobs.cancel(m["ticket"]),
+        "state": lambda m: _state(db, m, jobs),
+        "workload": lambda m: _workload(db, m, conn, pump),
+    }
     while True:
         try:
             message = receive(conn)
@@ -185,9 +203,11 @@ def worker_main(path, conn, event_conn, options):
             return
         pump.start_request()
         try:
-            reply = handlers[message["op"]](db, message, conn, pump)
+            jobs.resume()  # lock timeouts, and holders that ended since
+            reply = handlers[message["op"]](message)
+            jobs.resume()  # this request may have released a lock someone waits for
         except ArcanumError as e:
-            reply = {"ok": False, "error": error_json(e)}
+            reply = _failure(db, e, message.get("sql", ""))
         except Exception as e:
             reply = {"ok": False, "error": error_json(e)}
         pump.flush()
@@ -201,26 +221,201 @@ SESSIONS = ("A", "B")  # the database sessions each visitor can type into, side 
 VERSION_ROWS = 40  # rows with versions the state shows at most
 
 
-def _query(db, message, conn, pump):
-    session = db.connections[message.get("session") or SESSIONS[0]]
-    try:
-        results = session.execute_script(message["sql"], trace=True, max_rows=message["max_rows"])
-    except (SqlError, ConstraintError) as e:
-        e.doctor = diagnose(e, db.catalog, message["sql"])
+class Job:
+    """A script one session sent, which may stop at a statement that has to wait for a lock."""
+
+    def __init__(self, ticket, conn, sql, max_rows):
+        self.ticket, self.conn, self.sql, self.max_rows = ticket, conn, sql, max_rows
+        self.statements, cursor = [], 0
+        for statement, text in parse_statements(sql):
+            start = sql.find(text, cursor)
+            cursor = start + len(text)
+            self.statements.append((statement, text, start))
+        self.index = 0  # the next statement to run
+        self.results = []
+        self.kinds = Counter()  # engine events of every run of this job
+        self.elapsed = 0.0  # seconds spent running (not waiting)
+        self.holder = None  # the transaction it waits for, while parked
+        self.what = ""
+        self.since = None  # when it started waiting (monotonic)
+        self.deadline = None
+
+
+class Jobs:
+    """Statements parked behind a lock, the way a PostgreSQL backend waits for another transaction.
+
+    A statement that needs a row another open transaction holds is parked: its
+    request answers at once with a ticket, and the session's script resumes
+    from that statement as soon as the holder commits or rolls back. Waits form
+    a graph between transactions; a wait that would close a cycle is a
+    deadlock, and as in PostgreSQL the transaction that detects it is rolled
+    back. A wait longer than the lock timeout is cancelled.
+    """
+
+    def __init__(self, db, pump, lock_timeout):
+        self.db, self.pump, self.lock_timeout = db, pump, lock_timeout
+        self.parked = {}  # ticket -> Job
+        self.finished = {}  # ticket -> its final reply, until fetched
+        self.tickets = 0
+
+    def start(self, message):
+        conn = self.db.connections[message.get("session") or SESSIONS[0]]
+        waiting = next((j for j in self.parked.values() if j.conn is conn), None)
+        if waiting is not None:
+            raise ExecutionError(f"session {conn.name} is still waiting for a lock (ticket {waiting.ticket}); wait for "
+                                 "it to finish or cancel it first")
+        self.tickets += 1
+        return self.run(Job(f"t{self.tickets}", conn, message["sql"], message["max_rows"]))
+
+    def run(self, job):
+        """Run the job from its next statement: its final reply, or a waiting reply if it parked."""
+        before, started = Counter(self.pump.kinds), time.perf_counter()
+        try:
+            self._advance(job)
+        finally:
+            job.kinds += self.pump.kinds - before
+            job.elapsed += time.perf_counter() - started
+        return self._reply(job)
+
+    def _advance(self, job):
+        """Run statements until the script ends or one has to wait (the job is then parked)."""
+        while job.index < len(job.statements):
+            statement, text, start = job.statements[job.index]
+            try:
+                result = self.db._execute(job.conn, statement, text, job.sql, True, job.max_rows)
+            except LockWaitError as e:
+                if e.xid is None or self.db.mvcc.status(e.xid) != "running":
+                    raise
+                self._check_deadlock(job, e.xid)
+                self._park(job, e)
+                return
+            except ArcanumError as e:
+                e.completed, e.statement_start = job.index, start
+                raise
+            if job.since is not None:
+                self.db.events.emit("lock_granted", session=job.conn.name, waited_ms=self._waited(job))
+                job.since = job.holder = job.deadline = None
+            job.results.append(_result_json(result))
+            job.index += 1
+
+    def resume(self):
+        """Resume every parked job whose holder has finished, and cancel those past the lock timeout."""
+        progress = True
+        while progress:  # one finished job can release another
+            progress = False
+            for ticket, job in list(self.parked.items()):
+                expired = time.monotonic() >= job.deadline
+                if not expired and self.db.mvcc.status(job.holder) == "running":
+                    continue
+                del self.parked[ticket]
+                progress = True
+                if expired:
+                    statement_start = job.statements[job.index][2]
+                    error = LockTimeoutError(f"canceling statement due to lock timeout: it waited "
+                                             f"{self.lock_timeout:g} seconds for transaction {job.holder}")
+                    error.completed, error.statement_start = job.index, statement_start
+                    self.db.events.emit("lock_timeout", session=job.conn.name, holder=job.holder)
+                    self.finished[ticket] = _failure(self.db, error, job.sql)
+                    continue
+                try:
+                    reply = self.run(job)
+                except ArcanumError as e:
+                    reply = _failure(self.db, e, job.sql)
+                if ticket not in self.parked:
+                    self.finished[ticket] = reply
+
+    def ticket(self, ticket):
+        if ticket in self.finished:
+            return self.finished.pop(ticket)
+        job = self.parked.get(ticket)
+        if job is None:
+            raise ExecutionError(f"no statement is waiting under ticket {ticket}")
+        return self._reply(job)
+
+    def cancel(self, ticket):
+        job = self.parked.pop(ticket, None)
+        if job is None:
+            return self.ticket(ticket)
+        error = ExecutionError("canceling statement due to user request")
+        error.completed, error.statement_start = job.index, job.statements[job.index][2]
+        self.db.events.emit("lock_cancel", session=job.conn.name, holder=job.holder)
+        return _failure(self.db, error, job.sql)
+
+    def waits(self):
+        """Who waits for whom, for the lock graph."""
+        out = []
+        for job in self.parked.values():
+            holder = self.db.mvcc.running.get(job.holder)
+            out.append({"ticket": job.ticket, "session": job.conn.name,
+                        "xid": job.conn.txn.xid if job.conn.txn else None, "holder": job.holder,
+                        "holder_session": holder.owner if holder else None, "what": job.what,
+                        "waited_ms": self._waited(job)})
+        return out
+
+    # ---- helpers ----------------------------------------------------------------------------
+
+    def _park(self, job, error):
+        if job.since is None:
+            job.since = time.monotonic()
+            job.deadline = job.since + self.lock_timeout
+        job.holder, job.what = error.xid, error.what or str(error)
+        self.parked[job.ticket] = job
+        holder = self.db.mvcc.running[error.xid]
+        self.db.events.emit("lock_wait", session=job.conn.name, holder=error.xid, holder_session=holder.owner)
+
+    def _check_deadlock(self, job, holder):
+        """Follow who waits for whom from the holder; reaching this job's own transaction is a deadlock."""
+        waiter = job.conn.txn.xid if job.conn.txn else None
+        if waiter is None:
+            return  # a statement outside a transaction holds nothing anyone could be waiting for
+        chain, x = [], holder
+        while x is not None and x not in chain:
+            chain.append(x)
+            if x == waiter:
+                break
+            x = next((j.holder for j in self.parked.values() if j.conn.txn and j.conn.txn.xid == x), None)
+        if x != waiter:
+            return
+        cycle = " -> ".join(f"{t} (session {self.db.mvcc.running[t].owner})" for t in [waiter, *chain[:-1]])
+        self.db._end(job.conn, job.conn.txn, commit=False)
+        self.db.events.emit("deadlock", session=job.conn.name, victim=waiter, cycle=[waiter, *chain[:-1]])
+        error = DeadlockError(f"deadlock detected: {cycle} -> {waiter} each wait for the next; transaction {waiter} "
+                              "was rolled back so the others can go on")
+        error.completed, error.statement_start = job.index, job.statements[job.index][2]
+        raise error
+
+    def _waited(self, job):
+        return round((time.monotonic() - job.since) * 1000) if job.since is not None else 0
+
+    def _reply(self, job):
+        reply = {"ok": True, "stats": self.pump.request_stats(job.kinds, job.elapsed), "results": job.results}
+        if job.ticket in self.parked:
+            holder = self.db.mvcc.running.get(job.holder)
+            reply["waiting"] = {"ticket": job.ticket, "session": job.conn.name, "holder": job.holder,
+                                "holder_session": holder.owner if holder else None, "what": job.what,
+                                "waited_ms": self._waited(job)}
+        return reply
+
+
+def _result_json(r):
+    return {"columns": r.columns, "rows": [list(row) for row in r.rows], "truncated": r.row_total > len(r.rows),
+            "row_total": r.row_total, "rowcount": r.rowcount, "status": r.status, "plan": r.plan,
+            "advice": r.advice, "statement": r.statement, "planner": r.planner,
+            "planning_ms": r.planning_ms, "execution_ms": r.execution_ms}
+
+
+def _failure(db, e, sql):
+    """The reply for a failed script: the error, with the doctor's diagnosis of SQL mistakes."""
+    if isinstance(e, (SqlError, ConstraintError)):
+        e.doctor = diagnose(e, db.catalog, sql)
         if e.doctor and e.doctor["fix"]:
             # What to run now: the corrected script from the failing statement on, since
             # the statements before it already ran. Every fix edits at or after that point.
             e.doctor["rerun"] = e.doctor["fix"][getattr(e, "statement_start", 0):]
-        raise
-    return {"ok": True, "stats": pump.request_stats(), "results": [
-        {"columns": r.columns, "rows": [list(row) for row in r.rows], "truncated": r.row_total > len(r.rows),
-         "row_total": r.row_total, "rowcount": r.rowcount, "status": r.status, "plan": r.plan,
-         "advice": r.advice, "statement": r.statement, "planner": r.planner,
-         "planning_ms": r.planning_ms, "execution_ms": r.execution_ms}
-        for r in results]}
+    return {"ok": False, "error": error_json(e)}
 
 
-def _state(db, message, conn, pump):
+def _state(db, message, jobs):
     """Everything a visualizer needs to draw the database: trees, cache and log."""
     catalog, pager = db.catalog, db.pager
     limit = message.get("node_limit", 2000)
@@ -245,7 +440,7 @@ def _state(db, message, conn, pump):
         "pool_size": pager.pool_size, "cached": [{"page": p, "dirty": d} for p, d in pager.cached_pages()],
         "free": pager.free_pages(), "stats": dict(pager.stats)},
         "wal": {"committed_frames": pager.wal.committed_frames, "uncommitted": pager.wal.has_uncommitted},
-        "in_transaction": db.connections[SESSIONS[0]].in_transaction, **_mvcc_state(db)}
+        "in_transaction": db.connections[SESSIONS[0]].in_transaction, **_mvcc_state(db), "waits": jobs.waits()}
 
 
 def _mvcc_state(db):

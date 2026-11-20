@@ -3628,3 +3628,55 @@ p.session-badge {
 .play-tools .sessions-toggle {
   margin: 0;
 }
+
+/* ---- lock waits ------------------------------------------------------------------------------ */
+
+.session-last.waiting {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  color: var(--warn);
+  font-family: var(--sans);
+}
+
+.spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 4px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.lock-graph {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  list-style: none;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--warn) 7%, transparent);
+}
+
+.lock-graph li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.lock-arrow {
+  color: var(--warn);
+  font: 700 11px var(--mono);
+  animation: blink 1.4s ease-in-out infinite;
+}

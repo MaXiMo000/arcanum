@@ -158,6 +158,24 @@ export interface RowVersion {
   seen_by: SessionName[];
 }
 
+/** A statement parked behind another transaction's lock: fetch its ticket until it finishes. */
+export interface WaitInfo {
+  ticket: string;
+  session: SessionName;
+  holder: number;
+  holder_session: string | null;
+  /** What it needs, e.g. "row (id = 1)". */
+  what: string;
+  waited_ms: number;
+}
+
+export interface QueryReply {
+  results: QueryResult[];
+  stats: QueryStats;
+  /** Set while a statement of the script waits for a lock; results holds the statements before it. */
+  waiting?: WaitInfo;
+}
+
 export interface EngineState {
   tables: TableInfo[];
   trees: Tree[];
@@ -179,6 +197,8 @@ export interface EngineState {
   commit_log: number[];
   /** Rows that currently hold more than one version, or one not yet frozen. */
   versions: { table: string; key: Value[]; versions: RowVersion[] }[];
+  /** Who waits for whom: each parked statement and the transaction it waits for. */
+  waits: (WaitInfo & { xid: number | null })[];
 }
 
 export interface EngineEvent {
@@ -247,7 +267,10 @@ export const api = {
   createSession: () => call<SessionInfo>("POST", "/sessions"),
   deleteSession: (id: string) => call<void>("DELETE", sessionPath(id)),
   query: (id: string, sql: string, session: SessionName = "A") =>
-    call<{ results: QueryResult[]; stats: QueryStats }>("POST", `${sessionPath(id)}/query`, { sql, session }),
+    call<QueryReply>("POST", `${sessionPath(id)}/query`, { sql, session }),
+  ticket: (id: string, ticket: string) => call<QueryReply>("GET", `${sessionPath(id)}/tickets/${encodeURIComponent(ticket)}`),
+  cancel: (id: string, ticket: string) =>
+    call<QueryReply>("POST", `${sessionPath(id)}/tickets/${encodeURIComponent(ticket)}/cancel`),
   state: (id: string) => call<EngineState>("GET", `${sessionPath(id)}/state`),
   crash: (id: string, duringWrite: boolean) =>
     call<CrashSummary>("POST", `${sessionPath(id)}/crash`, { during_write: duringWrite }),

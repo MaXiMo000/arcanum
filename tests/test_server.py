@@ -1,6 +1,7 @@
 """The HTTP/WebSocket API, with real worker processes behind it."""
 
 import os
+import time
 
 import pytest
 
@@ -311,6 +312,72 @@ def test_other_sites_cannot_change_anything(client):
     assert sql(client, session, "SELECT count(*) FROM orders").json()["results"][0]["rows"] == [[80]]
 
 
+def test_a_conflicting_write_waits_and_resumes_when_the_holder_commits(client):
+    session = new_session(client)
+
+    def run(text, who):
+        return client.post(f"/sessions/{session}/query", json={"sql": text, "session": who})
+
+    run("BEGIN; UPDATE customers SET city = 'Rome' WHERE id = 1", "A")
+    parked = run("SELECT 1; UPDATE customers SET city = 'Lima' WHERE id = 1; SELECT city FROM customers WHERE id = 1", "B")
+    assert parked.status_code == 202
+    waiting = parked.json()["waiting"]
+    assert waiting["session"] == "B" and waiting["holder_session"] == "A"
+    assert [r["status"] for r in parked.json()["results"]] == ["SELECT 1"]  # what ran before it waited
+    assert client.get(f"/sessions/{session}/state").json()["waits"][0]["holder"] == waiting["holder"]
+    ticket = f"/sessions/{session}/tickets/{waiting['ticket']}"
+    assert client.get(ticket).status_code == 202
+    busy = run("SELECT 2", "B")
+    assert busy.status_code == 400 and "still waiting" in busy.json()["error"]["message"]
+
+    assert run("COMMIT", "A").status_code == 200  # A was never blocked by B's wait
+    done = client.get(ticket)
+    assert done.status_code == 200
+    assert [r["status"] for r in done.json()["results"]] == ["SELECT 1", "UPDATE 1", "SELECT 1"]
+    assert done.json()["results"][2]["rows"] == [["Lima"]]  # it went ahead on A's committed version
+    assert client.get(ticket).status_code == 400  # a ticket is collected once
+    assert client.get(f"/sessions/{session}/state").json()["waits"] == []
+
+
+def test_deadlocks_roll_back_the_transaction_that_closes_the_cycle(client):
+    session = new_session(client)
+
+    def run(text, who):
+        return client.post(f"/sessions/{session}/query", json={"sql": text, "session": who})
+
+    run("BEGIN; UPDATE customers SET city = 'x' WHERE id = 1", "A")
+    run("BEGIN; UPDATE customers SET city = 'y' WHERE id = 2", "B")
+    waiting = run("UPDATE customers SET city = 'y' WHERE id = 1", "B").json()["waiting"]
+    deadlock = run("UPDATE customers SET city = 'x' WHERE id = 2", "A")
+    assert deadlock.status_code == 400 and deadlock.json()["error"]["type"] == "DeadlockError"
+    state = client.get(f"/sessions/{session}/state").json()
+    assert state["sessions"]["A"]["xid"] is None  # A's transaction was rolled back...
+    done = client.get(f"/sessions/{session}/tickets/{waiting['ticket']}")
+    assert done.status_code == 200  # ...so B's wait ended and its update went through
+    run("COMMIT", "B")
+    rows = run("SELECT id, city FROM customers WHERE id <= 2 ORDER BY id", "A").json()["results"][0]["rows"]
+    assert rows == [[1, "y"], [2, "y"]]
+
+
+def test_waits_time_out_and_can_be_cancelled(make_client):
+    client = make_client(lock_timeout=0.2)
+    session = new_session(client)
+
+    def run(text, who):
+        return client.post(f"/sessions/{session}/query", json={"sql": text, "session": who})
+
+    run("BEGIN; DELETE FROM orders WHERE id = 5", "A")
+    first = run("UPDATE orders SET amount = 1 WHERE id = 5", "B").json()["waiting"]["ticket"]
+    time.sleep(0.3)
+    timed_out = client.get(f"/sessions/{session}/tickets/{first}")
+    assert timed_out.status_code == 400 and timed_out.json()["error"]["type"] == "LockTimeoutError"
+    second = run("UPDATE orders SET amount = 2 WHERE id = 5", "B").json()["waiting"]["ticket"]
+    cancelled = client.post(f"/sessions/{session}/tickets/{second}/cancel")
+    assert cancelled.status_code == 400 and "user request" in cancelled.json()["error"]["message"]
+    assert client.get(f"/sessions/{session}/tickets/t99999").status_code == 400
+    assert client.get(f"/sessions/{session}/tickets/../x").status_code == 404
+
+
 def test_two_sessions_see_each_other_only_after_commit(client):
     session = new_session(client)
 
@@ -321,7 +388,8 @@ def test_two_sessions_see_each_other_only_after_commit(client):
     seen = run("SELECT city FROM customers WHERE id = 1", "B").json()["results"][0]["rows"]
     assert seen == [["Osaka"]]
     blocked = run("UPDATE customers SET city = 'Lima' WHERE id = 1", "B")
-    assert blocked.status_code == 400 and blocked.json()["error"]["type"] == "LockWaitError"
+    assert blocked.status_code == 202  # waits for A
+    client.post(f"/sessions/{session}/tickets/{blocked.json()['waiting']['ticket']}/cancel")
 
     state = client.get(f"/sessions/{session}/state").json()
     a = state["sessions"]["A"]
