@@ -62,8 +62,10 @@ class EventPump:
         self.count = 0
         self.kinds = Counter()  # every event of the current request, counted even past the limit
         self.started = time.perf_counter()
+        self.request = 0  # numbers each request, so a viewer can replay one request's events
 
     def start_request(self):
+        self.request += 1
         self.count = 0
         self.kinds = Counter()
         self.started = time.perf_counter()
@@ -101,7 +103,8 @@ class EventPump:
                 self.buffer.append({"kind": "events_truncated", "limit": self.limit})
             return
         self.seq += 1
-        self.buffer.append({"seq": self.seq, "kind": kind, **{k: _json_value(v) for k, v in data.items()}})
+        self.buffer.append({"seq": self.seq, "request": self.request, "kind": kind,
+                            **{k: _json_value(v) for k, v in data.items()}})
         if len(self.buffer) >= 256 or kind in _FLUSH_NOW:
             self.flush()
 

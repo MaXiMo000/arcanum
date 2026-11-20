@@ -6,11 +6,12 @@ import { Inspector } from "./components/Inspector";
 import { Intro } from "./components/Intro";
 import type { RunError } from "./components/Results";
 import { StoryBar } from "./components/StoryBar";
+import { Timeline, replayMarker } from "./components/Timeline";
 import { Toasts, type Toast } from "./components/Toasts";
 import { TopBar, type Mode, type View } from "./components/TopBar";
 import { EngineMap, type MapFocus } from "./components/EngineMap";
 import { EXAMPLES } from "./examples";
-import { FLASH_MS, useEngineFeed } from "./feed";
+import { FLASH_MS, replayFrame, useEngineFeed } from "./feed";
 import { CHALLENGES } from "./learn/challenges";
 import { LessonPanel } from "./learn/LessonPanel";
 import type { InspectorTab, Step } from "./learn/lessons";
@@ -188,6 +189,24 @@ export default function App() {
     if (state) syncPool(state.pager.cached, state.pager.pool_size);
   }, [state, syncPool]);
 
+  // Time travel: the stage can show the engine as it was at any event of the latest request.
+  const [replayIndex, setReplayIndex] = useState<number | null>(null);
+  const [replaying, setReplaying] = useState(false);
+  const recording = feed.recording;
+  const request = recording?.request;
+  useEffect(() => {
+    setReplayIndex(null);
+    setReplaying(false);
+  }, [request]);
+  const replay = useMemo(
+    () =>
+      recording && replayIndex !== null
+        ? { feed: replayFrame(recording, replayIndex, flashMs / 6), marker: replayMarker(recording, replayIndex) }
+        : null,
+    [recording, replayIndex, flashMs],
+  );
+  const shown = replay?.feed ?? feed;
+
   useEffect(() => {
     document.documentElement.style.setProperty("--flash-ms", `${flashMs}ms`);
   }, [flashMs]);
@@ -360,7 +379,7 @@ export default function App() {
           trees={state.trees}
           selected={selectedTree}
           onSelect={setSelectedTree}
-          feed={feed}
+          feed={shown}
           flashMs={flashMs}
           state={state}
           owners={owners}
@@ -372,11 +391,12 @@ export default function App() {
         trees={state.trees}
         selected={selectedTree}
         onSelect={setSelectedTree}
-        feed={feed}
+        feed={shown}
         flashMs={flashMs}
         state={state}
         owners={owners}
         focus={mapFocus}
+        marker={replay?.marker ?? null}
       />
     ) : (
       <div className="stage-loading" aria-busy="true">
@@ -433,6 +453,13 @@ export default function App() {
         <main className="stage glass" aria-label="The database">
           {stage}
           <StoryBar outcome={outcome} onExplain={() => setTab("explain")} />
+          <Timeline
+            recording={recording}
+            index={replayIndex}
+            onIndex={setReplayIndex}
+            playing={replaying}
+            onPlaying={setReplaying}
+          />
         </main>
         <Inspector
           tab={tab}

@@ -114,7 +114,14 @@ def test_events_stream_the_engine_at_work(client):
         assert ws.receive_json()["type"] == "subscribed"
         sql(client, session, "INSERT INTO customers SELECT id + 100, name, city FROM customers")
         seen = events_until(ws, "commit")
+        sql(client, session, "SELECT * FROM customers WHERE id = 3")
+        requests = set()
+        while len(requests) < 1 or "node_visit" not in seen:
+            events = ws.receive_json().get("events", [])
+            requests |= {e["request"] for e in events}
+            seen |= {e["kind"] for e in events}
     assert {"page_read", "node_visit", "node_split", "wal_append", "wal_sync", "commit"} <= seen
+    assert len(requests) == 1  # every event of one request carries its number, for replaying it
 
 
 def test_pulling_the_plug_mid_write_keeps_every_acknowledged_commit(client):

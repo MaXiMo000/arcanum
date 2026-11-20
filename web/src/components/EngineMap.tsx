@@ -5,6 +5,7 @@
 import { useEffect, useRef } from "react";
 import type { EngineState, Tree } from "../api";
 import type { FeedState, Flash } from "../feed";
+import type { ReplayMarker } from "./Timeline";
 import { TreeView } from "./TreeView";
 import { Versions } from "./Versions";
 
@@ -19,11 +20,12 @@ interface Props {
   state: EngineState;
   owners: Map<number, { tree: string; color: number; leaf: boolean }>;
   focus: MapFocus;
+  marker: ReplayMarker | null;
 }
 
 const recent = (flash: Flash | undefined, now: number, ms: number) => (flash && now - flash.at < ms ? flash : undefined);
 
-export function EngineMap({ trees, selected, onSelect, feed, flashMs, state, owners, focus }: Props) {
+export function EngineMap({ trees, selected, onSelect, feed, flashMs, state, owners, focus, marker }: Props) {
   const poolRef = useRef<HTMLElement>(null);
   const diskRef = useRef<HTMLElement>(null);
   useEffect(() => {
@@ -40,7 +42,7 @@ export function EngineMap({ trees, selected, onSelect, feed, flashMs, state, own
   return (
     <div className="engine-map">
       <section className="map-card map-tree" aria-label="B+tree">
-        <TreeView trees={trees} selected={selected} onSelect={onSelect} nodeFlash={feed.nodeFlash} flashMs={flashMs} />
+        <TreeView trees={trees} selected={selected} onSelect={onSelect} nodeFlash={feed.nodeFlash} flashMs={flashMs} marker={marker} />
         <Descent trees={trees} selected={selected} feed={feed} />
       </section>
 
@@ -49,13 +51,13 @@ export function EngineMap({ trees, selected, onSelect, feed, flashMs, state, own
       <Bus up={reading} upLabel="pages read from disk" down={false} downLabel="" />
 
       <section ref={poolRef} className={`map-card ${focus === "pool" ? "focused" : ""}`} aria-label="Buffer pool">
-        <BufferPool feed={feed} flashMs={flashMs} owners={owners} now={now} />
+        <BufferPool feed={feed} flashMs={flashMs} owners={owners} now={now} current={marker?.page ?? null} />
       </section>
 
       <Bus up={false} upLabel="" down={logging || checkpointing} downLabel={checkpointing ? "checkpoint: log copied into the data file" : "changed pages logged"} />
 
       <section ref={diskRef} className={`map-card map-disk ${focus === "disk" || focus === "log" ? "focused" : ""}`} aria-label="Disk">
-        <DataFile state={state} feed={feed} flashMs={flashMs} owners={owners} now={now} />
+        <DataFile state={state} feed={feed} flashMs={flashMs} owners={owners} now={now} current={marker?.page ?? null} />
         <LogTape state={state} feed={feed} checkpointing={checkpointing} />
       </section>
     </div>
@@ -99,11 +101,12 @@ function Bus({ up, upLabel, down, downLabel }: { up: boolean; upLabel: string; d
   );
 }
 
-function BufferPool({ feed, flashMs, owners, now }: {
+function BufferPool({ feed, flashMs, owners, now, current }: {
   feed: FeedState;
   flashMs: number;
   owners: Map<number, { tree: string; color: number; leaf: boolean }>;
   now: number;
+  current: number | null;
 }) {
   const { pool, counters } = feed;
   const slots: (number | null)[] = Array.from({ length: pool.size }, () => null);
@@ -157,7 +160,7 @@ function BufferPool({ feed, flashMs, owners, now }: {
           return (
             <li
               key={slot}
-              className={`slot owner-tint-${owner?.color ?? 7} ${entry.dirty ? "dirty" : ""} ${page === nextOut ? "next-out" : ""}`}
+              className={`slot owner-tint-${owner?.color ?? 7} ${entry.dirty ? "dirty" : ""} ${page === nextOut ? "next-out" : ""} ${page === current ? "current" : ""}`}
               style={{ opacity: freshness }}
               title={label}
               aria-label={label}
@@ -190,12 +193,13 @@ function BufferPool({ feed, flashMs, owners, now }: {
   );
 }
 
-function DataFile({ state, feed, flashMs, owners, now }: {
+function DataFile({ state, feed, flashMs, owners, now, current }: {
   state: EngineState;
   feed: FeedState;
   flashMs: number;
   owners: Map<number, { tree: string; color: number; leaf: boolean }>;
   now: number;
+  current: number | null;
 }) {
   const { page_count, free, page_size } = state.pager;
   const freeSet = new Set(free);
@@ -220,7 +224,7 @@ function DataFile({ state, feed, flashMs, owners, now }: {
           return (
             <span
               key={page}
-              className={`file-page ${kind} ${cached.has(page) ? "cached" : ""}`}
+              className={`file-page ${kind} ${cached.has(page) ? "cached" : ""} ${page === current ? "current" : ""}`}
               title={`page ${page} · ${page === 0 ? "file header" : freeSet.has(page) ? "free" : owner ? `${owner.tree} ${owner.leaf ? "leaf" : "node"}` : "unused"}${cached.has(page) ? " · also in memory" : ""}`}
             >
               {flash?.kind === "miss" && <span key={flash.at} className="file-flash" />}

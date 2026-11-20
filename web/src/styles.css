@@ -3536,3 +3536,82 @@ p.session-badge {
   gap: 8px;
   min-height: 18px;
 }
+
+/* ---- time travel ----------------------------------------------------------------------------- */
+
+.timeline {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 4px 12px;
+  margin-top: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--panel);
+}
+
+.timeline.replaying {
+  border-color: color-mix(in srgb, var(--visit) 50%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--visit) 12%, transparent);
+}
+
+.timeline-controls {
+  display: flex;
+  gap: 4px;
+}
+
+.timeline-controls .play {
+  color: var(--visit);
+}
+
+.timeline-range {
+  width: 100%;
+  accent-color: var(--visit);
+}
+
+.timeline-caption {
+  grid-column: 1 / -1;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+}
+
+.timeline-caption .tone-read { color: var(--miss); }
+.timeline-caption .tone-hit { color: var(--hit); }
+.timeline-caption .tone-write { color: var(--write); }
+.timeline-caption .tone-log { color: var(--log); }
+.timeline-caption .tone-tree { color: var(--visit); }
+.timeline-caption .tone-danger { color: var(--danger); }
+.timeline-caption .tone-muted { color: var(--ink-3); }
+
+@container (max-width: 520px) {
+  .timeline {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* The replay's position: the node it is at, the path it took to get there, and the page it touched. */
+.tree-svg .node.trail .node-box {
+  stroke: var(--visit);
+  stroke-width: 2;
+}
+
+.tree-svg .node.current .node-box {
+  stroke: var(--visit);
+  stroke-width: 3.5;
+  filter: drop-shadow(0 0 8px var(--visit));
+}
+
+.slot.current {
+  outline: 2px solid var(--visit);
+  outline-offset: 1px;
+  box-shadow: 0 0 14px color-mix(in srgb, var(--visit) 60%, transparent);
+}
+
+.file-page.current {
+  outline: 2px solid var(--visit);
+  outline-offset: 1px;
+}

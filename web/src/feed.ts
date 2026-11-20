@@ -13,6 +13,7 @@ export const FLASH_MS: Record<Speed, number> = { instant: 500, normal: 700, slow
 const MAX_QUEUE = 50_000;
 const MAX_LOG = 300;
 const MAX_WAL = 240;
+const MAX_RECORDING = 5000; // events of one request kept for replay
 
 export interface Flash {
   kind: string;
@@ -59,6 +60,14 @@ export interface Pool {
   pages: Map<number, { slot: number; dirty: boolean }>;
 }
 
+/** One request's events, and the feed state from just before them, for replaying step by step. */
+export interface Recording {
+  request: number;
+  events: EngineEvent[];
+  start: FeedState;
+  truncated?: boolean;
+}
+
 export interface FeedState {
   pool: Pool;
   nodeFlash: Map<number, Flash>;
@@ -68,6 +77,8 @@ export interface FeedState {
   log: LogLine[];
   counters: Counters;
   crash: CrashPhase;
+  /** The latest request's events (see replayFrame). */
+  recording: Recording | null;
 }
 
 const emptyCounters = (): Counters => ({
@@ -82,6 +93,128 @@ const emptyCounters = (): Counters => ({
 
 export type Connection = "connecting" | "live" | "offline";
 
+/**
+ * Apply one engine event to a feed state: flashes, the pool, the log, counters. Returns whether it
+ * changed the shape of a tree (so the state needs fetching again). Used live and to rebuild replays.
+ */
+function reduce(s: FeedState, e: EngineEvent, now: number, nextId: () => number): boolean {
+  const page = typeof e.page === "number" ? e.page : null;
+  let structural = false;
+  switch (e.kind) {
+    case "page_read":
+      if (page !== null) {
+        s.pageFlash.set(page, { kind: e.source === "cache" ? "hit" : "miss", at: now });
+        touch(s.pool, page, false);
+      }
+      if (e.source === "cache") s.counters.hits++;
+      else s.counters.misses++;
+      break;
+    case "page_write":
+    case "page_alloc":
+      if (page !== null) {
+        s.pageFlash.set(page, { kind: "write", at: now });
+        touch(s.pool, page, true);
+      }
+      s.counters.writes++;
+      break;
+    case "cache_evict":
+      if (page !== null) {
+        s.pageFlash.set(page, { kind: "evict", at: now });
+        s.pool.pages.delete(page);
+      }
+      break;
+    case "page_free":
+      if (page !== null) s.pageFlash.set(page, { kind: "evict", at: now });
+      break;
+    case "node_visit":
+      if (page !== null) s.nodeFlash.set(page, { kind: "visit", at: now });
+      break;
+    case "node_split":
+      if (page !== null) s.nodeFlash.set(page, { kind: "split", at: now });
+      if (typeof e.new_page === "number") s.nodeFlash.set(e.new_page, { kind: "split", at: now });
+      s.counters.splits++;
+      structural = true;
+      break;
+    case "node_merge":
+    case "node_redistribute":
+    case "root_grow":
+    case "root_shrink":
+      if (page !== null) s.nodeFlash.set(page, { kind: "split", at: now });
+      structural = true;
+      break;
+    case "wal_append":
+      s.wal.push({ id: nextId(), page: page ?? 0, commit: Boolean(e.commit), committed: false });
+      if (s.wal.length > MAX_WAL) s.wal.splice(0, s.wal.length - MAX_WAL);
+      s.counters.logFrames++;
+      break;
+    case "wal_sync":
+      for (const frame of s.wal) frame.committed = true;
+      break;
+    case "commit":
+      s.counters.commits++;
+      for (const entry of s.pool.pages.values()) entry.dirty = false; // logged, so no longer at risk
+      break;
+    case "rollback":
+      s.wal = s.wal.filter((frame) => frame.committed);
+      structural = true;
+      break;
+    case "checkpoint":
+      s.checkpointAt = now;
+      s.wal = [];
+      s.counters.checkpoints++;
+      break;
+    case "demo_commit":
+      s.crash = { phase: "writing", batches: Number(e.batch) || 0 };
+      break;
+    case "crash":
+      s.crash = { phase: "crashed", batches: s.crash.phase === "writing" ? s.crash.batches : 0 };
+      s.nodeFlash.clear();
+      s.pageFlash.clear();
+      s.pool.pages.clear(); // memory is lost; the next state sync shows what recovery loaded
+      break;
+    case "recovery":
+      s.crash = { phase: "recovering", frames: Number(e.frames) || 0 };
+      break;
+    case "recovered":
+      s.crash = { phase: "done" };
+      structural = true;
+      break;
+  }
+  const { text, tone } = describeEvent(e);
+  s.log.push({ id: nextId(), text, tone });
+  if (s.log.length > MAX_LOG) s.log.splice(0, s.log.length - MAX_LOG);
+  return structural;
+}
+
+/** The parts of a feed state a replay starts from, copied so later events cannot change them. */
+function copyState(s: Pick<FeedState, "pool" | "wal" | "counters" | "checkpointAt">): FeedState {
+  return {
+    pool: { size: s.pool.size, pages: new Map([...s.pool.pages].map(([page, entry]) => [page, { ...entry }])) },
+    nodeFlash: new Map(),
+    pageFlash: new Map(),
+    wal: s.wal.map((frame) => ({ ...frame })),
+    checkpointAt: s.checkpointAt,
+    log: [],
+    counters: { ...s.counters },
+    crash: { phase: "idle" },
+    recording: null,
+  };
+}
+
+/**
+ * The engine as it was just after event `index` of a recording: replays its events onto the state the
+ * request started from. Each event's flash is dated `step` ms before the next, so the last few glow
+ * like a trail and the current one is brightest.
+ */
+export function replayFrame(recording: Recording, index: number, step: number): FeedState {
+  const s = copyState(recording.start);
+  const now = performance.now();
+  let id = 0;
+  recording.events.slice(0, index + 1).forEach((e, i) => reduce(s, e, now - (index - i) * step, () => id++));
+  return s;
+}
+
+
 export function useEngineFeed(sessionId: string | null, onSessionGone: () => void, onStructureChange: () => void) {
   const state = useRef<FeedState>({
     pool: { size: 0, pages: new Map() },
@@ -92,6 +225,7 @@ export function useEngineFeed(sessionId: string | null, onSessionGone: () => voi
     log: [],
     counters: emptyCounters(),
     crash: { phase: "idle" },
+    recording: null,
   });
   const queue = useRef<EngineEvent[]>([]);
   const ids = useRef(0);
@@ -106,91 +240,13 @@ export function useEngineFeed(sessionId: string | null, onSessionGone: () => voi
 
   const apply = useCallback((e: EngineEvent) => {
     const s = state.current;
-    const now = performance.now();
-    const page = typeof e.page === "number" ? e.page : null;
-    switch (e.kind) {
-      case "page_read":
-        if (page !== null) {
-          s.pageFlash.set(page, { kind: e.source === "cache" ? "hit" : "miss", at: now });
-          touch(s.pool, page, false);
-        }
-        if (e.source === "cache") s.counters.hits++;
-        else s.counters.misses++;
-        break;
-      case "page_write":
-      case "page_alloc":
-        if (page !== null) {
-          s.pageFlash.set(page, { kind: "write", at: now });
-          touch(s.pool, page, true);
-        }
-        s.counters.writes++;
-        break;
-      case "cache_evict":
-        if (page !== null) {
-          s.pageFlash.set(page, { kind: "evict", at: now });
-          s.pool.pages.delete(page);
-        }
-        break;
-      case "page_free":
-        if (page !== null) s.pageFlash.set(page, { kind: "evict", at: now });
-        break;
-      case "node_visit":
-        if (page !== null) s.nodeFlash.set(page, { kind: "visit", at: now });
-        break;
-      case "node_split":
-        if (page !== null) s.nodeFlash.set(page, { kind: "split", at: now });
-        if (typeof e.new_page === "number") s.nodeFlash.set(e.new_page, { kind: "split", at: now });
-        s.counters.splits++;
-        structureChanged.current = true;
-        break;
-      case "node_merge":
-      case "node_redistribute":
-      case "root_grow":
-      case "root_shrink":
-        if (page !== null) s.nodeFlash.set(page, { kind: "split", at: now });
-        structureChanged.current = true;
-        break;
-      case "wal_append":
-        s.wal.push({ id: ids.current++, page: page ?? 0, commit: Boolean(e.commit), committed: false });
-        if (s.wal.length > MAX_WAL) s.wal.splice(0, s.wal.length - MAX_WAL);
-        s.counters.logFrames++;
-        break;
-      case "wal_sync":
-        for (const frame of s.wal) frame.committed = true;
-        break;
-      case "commit":
-        s.counters.commits++;
-        for (const entry of s.pool.pages.values()) entry.dirty = false; // logged, so no longer at risk
-        break;
-      case "rollback":
-        s.wal = s.wal.filter((frame) => frame.committed);
-        structureChanged.current = true;
-        break;
-      case "checkpoint":
-        s.checkpointAt = now;
-        s.wal = [];
-        s.counters.checkpoints++;
-        break;
-      case "demo_commit":
-        s.crash = { phase: "writing", batches: Number(e.batch) || 0 };
-        break;
-      case "crash":
-        s.crash = { phase: "crashed", batches: s.crash.phase === "writing" ? s.crash.batches : 0 };
-        s.nodeFlash.clear();
-        s.pageFlash.clear();
-        s.pool.pages.clear(); // memory is lost; the next state sync shows what recovery loaded
-        break;
-      case "recovery":
-        s.crash = { phase: "recovering", frames: Number(e.frames) || 0 };
-        break;
-      case "recovered":
-        s.crash = { phase: "done" };
-        structureChanged.current = true;
-        break;
+    if (typeof e.request === "number") {
+      // Keep the latest request's events, and the state it started from, so it can be replayed.
+      if (s.recording?.request !== e.request) s.recording = { request: e.request, events: [], start: copyState(s) };
+      if (s.recording.events.length < MAX_RECORDING) s.recording.events.push(e);
+      else s.recording.truncated = true;
     }
-    const { text, tone } = describeEvent(e);
-    s.log.push({ id: ids.current++, text, tone });
-    if (s.log.length > MAX_LOG) s.log.splice(0, s.log.length - MAX_LOG);
+    if (reduce(s, e, performance.now(), () => ids.current++)) structureChanged.current = true;
     dirty.current = true;
   }, []);
 

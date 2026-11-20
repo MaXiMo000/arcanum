@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Tree } from "../api";
 import type { Flash } from "../feed";
 import { NODE_HEIGHT, layoutTree } from "../layout";
+import type { ReplayMarker } from "./Timeline";
 import { TreeCaption, TreeTabs, pickTree, visibleKeyColumns } from "./TreeTabs";
 
 interface Props {
@@ -10,12 +11,14 @@ interface Props {
   onSelect: (name: string) => void;
   nodeFlash: Map<number, Flash>;
   flashMs: number;
+  /** While replaying a query: the node it is at and the nodes it visited so far. */
+  marker?: ReplayMarker | null;
 }
 
 const ZOOMS = [0.5, 0.75, 1, 1.25];
 const MARGIN = 24;
 
-export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs }: Props) {
+export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs, marker }: Props) {
   const [zoom, setZoom] = useState<number | "fit">("fit");
   const scroller = useRef<HTMLDivElement>(null);
   const [available, setAvailable] = useState({ width: 800, height: 420 });
@@ -120,7 +123,11 @@ export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs }: Prop
             const flash = nodeFlash.get(p.node.page);
             const active = flash && now - flash.at < flashMs ? flash : undefined;
             return (
-              <g key={p.node.page} className="node" style={{ transform: `translate(${p.x}px, ${p.y}px)` }}>
+              <g
+                key={p.node.page}
+                className={`node ${marker?.trail.has(p.node.page) ? "trail" : ""} ${marker?.node === p.node.page ? "current" : ""}`}
+                style={{ transform: `translate(${p.x}px, ${p.y}px)` }}
+              >
                 <title>
                   {`page ${p.node.page} · ${p.node.leaf ? "leaf" : "internal"} · ${p.node.keys.length} keys`}
                 </title>

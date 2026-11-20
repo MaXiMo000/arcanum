@@ -294,6 +294,9 @@ draws it, with every page a query touches lighting up in each layer it passes th
 - **The disk**: the data file page by page, coloured by the table or index that owns each page, and the
   write-ahead log, whose frames appear as they are appended, turn solid when the log is synced, and drain
   into the data file at each checkpoint. Connectors between the layers animate as pages move.
+- **Time travel**: step backwards and forwards through every event of the last query (each page read,
+  node visit, split and log write) or play it back; the map shows the engine as it was at that moment,
+  with the node the query is at, the path it took and the buffer slot it touched marked.
 - **Pull the plug**: watch committed transactions stream in, the engine get killed mid-write, and recovery
   replay the log, with a check that every acknowledged row came back.
 - Playback at full speed, normal speed or slow motion, light and dark themes, and a layout that adapts
@@ -496,8 +499,6 @@ Arcanum aims to be the clearest way to see how a database works from the inside.
   victim the detector picks.
 - **An LSM-tree engine beside the B+tree**: memtable, flushes and compaction, with the same workload
   replayed on both to compare write and read amplification.
-- **Time travel**: a scrubber over a statement's event stream to step backwards and forwards through
-  every page read, split and log append.
 - **Replication**: a Raft-replicated log across three engines, with leader election, network partitions
   and catch-up you can trigger.
 - **Buffer pool policies**: LRU, Clock and 2Q on the same workload, with their hit rates over time.
