@@ -28,6 +28,17 @@ WHERE o.amount > 400;`,
     sql: "SELECT * FROM customers WHERE city = NULL;\nSELECT count(*) FROM customers, orders;",
   },
   {
+    label: "Constraints",
+    hint: "SERIAL, CHECK, a cascading foreign key, an upsert and RETURNING",
+    sql: `CREATE TABLE IF NOT EXISTS tags (id SERIAL PRIMARY KEY, name TEXT UNIQUE, uses INTEGER CHECK (uses >= 0));
+CREATE TABLE IF NOT EXISTS order_tags (order_id INTEGER REFERENCES orders ON DELETE CASCADE,
+  tag_id INTEGER REFERENCES tags ON DELETE CASCADE, PRIMARY KEY (order_id, tag_id));
+INSERT INTO tags (name, uses) VALUES ('gift', 1), ('rush', 1)
+  ON CONFLICT (name) DO UPDATE SET uses = tags.uses + 1 RETURNING id, name, uses;
+INSERT INTO order_tags SELECT o.id, t.id FROM orders o, tags t WHERE o.id <= 3 ON CONFLICT DO NOTHING;
+DELETE FROM tags WHERE name = 'rush' RETURNING *;`,
+  },
+  {
     label: "Point lookup",
     hint: "One root-to-leaf path through the primary key",
     sql: "SELECT * FROM customers WHERE id = 7;",

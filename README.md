@@ -76,8 +76,11 @@ with Database("company.db") as db:
 
 ## SQL support
 
-- `CREATE TABLE` (with `PRIMARY KEY`, `NOT NULL`, `UNIQUE` and `DEFAULT`), `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`
-- `INSERT ... VALUES` / `INSERT ... SELECT`, `UPDATE`, `DELETE`
+- `CREATE TABLE` with `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `FOREIGN KEY` /
+  `REFERENCES` (`ON DELETE NO ACTION | RESTRICT | CASCADE | SET NULL`), named `CONSTRAINT`s, `SERIAL`
+  types and `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`; `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`
+- `INSERT ... VALUES` / `INSERT ... SELECT` with `ON CONFLICT [(columns)] DO NOTHING | DO UPDATE SET ...
+  [WHERE ...]` (the proposed row as `EXCLUDED`), `UPDATE`, `DELETE`; all three with `RETURNING`
 - `SELECT` with `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... NULLS FIRST|LAST`, `LIMIT` and `OFFSET`
 - `INNER`, `LEFT`, `RIGHT`, `FULL` and `CROSS` joins, with `ON` or `USING`
 - Scalar, `IN`, `EXISTS`, correlated and `FROM` subqueries
@@ -88,7 +91,7 @@ with Database("company.db") as db:
 - Aggregates `count`, `sum`, `avg`, `min` and `max` (with `DISTINCT`)
 - Functions `abs`, `round`, `length`, `lower`, `upper`, `trim`, `ltrim`, `rtrim`, `replace`, `substr`,
   `coalesce`, `ifnull` and `nullif`; `CASE`, `CAST`, `BETWEEN`, `LIKE`, `IN`, `IS [NOT] NULL` and `||`
-- `BEGIN [ISOLATION LEVEL READ COMMITTED | REPEATABLE READ]`, `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]`,
+- `BEGIN [ISOLATION LEVEL READ COMMITTED | REPEATABLE READ | SERIALIZABLE]`, `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]`,
   `ANALYZE [table]`
 
 ### Semantics
@@ -99,6 +102,14 @@ with Database("company.db") as db:
 - Integer division truncates toward zero; `%` takes integers; dividing by zero and integer overflow are errors.
 - `LIKE` is case-sensitive.
 - Every statement is atomic, and a committed transaction survives any crash (see below).
+- Constraints behave as in PostgreSQL:
+  - A `CHECK` that evaluates to `NULL` passes.
+  - Foreign keys are checked at the end of each statement, so rows in one `INSERT` may reference each
+    other. A key with a `NULL` in it references nothing.
+  - A referenced row that another open transaction is changing makes the statement wait.
+  - `DROP TABLE` refuses while another table's foreign key references it.
+  - Sequences are never rolled back by a transaction. A value taken by a statement that fails is
+    handed out again.
 
 Errors point at the exact spot:
 

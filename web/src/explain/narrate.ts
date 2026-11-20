@@ -1,5 +1,5 @@
 // Turns what the engine did for a statement into plain sentences, each with the reason it matters.
-import type { PlanNode } from "../api";
+import type { ConstraintNote, PlanNode } from "../api";
 import { pagesRead, planNodes, plural, type Outcome } from "../learn/outcome";
 
 export type Tone = "read" | "write" | "log" | "tree" | "plan" | "ok" | "muted";
@@ -122,6 +122,7 @@ export function narrate(outcome: Outcome): Line[] {
       why: stats.commits ? "Once the log is on disk the change survives a crash, even before the data file is updated." : undefined,
     });
   }
+  lines.push(...constraintLines(stats.constraints ?? []));
   if (stats.rollbacks) {
     lines.push({ tone: "muted", text: `${plural(stats.rollbacks, "rollback")}: the pages changed were restored as they were.` });
   }
@@ -153,4 +154,55 @@ export function headline(outcome: Outcome): string {
     s.commits && "committed",
   ].filter(Boolean);
   return parts.join(" · ");
+}
+
+/** What the constraints did: sequences, checks, foreign key actions and ON CONFLICT outcomes. */
+function constraintLines(notes: ConstraintNote[]): Line[] {
+  const lines: Line[] = [];
+  for (const n of notes) {
+    if (n.kind === "sequence") {
+      lines.push({
+        tone: "write",
+        text: `The sequence of ${n.table}.${n.column} handed out ${n.first === n.last ? n.first : `${n.first} to ${n.last}`}.`,
+        why: "Identity and SERIAL columns number rows from a sequence, which never hands out a value twice.",
+      });
+    } else if (n.kind === "constraint") {
+      lines.push(
+        n.constraint_kind === "check"
+          ? { tone: "ok", text: `CHECK ${n.name} passed for ${plural(n.rows, "row")} of ${n.table}.` }
+          : n.constraint_kind === "referenced"
+            ? {
+                tone: "ok",
+                text: `Foreign key ${n.name} looked in ${n.table} for rows still referencing ${plural(n.rows, "removed key")}.`,
+                why: "A referenced row cannot simply vanish: its foreign keys decide whether to refuse, cascade or clear.",
+              }
+            : {
+              tone: "ok",
+              text: `Foreign key ${n.name} was checked for ${plural(n.rows, "key")} of ${n.table}.`,
+              why: "A referencing key must match a live row of the referenced table; each check is an index or key lookup.",
+            },
+      );
+    } else if (n.kind === "cascade") {
+      lines.push({
+        tone: "write",
+        text: `Foreign key ${n.constraint} ${n.action === "CASCADE" ? "deleted" : "cleared the key of"} ${plural(n.rows, "row")} in ${n.table} (ON DELETE ${n.action}).`,
+        why: "Removing a referenced row applies the foreign key's action to every row that references it.",
+      });
+    }
+  }
+  const conflicts = notes.filter((n) => n.kind === "conflict");
+  if (conflicts.length) {
+    const count = (a: string) => conflicts.reduce((sum, c) => sum + (c.action === a ? c.rows : 0), 0);
+    const parts = [
+      count("update") && `updated ${plural(count("update"), "existing row")}`,
+      count("nothing") && `skipped ${plural(count("nothing"), "new row")}`,
+      count("skipped") && `left ${plural(count("skipped"), "row")} alone (its WHERE was false)`,
+    ].filter(Boolean);
+    lines.push({
+      tone: "write",
+      text: `ON CONFLICT ${parts.join(", ")} on ${conflicts[0]!.constraint}.`,
+      why: "Each proposed row is looked up on the conflict target first; a match turns the insert into an update or a skip.",
+    });
+  }
+  return lines;
 }

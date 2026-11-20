@@ -40,6 +40,18 @@ class ColumnSchema:
     type: str
     not_null: bool = False
     default: object = None
+    identity: str | None = None  # "ALWAYS" or "BY DEFAULT": filled from the column's sequence
+
+
+@dataclass(eq=False)
+class ForeignKeySchema:
+    name: str
+    table: str  # the referencing (child) table
+    columns: list  # positions in the child's rows
+    parent: str
+    ref_columns: list  # column names in the parent; empty means its primary key
+    on_delete: str
+    on_update: str
 
 
 @dataclass(eq=False)
@@ -61,6 +73,8 @@ class TableSchema:
     sql: str
     indexes: list = field(default_factory=list)
     stats: object = None  # TableStats after ANALYZE
+    checks: list = field(default_factory=list)  # [nodes.Check], each with its name
+    foreign_keys: list = field(default_factory=list)  # [ForeignKeySchema]
 
     @cached_property
     def booleans(self):
@@ -172,12 +186,88 @@ class Catalog:
         table.root = BTree.create(self.pager, self.max_keys).root
         self.tables[table.name] = table
         self._put_entry("table", table.name, sql, table.root)
-        for column in stmt.columns:
-            if column.unique:
-                name = f"{table.name}_{column.name}_key"
-                index_sql = f'CREATE UNIQUE INDEX "{name}" ON "{table.name}" ("{column.name}")'
-                self.create_index(parse(index_sql), index_sql)
+        uniques = [(None, [c.name]) for c in stmt.columns if c.unique] + list(stmt.uniques)
+        for name, columns in uniques:
+            name = name or f"{table.name}_{'_'.join(columns)}_key"
+            listed = ", ".join(f'"{c}"' for c in columns)
+            index_sql = f'CREATE UNIQUE INDEX "{name}" ON "{table.name}" ({listed})'
+            self.create_index(parse(index_sql), index_sql)
+        for fk in table.foreign_keys:
+            parent = self.tables.get(fk.parent)
+            if parent is None:
+                raise SqlError(f"table {fk.parent} referenced by foreign key {fk.name} does not exist")
+            refs = self.referenced(fk)
+            if len(refs) != len(fk.columns):
+                raise SqlError(f"foreign key {fk.name} has {len(fk.columns)} columns but references {len(refs)}")
+            if refs != parent.primary_key and not any(i.unique and i.columns == refs for i in parent.indexes):
+                raise SqlError(f"there is no unique constraint matching the columns of table {parent.name} "
+                               f"referenced by foreign key {fk.name}")
+            for child, ref in zip(fk.columns, refs, strict=True):
+                a, b = table.columns[child], parent.columns[ref]
+                if not (assignable(a.type, b.type) and assignable(b.type, a.type)):
+                    raise SqlError(f"foreign key {fk.name}: column {a.name} ({a.type}) and {parent.name}.{b.name} "
+                                   f"({b.type}) are of different types")
         return table
+
+    def referenced(self, fk):
+        """Positions, in the parent, of the columns a foreign key references."""
+        parent = self.tables[fk.parent]
+        if not fk.ref_columns:
+            if not parent.primary_key:
+                raise SqlError(f"table {parent.name} has no primary key for foreign key {fk.name} to reference")
+            return list(parent.primary_key)
+        refs = []
+        for name in fk.ref_columns:
+            pos = parent.column(name)
+            if pos is None:
+                raise SqlError(f"column {name} referenced by foreign key {fk.name} does not exist in table {parent.name}")
+            refs.append(pos)
+        return refs
+
+    def referencing(self, name):
+        """[(child table, foreign key)] for every foreign key that references table name."""
+        return [(t, fk) for t in self.tables.values() for fk in t.foreign_keys if fk.parent == name]
+
+    def nextval(self, table, column):
+        """The next value of a column's sequence. As in PostgreSQL it is never handed out twice, even when the
+        transaction that took it rolls back (a failed statement's values are reused: its pages roll back)."""
+        name = f"seq:{table.name}.{table.columns[column].name}"
+        value = self.meta.get(name, 0) + 1
+        self.set_meta(name, value)
+        return value
+
+    def live_keys(self, table, positions, values, txn):
+        """Keys of rows whose columns at positions equal values and that are live for txn: committed (or txn's
+        own) and not deleted. A matching row an open transaction is changing raises LockWaitError: PostgreSQL
+        would wait for it. Uses the primary key or an index on those columns when there is one."""
+        values = tuple(values)
+
+        def matches(row):
+            return tuple(row[i] for i in positions) == values
+
+        if positions == table.primary_key:
+            key = encode(values)
+            versions = self.chain(table, key)
+            if versions and self._live(versions, txn, matches):
+                yield key
+            return
+        index = next((i for i in table.indexes if i.columns[:len(positions)] == positions), None)
+        if index is not None:
+            prefix, size = encode(values), len(index.columns)
+            keys = []
+            for entry, _ in self.btree(index.root).scan(lo=prefix):
+                if not entry.startswith(prefix):
+                    break
+                key = encode(decode(entry)[size:])
+                if key not in keys:
+                    keys.append(key)
+            candidates = ((k, self.chain(table, k) or []) for k in keys)
+        else:
+            width = len(table.columns)
+            candidates = [(k, unpack(decode(v), width)) for k, v in self.btree(table.root).scan()]
+        for key, versions in candidates:
+            if self._live(versions, txn, matches):
+                yield key
 
     def create_index(self, stmt, sql):
         table = self.tables.get(stmt.table)
@@ -212,6 +302,10 @@ class Catalog:
         self.btree(table.root).drop()
         self.tree.delete(encode((name,)))
         self.unsettled.pop(name, None)
+        for column in table.columns:
+            sequence = f"seq:{name}.{column.name}"
+            if self.meta.pop(sequence, None) is not None:
+                self.tree.delete(encode(("", sequence)))
         for column in range(-1, len(table.columns)):
             self.tree.delete(encode((name, "stats", column)))
         self._next_rowid.pop(name, None)
@@ -623,8 +717,30 @@ def _table_from_ast(stmt, root, sql):
                 raise SqlError(f"default {_show(default)} does not fit column {c.name} of type {c.type}")
             if c.type == REAL and default is not None:
                 default = float(default)
-        columns.append(ColumnSchema(c.name, c.type, c.not_null, default))
+        if c.identity and c.default is not None:
+            raise SqlError(f"both default and identity specified for column {c.name} of table {stmt.name}")
+        columns.append(ColumnSchema(c.name, c.type, c.not_null, default, c.identity))
     table = TableSchema(stmt.name, columns, [], root, sql)
+    names = set()
+    for i, check in enumerate(stmt.checks):
+        check.name = check.name or (f"{stmt.name}_check" if i == 0 else f"{stmt.name}_check{i}")
+        if check.name in names:
+            raise SqlError(f"constraint {check.name} is defined twice in table {stmt.name}")
+        names.add(check.name)
+        table.checks.append(check)
+    for fk in stmt.foreign_keys:
+        positions = []
+        for name in fk.columns:
+            pos = table.column(name)
+            if pos is None:
+                raise SqlError(f"column {name} of a foreign key does not exist in table {stmt.name}")
+            positions.append(pos)
+        name = fk.name or f"{stmt.name}_{'_'.join(fk.columns)}_fkey"
+        if name in names:
+            raise SqlError(f"constraint {name} is defined twice in table {stmt.name}")
+        names.add(name)
+        table.foreign_keys.append(ForeignKeySchema(name, stmt.name, positions, fk.table, list(fk.ref_columns),
+                                                   fk.on_delete, fk.on_update))
     for name in stmt.primary_key:
         pos = table.column(name)
         if pos is None:

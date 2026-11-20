@@ -223,12 +223,31 @@ class Query:
 
 
 @dataclass(slots=True)
+class ForeignKey:
+    """FOREIGN KEY (columns) REFERENCES table (ref_columns): ref_columns empty means its primary key."""
+    columns: list
+    table: str
+    ref_columns: list = field(default_factory=list)
+    on_delete: str = "NO ACTION"  # NO ACTION, RESTRICT, CASCADE or SET NULL
+    on_update: str = "NO ACTION"  # NO ACTION or RESTRICT
+    name: str | None = None
+
+
+@dataclass(slots=True)
+class Check:
+    expr: object
+    name: str | None = None
+    sql: str = ""  # the condition's own text, for error messages
+
+
+@dataclass(slots=True)
 class ColumnDef:
     name: str
     type: str
     not_null: bool = False
     unique: bool = False
     default: object = None
+    identity: str | None = None  # "ALWAYS" or "BY DEFAULT" (SERIAL types are BY DEFAULT)
 
 
 @dataclass(slots=True)
@@ -237,6 +256,9 @@ class CreateTable:
     columns: list
     primary_key: list = field(default_factory=list)  # column names; empty means an implicit row id
     if_not_exists: bool = False
+    checks: list = field(default_factory=list)  # [Check], column and table constraints alike
+    foreign_keys: list = field(default_factory=list)  # [ForeignKey]
+    uniques: list = field(default_factory=list)  # [(name or None, [column names])] from table constraints
 
 
 @dataclass(slots=True)
@@ -261,10 +283,20 @@ class DropIndex:
 
 
 @dataclass(slots=True)
+class OnConflict:
+    """ON CONFLICT [(columns)] DO NOTHING | DO UPDATE SET ... [WHERE ...]."""
+    columns: list | None
+    assignments: list | None = None  # None: DO NOTHING
+    where: object = None
+
+
+@dataclass(slots=True)
 class Insert:
     table: str
     source: Query  # VALUES or SELECT
     columns: list | None = None
+    on_conflict: OnConflict | None = None
+    returning: list | None = None  # [SelectItem]
 
 
 @dataclass(slots=True)
@@ -272,12 +304,14 @@ class Update:
     table: str
     assignments: list  # [(column, expr)]
     where: object = None
+    returning: list | None = None
 
 
 @dataclass(slots=True)
 class Delete:
     table: str
     where: object = None
+    returning: list | None = None
 
 
 @dataclass(slots=True)

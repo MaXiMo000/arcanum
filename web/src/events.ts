@@ -35,6 +35,29 @@ export function describeEvent(e: EngineEvent): { text: string; tone: Tone } {
       return { text: `session ${e.session} got its lock after ${num(e.waited_ms)} ms and goes on`, tone: "ok" };
     case "deadlock":
       return { text: `deadlock detected: session ${e.session}'s transaction ${num(e.victim)} rolled back`, tone: "danger" };
+    case "constraint":
+      return {
+        text:
+          e.constraint_kind === "referenced"
+            ? `foreign key ${e.name}: looked in ${e.table} for rows referencing ${num(e.rows)} removed key${num(e.rows) === 1 ? "" : "s"}`
+            : `checked ${e.constraint_kind} ${e.name} on ${num(e.rows)} row${num(e.rows) === 1 ? "" : "s"} of ${e.table}`,
+        tone: "ok",
+      };
+    case "cascade":
+      return {
+        text: `foreign key ${e.constraint}: ${e.action === "CASCADE" ? "deleted" : "set to NULL in"} ${num(e.rows)} row${num(e.rows) === 1 ? "" : "s"} of ${e.table}`,
+        tone: "write",
+      };
+    case "sequence":
+      return {
+        text: `sequence ${e.table}.${e.column} handed out ${num(e.first) === num(e.last) ? num(e.first) : `${num(e.first)}–${num(e.last)}`}`,
+        tone: "write",
+      };
+    case "conflict":
+      return {
+        text: `ON CONFLICT on ${e.constraint}: ${num(e.rows)} row${num(e.rows) === 1 ? "" : "s"} ${e.action === "update" ? "updated" : e.action === "nothing" ? "skipped" : "left alone (WHERE was false)"}`,
+        tone: "muted",
+      };
     case "rw_conflict":
       return {
         text: `rw-dependency: transaction ${num(e.reader)} (${e.reader_session}) read ${e.what}, which ${num(e.writer)} (${e.writer_session}) changed`,

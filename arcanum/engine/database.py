@@ -6,10 +6,11 @@ from dataclasses import dataclass, field
 from ..errors import ArcanumError, LockWaitError, SqlError
 from ..sql import nodes as n
 from ..sql.parser import parse_statements
-from ..storage import Pager, encode
+from ..storage import Pager
 from .advisor import advise
 from .binder import Binder
 from .catalog import Catalog
+from .dml import Writer
 from .executor import Context, QueryLimits, index_scan_pairs, run
 from .expr import conjuncts
 from .mvcc import READ_COMMITTED, REPEATABLE_READ, XID_BATCH, TransactionManager
@@ -252,14 +253,16 @@ class Database:
                 result.execution_ms = (time.perf_counter() - planned) * 1000
             return self._traced(result, statement, text, plan, stats, decisions)
         if isinstance(statement, n.Insert):
-            return self._insert(binder, statement)
+            return Writer(self, binder).insert(statement)
         if isinstance(statement, (n.Update, n.Delete)):
-            result = self._update(binder, statement) if isinstance(statement, n.Update) else self._delete(binder, statement)
+            writer = Writer(self, binder)
+            result = writer.update(statement) if isinstance(statement, n.Update) else writer.delete(statement)
             return self._traced(result, statement, text) if trace else result
         if isinstance(statement, n.CreateTable):
             if statement.name in self.catalog.tables and statement.if_not_exists:
                 return Result(status="CREATE TABLE")
-            self.catalog.create_table(statement, text)
+            table = self.catalog.create_table(statement, text)
+            Writer(self, binder).checks(table)  # bind the CHECK constraints now, so mistakes fail the CREATE
             return Result(status="CREATE TABLE")
         if isinstance(statement, n.CreateIndex):
             if statement.name in self.catalog.indexes and statement.if_not_exists:
@@ -271,6 +274,10 @@ class Database:
                 if statement.if_exists:
                     return Result(status="DROP TABLE")
                 raise SqlError(f"table {statement.name} does not exist")
+            for child, fk in self.catalog.referencing(statement.name):
+                if child.name != statement.name:
+                    raise SqlError(f"cannot drop table {statement.name} because foreign key {fk.name} on table "
+                                   f"{child.name} depends on it; drop {child.name} first")
             self.catalog.drop_table(statement.name)
             return Result(status="DROP TABLE")
         if isinstance(statement, n.DropIndex):
@@ -289,22 +296,6 @@ class Database:
                 self.catalog.analyze(table, self._snapshot)
             return Result(status="ANALYZE")
         raise SqlError(f"Arcanum doesn't support {type(statement).__name__} yet")
-
-    def _insert(self, binder, statement):
-        table, positions, source = binder.bind_insert(statement)
-        source = self._plan(source)
-        # Read every source row first, so INSERT ... SELECT from the same table never sees its own inserts.
-        ctx, rows = self._context(), []
-        for values in run(source, ctx):
-            ctx.hold()
-            rows.append(values)
-        defaults = [c.default for c in table.columns]
-        for values in rows:
-            row = list(defaults)
-            for pos, value in zip(positions, values, strict=True):
-                row[pos] = value
-            self.catalog.insert_row(table, self.catalog.check_row(table, row), self._txn)
-        return Result(rowcount=len(rows), status=f"INSERT {len(rows)}")
 
     def _traced(self, result, statement, text, plan=None, stats=None, decisions=None):
         """Attach the plan tree (with actual rows and time, if measured), the planner's decisions and the advisor's hints."""
@@ -351,42 +342,6 @@ class Database:
             if hit is not None:
                 locked.append((key, row, *hit))
         return locked
-
-    def _update(self, binder, statement):
-        table, where, assignments = binder.bind_update(statement)
-        ctx = self._context()
-        targets = self._locked_rows(ctx, table, where)
-        compiled = [(pos, ctx.compile(e)) for pos, e in assignments]
-        stayed, moved = [], []
-        for key, row, versions, current in targets:
-            new = list(row)
-            for pos, f in compiled:
-                new[pos] = f(row, ())
-            new = self.catalog.check_row(table, new)
-            if not table.primary_key or encode(tuple(new[i] for i in table.primary_key)) == key:
-                stayed.append((key, versions, current, new))
-            else:
-                moved.append((key, versions, current, new))
-        # Every old version is marked deleted before uniqueness is checked, so swapping keys or unique
-        # values between rows (UPDATE t SET id = id + 1) is not mistaken for a duplicate.
-        for key, versions, current, new in stayed:
-            self.catalog.update_version(table, key, versions, current, new, self._txn)
-        for key, versions, current, _ in moved:
-            self.catalog.delete_version(table, key, versions, current, self._txn)
-        for _, _, _, new in moved:
-            self.catalog.insert_row(table, new, self._txn)
-        for key, _, _, new in stayed:
-            self.catalog.check_unique(table, new, key, self._txn)
-        return Result(rowcount=len(targets), status=f"UPDATE {len(targets)}")
-
-    def _delete(self, binder, statement):
-        table, where = binder.bind_delete(statement)
-        targets = self._locked_rows(self._context(), table, where)
-        for key, _, versions, current in targets:
-            self.catalog.delete_version(table, key, versions, current, self._txn)
-        return Result(rowcount=len(targets), status=f"DELETE {len(targets)}")
-
-
 
 
 class Connection:

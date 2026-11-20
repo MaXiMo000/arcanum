@@ -71,6 +71,7 @@ class EventPump:
         self.seq = 0
         self.count = 0
         self.kinds = Counter()  # every event of the current request, counted even past the limit
+        self.notes = []
         self.started = time.perf_counter()
         self.request = 0  # numbers each request, so a viewer can replay one request's events
 
@@ -78,6 +79,7 @@ class EventPump:
         self.request += 1
         self.count = 0
         self.kinds = Counter()
+        self.notes = []  # constraint checks, cascades, sequences and conflicts, for the explanation
         self.started = time.perf_counter()
 
     def request_stats(self, kinds=None, elapsed=None):
@@ -103,10 +105,13 @@ class EventPump:
             "checkpoints": k["checkpoint"],
             "rollbacks": k["rollback"],
             "sort_spills": k["sort_spill"],
+            "constraints": self.notes[:NOTES],
         }
 
     def on_event(self, kind, data):
         self.kinds[kind] += 1
+        if kind in ("constraint", "cascade", "sequence", "conflict"):
+            self.notes.append({"kind": kind, **data})
         if kind == "page_read":
             self.kinds["read:cache" if data.get("source") == "cache" else "read:disk"] += 1
         self.count += 1
@@ -222,6 +227,7 @@ def worker_main(path, conn, event_conn, options):
 
 
 SESSIONS = ("A", "B")  # the database sessions each visitor can type into, side by side
+NOTES = 50  # constraint notes kept per request
 VERSION_ROWS = 40  # rows with versions the state shows at most
 
 

@@ -12,8 +12,9 @@ from .lexer import EOF, FLOAT, INT, OP, QUOTED, STRING, WORD, tokenize
 
 # Words that are never a bare name. Other keywords (KEY, INDEX, ROWS, FIRST, ...)
 # only mean something in one spot, so they stay usable as table and column names.
-RESERVED = frozenset(["ALL", "AND", "AS", "ASC", "BETWEEN", "BY", "CASE", "CAST", "CROSS", "DESC", "DISTINCT", "ELSE", "END", "EXCEPT", "EXISTS", "FALSE", "FROM", "FULL", "GROUP", "HAVING", "IN", "INNER", "INTERSECT", "IS", "JOIN", "LATERAL", "LEFT", "LIKE", "LIMIT", "NATURAL", "NOT", "NULL", "OFFSET", "ON", "OR", "ORDER", "OUTER", "OVER", "RIGHT", "SELECT", "SET", "THEN", "TRUE", "UNION", "USING", "VALUES", "WHEN", "WHERE", "WINDOW", "WITH"])
+RESERVED = frozenset(["ALL", "AND", "AS", "ASC", "BETWEEN", "BY", "CASE", "CAST", "CHECK", "CONSTRAINT", "CROSS", "DESC", "DISTINCT", "ELSE", "END", "EXCEPT", "EXISTS", "FALSE", "FOREIGN", "FROM", "FULL", "GROUP", "HAVING", "IN", "INNER", "INTERSECT", "IS", "JOIN", "LATERAL", "LEFT", "LIKE", "LIMIT", "NATURAL", "NOT", "NULL", "OFFSET", "ON", "OR", "ORDER", "OUTER", "OVER", "REFERENCES", "RETURNING", "RIGHT", "SELECT", "SET", "THEN", "TRUE", "UNION", "USING", "VALUES", "WHEN", "WHERE", "WINDOW", "WITH"])
 
+SERIALS = {"SERIAL", "BIGSERIAL", "SMALLSERIAL", "SERIAL4", "SERIAL8", "SERIAL2"}  # INTEGER with a sequence
 TYPES = {
     "INTEGER": "INTEGER", "INT": "INTEGER", "BIGINT": "INTEGER", "SMALLINT": "INTEGER",
     "REAL": "REAL", "FLOAT": "REAL", "DOUBLE": "REAL",
@@ -230,26 +231,43 @@ class _Parser:
         columns = self.paren_names() if self.is_op("(") and not self.is_kw(*_QUERY_START, tok=self.peek()) else None
         if not (self.starts_query() or self.is_op("(")):
             raise self.error(f"expected VALUES or SELECT, got {self.describe()}")
-        return n.Insert(table, self.query(), columns)
+        source = self.query()
+        on_conflict = None
+        if self.accept_kw("ON"):
+            self.expect_kw("CONFLICT")
+            target = self.paren_names() if self.is_op("(") else None
+            self.expect_kw("DO")
+            if self.accept_kw("NOTHING"):
+                on_conflict = n.OnConflict(target)
+            else:
+                self.expect_kw("UPDATE")
+                if target is None:
+                    raise self.error("ON CONFLICT DO UPDATE needs a conflict target, such as ON CONFLICT (id)")
+                self.expect_kw("SET")
+                assignments = self.comma_list(self.assignment)
+                on_conflict = n.OnConflict(target, assignments, self.expr() if self.accept_kw("WHERE") else None)
+        return n.Insert(table, source, columns, on_conflict, self.returning())
+
+    def assignment(self):
+        column = self.ident("a column name")
+        self.expect_op("=")
+        return column, self.expr()
+
+    def returning(self):
+        return self.comma_list(self.select_item) if self.accept_kw("RETURNING") else None
 
     def update(self):
         table = self.ident("a table name")
         self.expect_kw("SET")
-
-        def assignment():
-            column = self.ident("a column name")
-            self.expect_op("=")
-            return column, self.expr()
-
-        assignments = self.comma_list(assignment)
+        assignments = self.comma_list(self.assignment)
         where = self.expr() if self.accept_kw("WHERE") else None
-        return n.Update(table, assignments, where)
+        return n.Update(table, assignments, where, self.returning())
 
     def delete(self):
         self.expect_kw("FROM")
         table = self.ident("a table name")
         where = self.expr() if self.accept_kw("WHERE") else None
-        return n.Delete(table, where)
+        return n.Delete(table, where, self.returning())
 
     def create(self):
         unique = bool(self.accept_kw("UNIQUE"))
@@ -271,35 +289,105 @@ class _Parser:
         if_not_exists = self.if_not_exists()
         name = self.ident("a table name")
         self.expect_op("(")
-        columns, primary_key = [], []
+        stmt = n.CreateTable(name, [], [], if_not_exists)
         while True:
             tok = self.tok
+            constraint = self.ident("a constraint name") if self.accept_kw("CONSTRAINT") else None
             if self.accept_kw("PRIMARY"):
                 self.expect_kw("KEY")
-                if primary_key:
+                if stmt.primary_key:
                     raise self.error("table has more than one primary key", tok)
-                primary_key = self.paren_names()
+                stmt.primary_key = self.paren_names()
+            elif self.accept_kw("UNIQUE"):
+                stmt.uniques.append((constraint, self.paren_names()))
+            elif self.is_kw("CHECK"):
+                stmt.checks.append(self.check(constraint))
+            elif self.accept_kw("FOREIGN"):
+                self.expect_kw("KEY")
+                columns = self.paren_names()
+                stmt.foreign_keys.append(self.references(columns, constraint))
+            elif constraint is not None:
+                raise self.error(f"expected PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY, got {self.describe()}")
             else:
-                column, is_pk = self.column_def()
+                column, is_pk = self.column_def(stmt)
                 if is_pk:
-                    if primary_key:
+                    if stmt.primary_key:
                         raise self.error("table has more than one primary key", tok)
-                    primary_key = [column.name]
-                columns.append(column)
+                    stmt.primary_key = [column.name]
+                stmt.columns.append(column)
             if not self.accept_op(","):
                 break
         self.expect_op(")")
-        if not columns:
+        if not stmt.columns:
             raise self.error("a table needs at least one column")
-        return n.CreateTable(name, columns, primary_key, if_not_exists)
+        return stmt
 
-    def column_def(self):
-        column = n.ColumnDef(self.ident("a column name"), self.type_name())
+    def check(self, name):
+        self.expect_kw("CHECK")
+        self.expect_op("(")
+        start = self.tok.pos
+        expr = self.expr()
+        text = self.sql[start:self.tok.pos].strip()
+        self.expect_op(")")
+        return n.Check(expr, name, text)
+
+    def references(self, columns, name):
+        self.expect_kw("REFERENCES")
+        fk = n.ForeignKey(columns, self.ident("a table name"), self.paren_names() if self.is_op("(") else [], name=name)
+        while self.accept_kw("ON"):
+            event = self.accept_kw("DELETE", "UPDATE")
+            if event is None:
+                raise self.error(f"expected DELETE or UPDATE, got {self.describe()}")
+            tok = self.tok
+            if self.accept_kw("CASCADE"):
+                action = "CASCADE"
+            elif self.accept_kw("RESTRICT"):
+                action = "RESTRICT"
+            elif self.accept_kw("NO"):
+                self.expect_kw("ACTION")
+                action = "NO ACTION"
+            elif self.accept_kw("SET"):
+                if not self.accept_kw("NULL"):
+                    raise self.unsupported("ON DELETE SET DEFAULT (use SET NULL or CASCADE)", tok)
+                action = "SET NULL"
+            else:
+                raise self.error(f"expected CASCADE, RESTRICT, NO ACTION or SET NULL, got {self.describe()}")
+            if event == "UPDATE":
+                if action not in ("NO ACTION", "RESTRICT"):
+                    raise self.unsupported(f"ON UPDATE {action} (use NO ACTION or RESTRICT)", tok)
+                fk.on_update = action
+            else:
+                fk.on_delete = action
+        return fk
+
+    def column_def(self, table):
+        name = self.ident("a column name")
+        if self.tok.kind == WORD and self.tok.value.upper() in SERIALS:
+            self.advance()
+            column = n.ColumnDef(name, "INTEGER", not_null=True, identity="BY DEFAULT")
+        else:
+            column = n.ColumnDef(name, self.type_name())
         is_pk = False
         while True:
+            constraint = self.ident("a constraint name") if self.accept_kw("CONSTRAINT") else None
             if self.accept_kw("PRIMARY"):
                 self.expect_kw("KEY")
                 is_pk = True
+            elif self.is_kw("CHECK"):
+                table.checks.append(self.check(constraint or f"{table.name}_{name}_check"))
+            elif self.is_kw("REFERENCES"):
+                table.foreign_keys.append(self.references([name], constraint))
+            elif self.accept_kw("GENERATED"):
+                mode = "ALWAYS" if self.accept_kw("ALWAYS") else None
+                if mode is None:
+                    self.expect_kw("BY")
+                    self.expect_kw("DEFAULT")
+                    mode = "BY DEFAULT"
+                self.expect_kw("AS")
+                self.expect_kw("IDENTITY")
+                if column.type != "INTEGER":
+                    raise self.error(f"identity column {name} must be an integer")
+                column.identity, column.not_null = mode, True
             elif self.accept_kw("NOT"):
                 self.expect_kw("NULL")
                 column.not_null = True

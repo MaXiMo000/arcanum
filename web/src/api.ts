@@ -81,7 +81,15 @@ export interface QueryStats {
   checkpoints: number;
   rollbacks: number;
   sort_spills: number;
+  /** Constraint work: checks, foreign key cascades, sequence values and ON CONFLICT outcomes. */
+  constraints?: ConstraintNote[];
 }
+
+export type ConstraintNote =
+  | { kind: "constraint"; constraint_kind: "check" | "foreign key" | "referenced"; name: string; table: string; rows: number }
+  | { kind: "cascade"; constraint: string; table: string; action: "CASCADE" | "SET NULL"; rows: number }
+  | { kind: "sequence"; table: string; column: string; first: number; last: number }
+  | { kind: "conflict"; table: string; action: "nothing" | "update" | "skipped"; constraint: string; rows: number };
 
 /** The error doctor's diagnosis (arcanum/engine/doctor.py). */
 export interface Doctor {
