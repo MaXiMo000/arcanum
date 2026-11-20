@@ -152,7 +152,8 @@ export default function Vault({ trees, selected, onSelect, feed, flashMs, state,
           role="img"
         >
           <color attach="background" args={[COLORS.background]} />
-          <fog attach="fog" args={[COLORS.background, 28, 110]} />
+          {/* Fog starts beyond the scene, wherever the camera has backed off to, and swallows the floor's edge. */}
+          <fog attach="fog" args={[COLORS.background, Math.max(28, bounds.width * 1.6), Math.max(110, bounds.width * 5)]} />
           <Scenery motion={motion} />
           <CrashMotion feed={feed} motion={motion} />
           <CrystalTree placement={placement} feed={feed} flashMs={flashMs} motion={motion} onHover={onNodeHover} />

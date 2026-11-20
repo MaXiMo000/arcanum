@@ -9,15 +9,17 @@ import {
   CanvasTexture,
   Color,
   DoubleSide,
-  Group,
   IcosahedronGeometry,
+  InstancedBufferAttribute,
   InstancedMesh,
   type InterleavedBufferAttribute,
+  Matrix4,
   MeshBasicMaterial,
   MeshPhysicalMaterial,
   Object3D,
   PlaneGeometry,
   SRGBColorSpace,
+  ShaderMaterial,
   TorusGeometry,
   Vector3,
 } from "three";
@@ -33,7 +35,11 @@ const COMETS = 64;
 const TRAIL = 6; // glowing beads behind each comet's head
 const RINGS = 48;
 const MAX_LABELS = 400; // beyond this, slabs stay unlabelled (hover still shows the keys)
-const LABEL_PX = 64; // texture pixels per world unit of slab length
+const ATLAS_WIDTH = 4096;
+const CELL_WIDTH = 512; // one label per cell, its width trimmed to the slab face's proportions
+const CELL_HEIGHT = 52;
+const FACE_WIDTH = 0.94; // of the slab's length
+const FACE_HEIGHT = 0.86; // of the slab's height
 
 interface Comet {
   edge: number;
@@ -54,79 +60,134 @@ interface Props {
   onHover: (page: number | null, event?: ThreeEvent<PointerEvent>) => void;
 }
 
-/** A slab's face: its keys in cells divided by thin rules, drawn once per distinct text and length. */
-function labelTexture(node: CrystalNode): CanvasTexture {
-  const width = Math.max(64, Math.round(node.length * LABEL_PX * 2));
-  const height = Math.round(SLAB_HEIGHT * LABEL_PX * 2);
+/**
+ * Every slab's face in one texture: each label in its own cell, the keys divided by thin rules. Returns
+ * the texture and, per label, the [u, v, width, height] of its cell, for the label shader.
+ */
+function labelAtlas(nodes: CrystalNode[]): { texture: CanvasTexture; rects: Float32Array } {
+  const columns = ATLAS_WIDTH / CELL_WIDTH;
+  const rows = Math.max(1, Math.ceil(nodes.length / columns));
   const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
+  canvas.width = ATLAS_WIDTH;
+  canvas.height = rows * CELL_HEIGHT;
   const ctx = canvas.getContext("2d")!;
-  const keys = node.labels.length ? node.labels : ["empty"];
-  const cell = width / keys.length;
-  ctx.font = `600 ${Math.round(height * 0.42)}px "JetBrains Mono Variable", ui-monospace, monospace`;
+  ctx.font = `600 ${Math.round(CELL_HEIGHT * 0.46)}px "JetBrains Mono Variable", ui-monospace, monospace`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  keys.forEach((key, i) => {
-    if (i > 0) {
-      ctx.fillStyle = "rgba(255,255,255,0.22)";
-      ctx.fillRect(Math.round(i * cell) - 1, height * 0.22, 2, height * 0.56);
-    }
-    ctx.fillStyle = node.labels.length ? "rgba(255,255,255,0.96)" : "rgba(255,255,255,0.45)";
-    const text = ctx.measureText(key).width > cell * 0.9 ? `${key.slice(0, Math.max(1, Math.floor(key.length * (cell * 0.9) / ctx.measureText(key).width) - 1))}…` : key;
-    ctx.fillText(text, (i + 0.5) * cell, height / 2 + 1);
+  const rects = new Float32Array(nodes.length * 4);
+  nodes.forEach((node, i) => {
+    const x0 = (i % columns) * CELL_WIDTH;
+    const y0 = Math.floor(i / columns) * CELL_HEIGHT;
+    // Trim the cell to the face's proportions so the text is never stretched.
+    const aspect = (node.length * FACE_WIDTH) / (SLAB_HEIGHT * FACE_HEIGHT);
+    const width = Math.min(CELL_WIDTH, Math.round(CELL_HEIGHT * aspect));
+    const keys = node.labels.length ? node.labels : ["empty"];
+    const cell = width / keys.length;
+    keys.forEach((key, k) => {
+      if (k > 0) {
+        ctx.fillStyle = "rgba(255,255,255,0.22)";
+        ctx.fillRect(x0 + Math.round(k * cell) - 1, y0 + CELL_HEIGHT * 0.22, 2, CELL_HEIGHT * 0.56);
+      }
+      ctx.fillStyle = node.labels.length ? "rgba(255,255,255,0.96)" : "rgba(255,255,255,0.45)";
+      const measured = ctx.measureText(key).width;
+      const text = measured > cell * 0.9 ? `${key.slice(0, Math.max(1, Math.floor((key.length * cell * 0.9) / measured) - 1))}…` : key;
+      ctx.fillText(text, x0 + (k + 0.5) * cell, y0 + CELL_HEIGHT / 2 + 1);
+    });
+    // The texture is flipped vertically on upload, so v counts from the bottom of the canvas.
+    rects.set([x0 / canvas.width, 1 - (y0 + CELL_HEIGHT) / canvas.height, width / canvas.width, CELL_HEIGHT / canvas.height], i * 4);
   });
   const texture = new CanvasTexture(canvas);
   texture.colorSpace = SRGBColorSpace;
   texture.anisotropy = 4;
-  return texture;
+  return { texture, rects };
+}
+
+/** Draws each label instance's own cell of the atlas onto a unit quad. */
+function labelMaterial(texture: CanvasTexture) {
+  return new ShaderMaterial({
+    uniforms: { map: { value: texture }, opacity: { value: 1 } },
+    vertexShader: `
+      attribute vec4 uvRect;
+      varying vec2 vUv;
+      void main() {
+        vUv = uvRect.xy + uv * uvRect.zw;
+        gl_Position = projectionMatrix * modelViewMatrix * instanceMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: `
+      uniform sampler2D map;
+      uniform float opacity;
+      varying vec2 vUv;
+      void main() {
+        vec4 c = texture2D(map, vUv);
+        if (c.a < 0.04) discard;
+        gl_FragColor = vec4(c.rgb, c.a * opacity);
+      }`,
+    transparent: true,
+    depthWrite: false,
+    toneMapped: false,
+  });
 }
 
 export const CrystalTree = memo(function CrystalTree({ placement, feed, flashMs, motion, onHover }: Props) {
   const { nodes, edges, links } = placement;
   const { size } = useThree();
-  const groups = useRef<(Group | null)[]>([]);
+  const bodies = useRef<(InstancedMesh | null)[]>([]);
+  const glows = useRef<(InstancedMesh | null)[]>([]);
+  const labelMesh = useRef<InstancedMesh>(null);
   const cometMesh = useRef<InstancedMesh>(null);
   const ringMesh = useRef<InstancedMesh>(null);
   const hovered = useRef<number | null>(null);
 
-  // One rounded geometry per slab length (rounded), shared by slabs of the same size.
-  const geometries = useMemo(() => {
-    const cache = new Map<number, RoundedBoxGeometry>();
-    return nodes.map((n) => {
+  // Slabs of the same length share one rounded geometry and one instanced draw (and one more for their
+  // flash glow), so the tree costs a handful of draw calls however many nodes it has.
+  const buckets = useMemo(() => {
+    const byLength = new Map<number, number[]>();
+    nodes.forEach((n, i) => {
       const length = Math.round(n.length * 20) / 20;
-      let g = cache.get(length);
-      if (!g) {
-        g = new RoundedBoxGeometry(length, SLAB_HEIGHT, SLAB_DEPTH, 3, 0.1);
-        cache.set(length, g);
-      }
-      return g;
+      byLength.set(length, [...(byLength.get(length) ?? []), i]);
     });
+    return [...byLength].map(([length, members]) => ({
+      members,
+      geometry: new RoundedBoxGeometry(length, SLAB_HEIGHT, SLAB_DEPTH, 3, 0.1),
+    }));
   }, [nodes]);
-  const materials = useMemo(
+  const place = useMemo(() => {
+    const at = new Array<[number, number]>(nodes.length);
+    buckets.forEach((b, i) => b.members.forEach((node, k) => (at[node] = [i, k])));
+    return at;
+  }, [buckets, nodes.length]);
+  const bodyMaterial = useMemo(
     () =>
-      nodes.map(
-        (n) =>
-          new MeshPhysicalMaterial({
-            color: n.leaf ? COLORS.leaf : COLORS.internal,
-            emissive: n.leaf ? COLORS.leafGlow : COLORS.internalGlow,
-            emissiveIntensity: 0.35,
-            roughness: 0.22,
-            metalness: 0.25,
-            clearcoat: 1,
-            clearcoatRoughness: 0.15,
-          }),
-      ),
-    [nodes],
+      new MeshPhysicalMaterial({
+        roughness: 0.22,
+        metalness: 0.25,
+        clearcoat: 1,
+        clearcoatRoughness: 0.15,
+        emissive: new Color("#0b1030"),
+      }),
+    [],
   );
-  const labels = useMemo(
-    () =>
-      nodes.slice(0, MAX_LABELS).map((n) => ({
-        geometry: new PlaneGeometry(n.length * 0.94, SLAB_HEIGHT * 0.86),
-        material: new MeshBasicMaterial({ map: labelTexture(n), transparent: true, depthWrite: false, toneMapped: false }),
-      })),
-    [nodes],
+  const glowMaterial = useMemo(
+    () => new MeshBasicMaterial({ toneMapped: false, blending: AdditiveBlending, transparent: true, depthWrite: false }),
+    [],
   );
+  // Labels: one quad per face (front and back), each showing its own cell of a shared atlas.
+  const labels = useMemo(() => {
+    const labelled = nodes.slice(0, MAX_LABELS);
+    const { texture, rects } = labelAtlas(labelled);
+    const geometry = new PlaneGeometry(1, 1);
+    const both = new Float32Array(rects.length * 2);
+    both.set(rects);
+    both.set(rects, rects.length);
+    geometry.setAttribute("uvRect", new InstancedBufferAttribute(both, 4));
+    const faces = labelled.map((n) => {
+      const scale = new Matrix4().makeScale(n.length * FACE_WIDTH, SLAB_HEIGHT * FACE_HEIGHT, 1);
+      const front = new Matrix4().makeTranslation(0, 0, SLAB_DEPTH / 2 + 0.006).multiply(scale);
+      const back = new Matrix4().makeRotationY(Math.PI).multiply(new Matrix4().makeTranslation(0, 0, SLAB_DEPTH / 2 + 0.006)).multiply(scale);
+      return [front, back] as const;
+    });
+    return { count: labelled.length, texture, geometry, material: labelMaterial(texture), faces };
+  }, [nodes]);
 
   // Pointers (fat lines along bezier curves) and the leaf chain, rebuilt each frame as slabs move.
   const pointer = useMemo(() => {
@@ -175,17 +236,15 @@ export const CrystalTree = memo(function CrystalTree({ placement, feed, flashMs,
   const seen = useRef(new Map<number, number>());
   const edgeTo = useMemo(() => new Map(edges.map((e, i) => [e.to, i])), [edges]);
 
+  useEffect(() => () => buckets.forEach((b) => b.geometry.dispose()), [buckets]);
+  useEffect(() => () => [bodyMaterial, glowMaterial].forEach((m) => m.dispose()), [bodyMaterial, glowMaterial]);
   useEffect(
     () => () => {
-      new Set(geometries).forEach((g) => g.dispose());
-      materials.forEach((m) => m.dispose());
-      labels.forEach((l) => {
-        l.geometry.dispose();
-        l.material.map?.dispose();
-        l.material.dispose();
-      });
+      labels.texture.dispose();
+      labels.geometry.dispose();
+      labels.material.dispose();
     },
-    [geometries, materials, labels],
+    [labels],
   );
   useEffect(
     () => () => {
@@ -199,9 +258,11 @@ export const CrystalTree = memo(function CrystalTree({ placement, feed, flashMs,
   );
   // Per-instance colours must exist before the first draw, so the shaders are built to use them.
   useLayoutEffect(() => {
-    for (const mesh of [cometMesh.current, ringMesh.current]) if (mesh && !mesh.instanceColor) mesh.setColorAt(0, COLORS.spark);
-    cometMaterial.needsUpdate = ringMaterial.needsUpdate = true;
-  }, [cometMaterial, ringMaterial]);
+    for (const mesh of [cometMesh.current, ringMesh.current, ...bodies.current, ...glows.current]) {
+      if (mesh && !mesh.instanceColor) mesh.setColorAt(0, COLORS.spark);
+    }
+    cometMaterial.needsUpdate = ringMaterial.needsUpdate = bodyMaterial.needsUpdate = glowMaterial.needsUpdate = true;
+  }, [cometMaterial, ringMaterial, bodyMaterial, glowMaterial, buckets]);
 
   useEffect(() => {
     pointer.material.resolution.set(size.width, size.height);
@@ -215,35 +276,49 @@ export const CrystalTree = memo(function CrystalTree({ placement, feed, flashMs,
     const color = scratch.color;
 
     // Slabs: drift, swell when visited, flare when split, scatter on a crash.
+    const slab = scratch.object;
+    const labelInstances = labelMesh.current;
     nodes.forEach((n, i) => {
-      const group = groups.current[i];
-      const material = materials[i]!;
-      if (!group) return;
+      const [bucket, k] = place[i]!;
+      const body = bodies.current[bucket];
+      const halo = glows.current[bucket];
+      if (!body || !halo) return;
       const flash = feed.nodeFlash.get(n.page);
       const g = glow(flash, now, flashMs);
       const away = scatter[i]!;
       const bob = reduced ? 0 : Math.sin(t * 0.8 + i * 0.7) * 0.05;
       const p = positions[i]!;
       p.set(n.x + away.x * shatter * 7, n.y + bob + away.y * shatter * 5, n.z + away.z * shatter * 7);
-      group.position.copy(p);
-      group.rotation.set(away.x * shatter * 3, n.angle, away.z * shatter * 3);
-      const lift = hovered.current === i ? 1.06 : 1;
-      group.scale.setScalar((1 + g * 0.16) * lift);
+      slab.position.copy(p);
+      slab.rotation.set(away.x * shatter * 3, n.angle, away.z * shatter * 3);
+      slab.scale.setScalar((1 + g * 0.16) * (hovered.current === i ? 1.06 : 1));
+      slab.updateMatrix();
+      body.setMatrixAt(k, slab.matrix);
+      if (labelInstances && i < labels.count) {
+        const [front, back] = labels.faces[i]!;
+        labelInstances.setMatrixAt(i, scratch.matrix.multiplyMatrices(slab.matrix, front));
+        labelInstances.setMatrixAt(labels.count + i, scratch.matrix.multiplyMatrices(slab.matrix, back));
+      }
 
-      const rest = n.leaf ? COLORS.leafGlow : COLORS.internalGlow;
-      color.copy(rest);
-      let intensity = hovered.current === i ? 0.9 : 0.35;
-      if (g > 0) {
-        color.lerp(flash!.kind === "split" ? COLORS.split : COLORS.visit, Math.min(1, g * 1.4));
-        intensity += g * 1.3;
-      }
-      if (shatter > 0) {
-        color.lerp(COLORS.danger, shatter * 0.8);
-        intensity += shatter * 1.5;
-      }
-      material.emissive.copy(color);
-      material.emissiveIntensity = intensity;
+      color.copy(n.leaf ? COLORS.leaf : COLORS.internal);
+      if (hovered.current === i) color.multiplyScalar(1.35);
+      if (shatter > 0) color.lerp(COLORS.danger, shatter * 0.8);
+      body.setColorAt(k, color);
+      // The glow shell, slightly larger, is black (invisible, blended additively) unless the node flashes.
+      slab.scale.multiplyScalar(1.05);
+      slab.updateMatrix();
+      halo.setMatrixAt(k, slab.matrix);
+      if (g > 0) color.copy(flash!.kind === "split" ? COLORS.split : COLORS.visit).multiplyScalar(g * 1.1);
+      else color.setRGB(shatter * 0.5, 0, 0);
+      halo.setColorAt(k, color);
     });
+    for (const mesh of [...bodies.current, ...glows.current, labelInstances]) {
+      if (!mesh) continue;
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      mesh.boundingSphere = null; // recomputed when hovering, since the slabs move
+    }
+    labels.material.uniforms.opacity!.value = 1 - shatter * 0.7;
 
     // Pointers: a bezier from the parent's key gap down to the child's top, lit where the descent passed.
     const pos = buffers.pointerPositions;
@@ -378,10 +453,11 @@ export const CrystalTree = memo(function CrystalTree({ placement, feed, flashMs,
     }
   });
 
-  const hover = (i: number) => (e: ThreeEvent<PointerEvent>) => {
+  const hover = (members: number[]) => (e: ThreeEvent<PointerEvent>) => {
     e.stopPropagation();
-    hovered.current = i;
-    onHover(nodes[i]!.page, e);
+    const i = e.instanceId !== undefined ? members[e.instanceId] : undefined;
+    hovered.current = i ?? null;
+    onHover(i !== undefined ? nodes[i]!.page : null, e);
   };
   const leave = () => {
     hovered.current = null;
@@ -390,29 +466,32 @@ export const CrystalTree = memo(function CrystalTree({ placement, feed, flashMs,
 
   return (
     <group>
-      {nodes.map((n, i) => (
-        <group key={n.page} ref={(g) => void (groups.current[i] = g)}>
-          <mesh
-            geometry={geometries[i]}
-            material={materials[i]}
-            castShadow
-            onPointerMove={hover(i)}
+      {buckets.map((b, i) => (
+        <group key={`${nodes.length}-${i}`}>
+          <instancedMesh
+            ref={(m) => void (bodies.current[i] = m)}
+            args={[b.geometry, bodyMaterial, b.members.length]}
+            frustumCulled={false}
+            onPointerMove={hover(b.members)}
             onPointerOut={leave}
           />
-          {labels[i] && (
-            <mesh geometry={labels[i]!.geometry} material={labels[i]!.material} position={[0, 0, SLAB_DEPTH / 2 + 0.006]} raycast={noRaycast} />
-          )}
-          {labels[i] && (
-            <mesh
-              geometry={labels[i]!.geometry}
-              material={labels[i]!.material}
-              position={[0, 0, -SLAB_DEPTH / 2 - 0.006]}
-              rotation={[0, Math.PI, 0]}
-              raycast={noRaycast}
-            />
-          )}
+          <instancedMesh
+            ref={(m) => void (glows.current[i] = m)}
+            args={[b.geometry, glowMaterial, b.members.length]}
+            frustumCulled={false}
+            raycast={noRaycast}
+          />
         </group>
       ))}
+      {labels.count > 0 && (
+        <instancedMesh
+          key={`labels-${labels.count}`}
+          ref={labelMesh}
+          args={[labels.geometry, labels.material, labels.count * 2]}
+          frustumCulled={false}
+          raycast={noRaycast}
+        />
+      )}
       <primitive object={pointer.line} raycast={noRaycast} frustumCulled={false} />
       <primitive object={chain.line} raycast={noRaycast} frustumCulled={false} />
       <instancedMesh ref={cometMesh} args={[cometGeometry, cometMaterial, COMETS * TRAIL]} frustumCulled={false} raycast={noRaycast} />
@@ -421,7 +500,7 @@ export const CrystalTree = memo(function CrystalTree({ placement, feed, flashMs,
   );
 });
 
-const scratch = { object: new Object3D(), color: new Color() };
+const scratch = { object: new Object3D(), color: new Color(), matrix: new Matrix4() };
 
 function noRaycast() {
   // Decorations are not hoverable; only the slab bodies are.
