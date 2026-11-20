@@ -245,6 +245,7 @@ const sessionPath = (id: string) => `/sessions/${encodeURIComponent(id)}`;
 
 export const api = {
   createSession: () => call<SessionInfo>("POST", "/sessions"),
+  deleteSession: (id: string) => call<void>("DELETE", sessionPath(id)),
   query: (id: string, sql: string, session: SessionName = "A") =>
     call<{ results: QueryResult[]; stats: QueryStats }>("POST", `${sessionPath(id)}/query`, { sql, session }),
   state: (id: string) => call<EngineState>("GET", `${sessionPath(id)}/state`),

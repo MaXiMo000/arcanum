@@ -15,8 +15,9 @@ import { FLASH_MS, replayFrame, useEngineFeed } from "./feed";
 import { CHALLENGES } from "./learn/challenges";
 import { LessonPanel } from "./learn/LessonPanel";
 import type { InspectorTab, Step } from "./learn/lessons";
-import type { CheckContext, Outcome } from "./learn/outcome";
-import { PlayPanel } from "./learn/PlayPanel";
+import { plural, type CheckContext, type Outcome } from "./learn/outcome";
+import { PlayPanel, SECOND_SESSION_SQL } from "./learn/PlayPanel";
+import { MAX_LINK, clearShared, readShared, shareLink, type SharedState } from "./share";
 import { useProgress } from "./learn/progress";
 
 const SESSION_KEY = "arcanum.session";
@@ -24,6 +25,10 @@ const THEME_KEY = "arcanum.theme";
 const VIEW_KEY = "arcanum.view.v2"; // v2: the engine map became the default view
 const MODE_KEY = "arcanum.mode";
 const INTRO_KEY = "arcanum.intro-seen";
+const SETUP_KEY = "arcanum.setup"; // statements that changed this session's database, for share links
+const MAX_SETUP = 200;
+// Statuses of statements that change the database (or a transaction), which a shared link replays.
+const CHANGES = /^(INSERT|UPDATE|DELETE|CREATE|DROP|ANALYZE|BEGIN|COMMIT|ROLLBACK)/;
 const EXPLAIN_PREFIX = /^\s*EXPLAIN\s+(ANALYZE\s+)?/i;
 
 // The 3D view (three.js) is a separate download, fetched the first time someone opens it.
@@ -80,6 +85,13 @@ export default function App() {
   const [measuring, setMeasuring] = useState(false);
   const [tab, setTab] = useState<InspectorTab>("explain");
   const [playSql, setPlaySql] = useState(EXAMPLES[0]!.sql);
+  const [playSqlB, setPlaySqlB] = useState(SECOND_SESSION_SQL);
+  const [twoSessions, setTwoSessions] = useState(false);
+  const setup = useRef<{ session: string | null; statements: [SessionName, string][]; full: boolean }>({
+    session: null,
+    statements: [],
+    full: false,
+  });
   const [crashOpen, setCrashOpen] = useState(false);
   const [crashSummary, setCrashSummary] = useState<CrashSummary | null>(null);
   const [crashError, setCrashError] = useState<string | null>(null);
@@ -132,11 +144,23 @@ export default function App() {
 
   async function openSession(forceNew: boolean) {
     setStartError(null);
-    const saved = forceNew ? null : readStorage(session, SESSION_KEY);
+    const previous = readStorage(session, SESSION_KEY);
+    if (forceNew && previous) {
+      // The tab is starting over: free its old database now (visitors may only hold a few at once).
+      writeStorage(session, SESSION_KEY, null);
+      await api.deleteSession(previous).catch(() => undefined);
+    }
+    const saved = forceNew ? null : previous;
     if (saved) {
       try {
         const current = await api.state(saved);
         idRef.current = saved;
+        try {
+          const stored = JSON.parse(readStorage(session, SETUP_KEY) ?? "null");
+          if (stored?.session === saved && Array.isArray(stored.statements)) setup.current = stored;
+        } catch {
+          // A damaged log only means a share link without setup.
+        }
         setSessionId(saved);
         setState(current);
         setSelectedTree((name) => name ?? firstTable(current));
@@ -151,6 +175,8 @@ export default function App() {
     try {
       const created = await api.createSession();
       writeStorage(session, SESSION_KEY, created.id);
+      setup.current = { session: created.id, statements: [], full: false };
+      writeStorage(session, SETUP_KEY, JSON.stringify(setup.current));
       idRef.current = created.id;
       setSessionId(created.id);
       const fresh = await api.state(created.id);
@@ -161,9 +187,79 @@ export default function App() {
     }
   }
 
+  const remember = useCallback((statements: [SessionName, string][]) => {
+    const log = setup.current;
+    for (const statement of statements) {
+      if (log.statements.length >= MAX_SETUP) log.full = true;
+      else log.statements.push(statement);
+    }
+    writeStorage(session, SETUP_KEY, JSON.stringify(log));
+  }, []);
+
+  /** Open a shared link: replay its statements on this fresh database, then fill in the playground. */
+  const openShared = useCallback(
+    async (shared: SharedState) => {
+      const id = idRef.current;
+      if (!id) return;
+      let failed = 0;
+      for (const [who, sql] of shared.setup) {
+        try {
+          await api.query(id, sql, who);
+        } catch {
+          failed++;
+        }
+      }
+      remember(shared.setup);
+      void refresh();
+      setPlaySql(shared.sql);
+      setPlaySqlB(shared.sqlB);
+      setTwoSessions(shared.two);
+      setMode("play");
+      setToasts((all) => [
+        ...all,
+        {
+          id: ++toastIds.current,
+          title: "Opened a shared query",
+          body: shared.setup.length
+            ? `${shared.setup.length - failed} of ${shared.setup.length} setup statements ran on your own fresh database. Press Run when ready.`
+            : "On your own fresh database. Press Run when ready.",
+        },
+      ]);
+    },
+    [refresh, remember],
+  );
+
   useEffect(() => {
-    void startSession(false);
-  }, [startSession]);
+    void (async () => {
+      const shared = await readShared();
+      if (!shared) {
+        await startSession(false);
+        return;
+      }
+      clearShared();
+      await startSession(true); // a fresh database, so the setup replays onto exactly what the sharer started from
+      await openShared(shared);
+    })();
+  }, [startSession, openShared]);
+
+  const share = useCallback(async () => {
+    const log = setup.current;
+    let body: string;
+    try {
+      const link = await shareLink({ sql: playSql, sqlB: playSqlB, two: twoSessions, setup: log.statements });
+      if (link.length > MAX_LINK) {
+        body = "This database has changed too much to fit in a link. Share the query alone from a fresh session.";
+      } else {
+        await navigator.clipboard.writeText(link);
+        body = log.full
+          ? "Copied. Only your first changes fit; the database it opens may differ."
+          : `Copied. It opens this query on a fresh database${log.statements.length ? ` after replaying your ${plural(log.statements.length, "change")}` : ""}.`;
+      }
+    } catch {
+      body = "The link could not be copied. Your browser may block clipboard access here.";
+    }
+    setToasts((all) => [...all, { id: ++toastIds.current, title: "Share link", body }]);
+  }, [playSql, playSqlB, twoSessions]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -243,6 +339,7 @@ export default function App() {
           // The outcome still stands without the fresh picture.
         }
         const next: Outcome = { id: ++outcomeIds.current, session, sql, results, stats, state: after };
+        if (results.some((r) => CHANGES.test(r.status))) remember([[session, sql]]);
         setOutcome(next);
         const read = treeRead(results);
         if (read && after?.trees.some((t) => t.name === read)) setSelectedTree(read);
@@ -442,6 +539,11 @@ export default function App() {
             sql={playSql}
             onSql={setPlaySql}
             onRun={(sql, session) => execute(sql, undefined, session)}
+            two={twoSessions}
+            onTwo={setTwoSessions}
+            sqlB={playSqlB}
+            onSqlB={setPlaySqlB}
+            onShare={() => void share()}
             sessions={state?.sessions ?? null}
             maxSqlBytes={state?.limits.max_sql_bytes ?? null}
             disabled={!state || measuring}

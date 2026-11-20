@@ -294,6 +294,9 @@ draws it, with every page a query touches lighting up in each layer it passes th
 - **The disk**: the data file page by page, coloured by the table or index that owns each page, and the
   write-ahead log, whose frames appear as they are appended, turn solid when the log is synced, and drain
   into the data file at each checkpoint. Connectors between the layers animate as pages move.
+- **Share**: a link that opens the playground (both sessions' SQL) on a fresh database set up the way
+  yours is, by replaying the statements that changed it. It all travels in the URL fragment, which
+  browsers never send to a server, so nothing is stored anywhere.
 - **Time travel**: step backwards and forwards through every event of the last query (each page read,
   node visit, split and log write) or play it back; the map shows the engine as it was at that moment,
   with the node the query is at, the path it took and the buffer slot it touched marked.
@@ -507,6 +510,5 @@ Arcanum aims to be the clearest way to see how a database works from the inside.
   `LIMIT` can prefer plans that produce their first rows early.
 - **More advisor rules**: unused and duplicate indexes, an index advisor over a whole workload, and
   rewrites for `OR` across indexed columns.
-- **Sharing**: permalinks to a database snapshot and a query, CSV import, and a classroom mode where a
-  teacher's statements appear live on every student's screen.
+- **Classroom mode**: a teacher's statements appear live on every student's screen, and CSV import.
 - **Benchmarks**: a TPC-H-style dataset generator and a mode that charts a query's cost as the data grows.

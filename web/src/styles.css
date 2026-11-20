@@ -3615,3 +3615,16 @@ p.session-badge {
   outline: 2px solid var(--visit);
   outline-offset: 1px;
 }
+
+.play-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 14px 0 6px;
+}
+
+.play-tools .sessions-toggle {
+  margin: 0;
+}

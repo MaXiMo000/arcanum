@@ -6,9 +6,14 @@ import { CHALLENGES } from "./challenges";
 import { Editor } from "./Editor";
 import type { Outcome } from "./outcome";
 
-const SECOND_SESSION_SQL = "SELECT id, name, city FROM customers WHERE id = 1;";
+export const SECOND_SESSION_SQL = "SELECT id, name, city FROM customers WHERE id = 1;";
 
 interface Props {
+  two: boolean;
+  onTwo: (two: boolean) => void;
+  sqlB: string;
+  onSqlB: (sql: string) => void;
+  onShare: () => void;
   sql: string;
   onSql: (sql: string) => void;
   onRun: (sql: string, session: SessionName) => Promise<Outcome | ApiError | null>;
@@ -34,8 +39,7 @@ function summary(result: Outcome | ApiError | null): { text: string; error: bool
 
 export function PlayPanel(props: Props) {
   const { sql, onSql, onRun, sessions, maxSqlBytes, disabled, completed, tables, error } = props;
-  const [two, setTwo] = useState(false);
-  const [sqlB, setSqlB] = useState(SECOND_SESSION_SQL);
+  const { two, onTwo: setTwo, sqlB, onSqlB: setSqlB } = props;
   const [showHints, setShowHints] = useState(false);
   const done = CHALLENGES.filter((c) => c.id in completed).length;
 
@@ -49,6 +53,7 @@ export function PlayPanel(props: Props) {
           checked by the advisor, and mistakes go to the doctor.
         </p>
       </header>
+      <div className="play-tools">
       <div className="segmented small sessions-toggle" role="radiogroup" aria-label="Sessions">
         <button role="radio" aria-checked={!two} className={!two ? "active" : ""} onClick={() => setTwo(false)}>
           One session
@@ -56,6 +61,15 @@ export function PlayPanel(props: Props) {
         <button role="radio" aria-checked={two} className={two ? "active" : ""} onClick={() => setTwo(true)}>
           Two sessions
         </button>
+      </div>
+      <button
+        className="button ghost small"
+        onClick={props.onShare}
+        disabled={disabled}
+        title="Copy a link that opens this query on a database set up the way yours is"
+      >
+        ⤴ Share
+      </button>
       </div>
       {two && (
         <p className="muted small">
