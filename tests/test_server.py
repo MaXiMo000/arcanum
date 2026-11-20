@@ -359,6 +359,26 @@ def test_deadlocks_roll_back_the_transaction_that_closes_the_cycle(client):
     assert rows == [[1, "y"], [2, "y"]]
 
 
+def test_serializable_shows_and_refuses_read_write_dependencies(client):
+    session = new_session(client)
+
+    def run(text, who):
+        return client.post(f"/sessions/{session}/query", json={"sql": text, "session": who})
+
+    run("BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT count(*) FROM customers WHERE id <= 2", "A")
+    run("BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT count(*) FROM customers WHERE id <= 2", "B")
+    run("UPDATE customers SET city = 'x' WHERE id = 1", "A")
+    state = client.get(f"/sessions/{session}/state").json()
+    assert [(d["reader_session"], d["writer_session"]) for d in state["dependencies"]] == [("B", "A")]
+    assert {s["session"] for s in state["serializable"]} == {"A", "B"}
+    failed = run("UPDATE customers SET city = 'y' WHERE id = 2", "B")
+    error = failed.json()["error"]
+    assert failed.status_code == 400 and error["type"] == "SerializationError"
+    assert len(error["dependencies"]) == 2
+    assert client.get(f"/sessions/{session}/state").json()["sessions"]["B"]["xid"] is None  # rolled back
+    assert run("COMMIT", "A").status_code == 200
+
+
 def test_waits_time_out_and_can_be_cancelled(make_client):
     client = make_client(lock_timeout=0.2)
     session = new_session(client)

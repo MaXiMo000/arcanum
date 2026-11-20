@@ -125,7 +125,6 @@ class _Parser:
         if not self.accept_kw("ISOLATION"):
             return None
         self.expect_kw("LEVEL")
-        tok = self.tok
         if self.accept_kw("READ"):
             if self.accept_kw("COMMITTED"):
                 return "READ COMMITTED"
@@ -136,8 +135,8 @@ class _Parser:
             self.expect_kw("READ")
             return "REPEATABLE READ"
         if self.accept_kw("SERIALIZABLE"):
-            raise self.unsupported("SERIALIZABLE isolation (use REPEATABLE READ)", tok)
-        raise self.error(f"expected READ COMMITTED or REPEATABLE READ, got {self.describe()}")
+            return "SERIALIZABLE"
+        raise self.error(f"expected READ COMMITTED, REPEATABLE READ or SERIALIZABLE, got {self.describe()}")
 
     def error(self, message, tok=None):
         return SqlError(message, self.sql, (tok or self.tok).pos)

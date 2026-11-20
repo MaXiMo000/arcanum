@@ -35,6 +35,13 @@ export function describeEvent(e: EngineEvent): { text: string; tone: Tone } {
       return { text: `session ${e.session} got its lock after ${num(e.waited_ms)} ms and goes on`, tone: "ok" };
     case "deadlock":
       return { text: `deadlock detected: session ${e.session}'s transaction ${num(e.victim)} rolled back`, tone: "danger" };
+    case "rw_conflict":
+      return {
+        text: `rw-dependency: transaction ${num(e.reader)} (${e.reader_session}) read ${e.what}, which ${num(e.writer)} (${e.writer_session}) changed`,
+        tone: "write",
+      };
+    case "serialization_failure":
+      return { text: `serialization failure: session ${e.session}'s transaction ${num(e.victim)} rolled back`, tone: "danger" };
     case "lock_timeout":
       return { text: `session ${e.session} gave up waiting for transaction ${num(e.holder)} (lock timeout)`, tone: "danger" };
     case "lock_cancel":

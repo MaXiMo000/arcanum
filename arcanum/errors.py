@@ -62,5 +62,6 @@ class LockTimeoutError(ExecutionError):
 
 
 class SerializationError(ExecutionError):
-    """A REPEATABLE READ transaction tried to change a row that changed after its snapshot was taken.
-    PostgreSQL reports the same: "could not serialize access due to concurrent update"."""
+    """A REPEATABLE READ or SERIALIZABLE transaction tried to change a row that changed after its snapshot
+    was taken ("could not serialize access due to concurrent update"), or SERIALIZABLE found read/write
+    dependencies no serial order fits. The messages are PostgreSQL's."""

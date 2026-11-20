@@ -1,6 +1,7 @@
 import type { ApiError, QueryResult } from "../api";
 import { SqlDiff } from "../advisor/Advisor";
 import { formatValue } from "../format";
+import { Dependencies } from "./Versions";
 
 const SHOWN_ROWS = 100;
 
@@ -15,7 +16,7 @@ interface ErrorProps extends RunError {
 }
 
 export function ErrorBox({ error, sql, onFix }: ErrorProps) {
-  const { line, column, type, message, completed, doctor } = error.body;
+  const { line, column, type, message, completed, doctor, dependencies } = error.body;
   const source = line !== undefined ? sql.split("\n")[line - 1] : undefined;
   const width = doctor?.pos != null && doctor.end != null ? Math.max(1, doctor.end - doctor.pos) : 1;
   return (
@@ -42,6 +43,7 @@ export function ErrorBox({ error, sql, onFix }: ErrorProps) {
           The {completed === 1 ? "statement" : `${completed} statements`} before this one ran and {completed === 1 ? "is" : "are"} kept.
         </p>
       ) : null}
+      {dependencies && dependencies.length > 0 && <Dependencies edges={dependencies} failed />}
       {doctor && (
         <div className="doctor">
           <p className="doctor-head">

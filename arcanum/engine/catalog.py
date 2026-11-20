@@ -270,20 +270,29 @@ class Catalog:
         _check_size(len(key) + len(value), f"row of table {table.name}")
         tree.insert(key, value, replace=True)
 
-    def _visible(self, table, versions, snapshot):
-        """The version of a row that snapshot sees (raw, untyped), or None."""
+    def _visible(self, table, versions, snapshot, sx=None, key=None):
+        """The version of a row that snapshot sees (raw, untyped), or None. sx: the SERIALIZABLE reader,
+        told which transactions wrote versions it cannot see."""
         if len(versions) == 1 and versions[0][0] == FROZEN and versions[0][1] is None:
             return versions[0][2]  # settled: everyone sees it
-        for xmin, xmax, row in reversed(versions):
+        for i in range(len(versions) - 1, -1, -1):
+            xmin, xmax, row = versions[i]
             if self.mvcc.visible(snapshot, xmin, xmax):
+                if sx is not None:
+                    self.ssi.saw(sx, versions, i, table.name, key)
                 return row
+        if sx is not None:
+            self.ssi.saw(sx, versions, -1, table.name, key)
         return None
 
     def scan(self, table, snapshot):
         """Yield (key, row) for every row the snapshot sees, in primary key order."""
         width = len(table.columns)
+        sx = self.ssi.reader(snapshot)
+        if sx is not None:
+            self.ssi.read(sx, table.name)
         for key, value in self.btree(table.root).scan():
-            row = self._visible(table, unpack(decode(value), width), snapshot)
+            row = self._visible(table, unpack(decode(value), width), snapshot, sx, key)
             if row is not None:
                 yield key, self._typed(table, row)
 
@@ -305,9 +314,13 @@ class Catalog:
         Columns outside the index come back as NULL.
         """
         width = len(table.columns)
+        sx = self.ssi.reader(snapshot)
+        if sx is not None:
+            # A key range is remembered as read; a secondary index range, more coarsely, as the whole table.
+            self.ssi.read(sx, table.name, *((lo, hi, hi_inclusive) if index is None else ()))
         if index is None:
             for key, value in self.btree(table.root).scan(lo, hi, hi_inclusive=hi_inclusive):
-                row = self._visible(table, unpack(decode(value), width), snapshot)
+                row = self._visible(table, unpack(decode(value), width), snapshot, sx, key)
                 if row is not None:
                     yield key, self._typed(table, row)
             return
@@ -324,7 +337,7 @@ class Catalog:
                 yield key, self._typed(table, tuple(row))
                 continue
             stored = tree.get(key)
-            row = self._visible(table, unpack(decode(stored), width), snapshot) if stored is not None else None
+            row = self._visible(table, unpack(decode(stored), width), snapshot, sx, key) if stored is not None else None
             if row is not None and tuple(row[i] for i in index.columns) == tuple(values[:size]):
                 yield key, self._typed(table, row)
 
@@ -487,6 +500,7 @@ class Catalog:
             self.set_meta("unsettled", 1)  # logged with the versions, so a crash leaves a vacuum to do
         self.unsettled.setdefault(table.name, set()).add(key)
         txn.touched.setdefault(table.name, set()).add(key)
+        self.ssi.wrote(txn, table.name, key)
 
     def _live(self, versions, txn, matches):
         """Whether some version matching `matches` is live for a writer: created by a transaction that

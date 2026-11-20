@@ -88,7 +88,8 @@ export function TopBar(p: Props) {
             role="status"
             title={`Session ${name} has transaction ${s.xid} open (${s.isolation}); it is waiting for COMMIT or ROLLBACK`}
           >
-            {name} · txn {s.xid}
+            {name}
+            <span className="pill-long"> · txn</span> {s.xid}
           </span>
         ),
       )}

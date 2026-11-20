@@ -15,6 +15,7 @@ from .expr import conjuncts
 from .mvcc import READ_COMMITTED, REPEATABLE_READ, XID_BATCH, TransactionManager
 from .optimizer import Optimizer, mark_index_only
 from .plan import IndexScan, TableScan, explain, plan_tree
+from .ssi import SERIALIZABLE, SSI
 
 _WRITES = (n.Insert, n.Update, n.Delete, n.CreateTable, n.DropTable, n.CreateIndex, n.DropIndex, n.Analyze)
 _DDL = (n.CreateTable, n.DropTable, n.CreateIndex, n.DropIndex)
@@ -67,6 +68,8 @@ class Database:
         self.catalog = Catalog(self.pager, max_keys)
         self.mvcc = TransactionManager(self.catalog.clog, self.catalog.meta.get("xid_limit", 1))
         self.catalog.mvcc = self.mvcc
+        self.ssi = self.catalog.ssi = SSI(
+            self.mvcc, lambda table, key: self.catalog._describe(self.catalog.tables[table], key), self.events.emit)
         self.connections = {}
         self.exclusive = None  # the session whose open transaction changed the schema; others wait for it
         self._snapshot = None  # what the running statement sees
@@ -161,11 +164,11 @@ class Database:
         self.pager.savepoint()
         try:
             result = self._run(statement, text, sql, trace, max_rows)
-        except BaseException:
+        except BaseException as e:
             self.pager.rollback()
             self.catalog.reload()
-            if autocommit:
-                self._end(conn, txn, commit=False)
+            if autocommit or (txn is not None and getattr(e, "rolled_back", None) is txn):
+                self._end(conn, txn, commit=False)  # an SSI failure ends the whole transaction
             raise
         finally:
             self._txn = self._snapshot = None
@@ -178,12 +181,14 @@ class Database:
         if self.mvcc.next_xid >= self.catalog.meta.get("xid_limit", 0):
             # Reserve the next batch of ids on disk first, so none is handed out twice after a crash.
             self.catalog.set_meta("xid_limit", self.mvcc.next_xid + XID_BATCH)
-        return self.mvcc.begin(conn.name, isolation)
+        txn = self.mvcc.begin(conn.name, isolation)
+        self.ssi.begin(txn)
+        return txn
 
     def _take_snapshot(self, txn):
         if txn is None:
             return self.mvcc.snapshot()
-        if txn.isolation == REPEATABLE_READ:
+        if txn.isolation in (REPEATABLE_READ, SERIALIZABLE):
             if txn.snapshot is None:
                 txn.snapshot = self.mvcc.snapshot(txn.xid)
             return txn.snapshot
@@ -200,6 +205,7 @@ class Database:
             conn.ddl = False
             self.exclusive = None
         self.mvcc.end(txn, commit)
+        self.ssi.end(txn, commit)
         if conn.txn is txn:
             conn.txn = None
         # The commit itself: versions the transaction made are frozen where no snapshot needs them, and

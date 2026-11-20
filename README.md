@@ -197,7 +197,7 @@ Concurrency control works like PostgreSQL's. A row is a chain of versions, each 
 transaction that created it (`xmin`) and the one that deleted it (`xmax`); an `UPDATE` marks the old
 version deleted and appends a new one. Every statement reads through a snapshot: the transactions that had
 committed when it was taken, plus its own. `READ COMMITTED` (the default) takes a snapshot per statement;
-`REPEATABLE READ` takes one for the whole transaction.
+`REPEATABLE READ` and `SERIALIZABLE` take one for the whole transaction.
 
 ```python
 from arcanum import Database
@@ -223,6 +223,13 @@ b.execute("SELECT balance FROM account").rows  # [(0,)]
   longer than the lock timeout fails with `LockTimeoutError`, and a waiting statement can be cancelled.
 - Under `REPEATABLE READ`, changing a row that changed after the snapshot fails with PostgreSQL's
   "could not serialize access due to concurrent update", so updates are never lost.
+- `SERIALIZABLE` is serializable snapshot isolation, as in PostgreSQL. The engine remembers what each
+  serializable transaction read: primary key ranges for key lookups, the whole table for other scans.
+  A read/write dependency forms when one transaction reads something a concurrent one changes. A
+  transaction with a dependency in and one out (a pivot) is where write skew and the other snapshot
+  anomalies come from. The transaction that creates a pivot is rolled back with "could not serialize
+  access due to read/write dependencies among transactions", and the error lists the dependencies.
+  The map draws them as they form.
 - Primary key and `UNIQUE` checks consider every live version, including those of open transactions.
 - Index entries can belong to any version of a row, so every index match is rechecked against the version
   the snapshot sees. Index-only scans stay index-only while a table has no unsettled rows (the role of
@@ -257,8 +264,8 @@ never a mix.
 
 Two modes share one screen: the database in the middle, an inspector on the right.
 
-- **Learn**: ten short lessons (B+trees, growth and merges, indexes, the buffer pool, the optimizer, the
-  query advisor, two sessions at once, transactions, the log, crash recovery). Every step runs real SQL on your own database and
+- **Learn**: eleven short lessons (B+trees, growth and merges, indexes, the buffer pool, the optimizer, the
+  query advisor, two sessions at once, write skew and SERIALIZABLE, transactions, the log, crash recovery). Every step runs real SQL on your own database and
   checks what the engine actually did (nodes visited, pages read, splits, log frames) before moving on.
 - **Play**: an editor with syntax highlighting, name completion and errors underlined, example queries,
   and challenges judged from what the engine really did. Switch to two sessions to get a second editor on
@@ -502,7 +509,6 @@ tests/
 
 Arcanum aims to be the clearest way to see how a database works from the inside. Next:
 
-- **SERIALIZABLE**: serializable snapshot isolation, with the read/write dependencies that cause an abort shown.
 - **An LSM-tree engine beside the B+tree**: memtable, flushes and compaction, with the same workload
   replayed on both to compare write and read amplification.
 - **Replication**: a Raft-replicated log across three engines, with leader election, network partitions

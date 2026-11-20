@@ -427,6 +427,7 @@ h3 {
 .status-pill.txn {
   border-color: color-mix(in srgb, var(--warn) 50%, transparent);
   color: var(--warn);
+  white-space: nowrap;
 }
 
 @keyframes pulse-dot {
@@ -3679,4 +3680,34 @@ p.session-badge {
   color: var(--warn);
   font: 700 11px var(--mono);
   animation: blink 1.4s ease-in-out infinite;
+}
+
+.rw-graph {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.rw-graph .lock-arrow {
+  color: var(--accent);
+}
+
+.rw-graph.failed,
+.rw-graph li.pivot .lock-arrow {
+  border-color: color-mix(in srgb, var(--danger) 50%, transparent);
+  color: var(--danger);
+}
+
+.rw-graph.failed {
+  margin-top: 10px;
+  background: color-mix(in srgb, var(--danger) 7%, transparent);
+}
+
+.rw-note {
+  display: block !important;
+}
+
+@media (max-width: 1180px) {
+  .pill-long {
+    display: none;
+  }
 }

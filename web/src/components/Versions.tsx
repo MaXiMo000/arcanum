@@ -2,7 +2,7 @@
 // with the transaction that created it (xmin) and the one that deleted it (xmax), and which session's
 // snapshot sees which version right now. Rows settle back to one frozen version once no snapshot needs
 // the others.
-import type { EngineState, RowVersion, SessionName, TxnStatus } from "../api";
+import type { Dependency, EngineState, RowVersion, SessionName, TxnStatus } from "../api";
 import { formatValue } from "../format";
 
 const SHOWN = 8;
@@ -63,9 +63,48 @@ function LockGraph({ waits }: { waits: EngineState["waits"] }) {
   );
 }
 
+function Txn({ xid, session }: { xid: number; session: string | null }) {
+  return (
+    <span className={`session-badge s-${session ?? "none"}`}>
+      <span aria-hidden="true">{session ?? "?"}</span> txn {xid}
+    </span>
+  );
+}
+
+/** SERIALIZABLE's read/write dependencies: each arrow means "read something the other then changed", so
+ * in any serial order the reader goes first. A transaction with an arrow in and an arrow out is a pivot. */
+export function Dependencies({ edges, failed }: { edges: Dependency[]; failed?: boolean }) {
+  const into = new Set(edges.map((e) => e.writer));
+  const pivots = new Set(edges.map((e) => e.reader).filter((x) => into.has(x)));
+  return (
+    <ul className={`lock-graph rw-graph ${failed ? "failed" : ""}`} aria-label="Read/write dependencies">
+      {edges.map((e) => (
+        <li key={`${e.reader}-${e.writer}`} className={pivots.has(e.reader) || pivots.has(e.writer) ? "pivot" : ""}>
+          <Txn xid={e.reader} session={e.reader_session} />
+          <span className="lock-arrow" aria-hidden="true">
+            rw ⟶
+          </span>
+          <Txn xid={e.writer} session={e.writer_session} />
+          <span className="muted small">
+            read {e.what} before it changed
+          </span>
+        </li>
+      ))}
+      {pivots.size > 0 && (
+        <li className="muted small rw-note">
+          {failed ? "Refused: " : ""}
+          {pivots.size === 1 ? `transaction ${[...pivots][0]} has` : `transactions ${[...pivots].join(" and ")} each have`} a
+          dependency in and one out (a pivot), so no serial order fits them all.
+        </li>
+      )}
+    </ul>
+  );
+}
+
 export function Versions({ state }: { state: EngineState }) {
   const rows = state.versions ?? [];
   const waits = state.waits ?? [];
+  const edges = state.dependencies ?? [];
   const sessions = Object.entries(state.sessions ?? {}) as [SessionName, EngineState["sessions"][SessionName]][];
   return (
     <section className="map-card versions-card" aria-label="Row versions">
@@ -83,13 +122,14 @@ export function Versions({ state }: { state: EngineState }) {
         <div className="txn-strip">
           {sessions.map(([name, s]) => (
             <span key={name} className={`txn-chip s-${name}`} title={`snapshot: sees transactions below ${s.snapshot.xmax}${s.snapshot.active.length ? ` except ${s.snapshot.active.join(", ")} (still open)` : ""}`}>
-              <b>{name}</b> {s.xid ? `txn ${s.xid}${s.isolation === "REPEATABLE READ" ? " · RR" : ""}` : "idle"}
+              <b>{name}</b> {s.xid ? `txn ${s.xid}${s.isolation === "REPEATABLE READ" ? " · RR" : s.isolation === "SERIALIZABLE" ? " · SER" : ""}` : "idle"}
             </span>
           ))}
           <span className="txn-chip muted" title="the id the next transaction gets">next {state.next_xid}</span>
         </div>
       </header>
       {waits.length > 0 && <LockGraph waits={waits} />}
+      {edges.length > 0 && <Dependencies edges={edges} />}
       {rows.length > 0 && (
         <ul className="version-rows">
           {rows.slice(0, SHOWN).map((r) => (

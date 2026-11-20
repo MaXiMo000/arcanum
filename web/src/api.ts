@@ -104,6 +104,17 @@ export interface ApiErrorBody {
   /** Statements before the failing one, which did run. */
   completed?: number;
   doctor?: Doctor;
+  /** SERIALIZABLE: the read/write dependencies that made a transaction roll back. */
+  dependencies?: Dependency[];
+}
+
+/** A read/write dependency: reader read something a concurrent writer then changed (or had changed). */
+export interface Dependency {
+  reader: number;
+  writer: number;
+  what: string;
+  reader_session: string | null;
+  writer_session: string | null;
 }
 
 export interface TreeNode {
@@ -199,6 +210,9 @@ export interface EngineState {
   versions: { table: string; key: Value[]; versions: RowVersion[] }[];
   /** Who waits for whom: each parked statement and the transaction it waits for. */
   waits: (WaitInfo & { xid: number | null })[];
+  /** SERIALIZABLE transactions the engine still tracks: running, or committed but overlapping one that is. */
+  serializable: { xid: number; session: string; committed: boolean; reads: string[] }[];
+  dependencies: Dependency[];
 }
 
 export interface EngineEvent {

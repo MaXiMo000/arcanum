@@ -145,6 +145,8 @@ def error_json(e):
             error["completed"] = e.completed  # statements before the failing one, which did run
         if getattr(e, "doctor", None):
             error["doctor"] = e.doctor
+        if getattr(e, "dependencies", None):
+            error["dependencies"] = e.dependencies  # the rw-conflicts SERIALIZABLE refused
         return error
     # Anything else is a fault on our side. Keep the details (which may include file paths) in the
     # server log, and give the client only a reference to them.
@@ -472,7 +474,11 @@ def _mvcc_state(db):
         rows.append({"table": table.name, "key": list(decode(key)), "versions": shown})
     return {"sessions": sessions, "next_xid": manager.next_xid,
             "running": [{"xid": t.xid, "session": t.owner, "isolation": t.isolation} for t in manager.running.values()],
-            "commit_log": sorted(catalog.clog), "versions": rows}
+            "commit_log": sorted(catalog.clog), "versions": rows,
+            "serializable": [{"xid": s.xid, "session": s.owner, "committed": s.committed,
+                              "reads": [t if r is None else f"{t} (keys)" for t, r in sorted(s.reads.items())]}
+                             for s in db.ssi.sx.values()],
+            "dependencies": db.ssi.edges()}
 
 
 def _workload(db, message, conn, pump):

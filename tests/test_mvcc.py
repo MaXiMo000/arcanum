@@ -159,3 +159,69 @@ def test_a_crash_drops_unfinished_transactions_of_every_session():
     assert db.execute("SELECT id FROM t WHERE v = 11").rows == []  # no stale index entry either
     assert not db.catalog.unsettled
     db.execute("INSERT INTO t VALUES (4, 41)")  # the id a held is free
+
+
+# ---- SERIALIZABLE (serializable snapshot isolation) ----------------------------------------
+
+
+def serializable(db, *names):
+    conns = [db.connect(n) for n in names]
+    for c in conns:
+        c.execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+    return conns
+
+
+def test_serializable_refuses_write_skew_and_rolls_back(db):
+    a, b = serializable(db, "a", "b")
+    # Each checks the total stays at least 1000, then withdraws from a different account.
+    assert value(a, "SELECT sum(balance) FROM account WHERE id <= 2") == 300
+    assert value(b, "SELECT sum(balance) FROM account WHERE id <= 2") == 300
+    a.execute("UPDATE account SET balance = balance - 300 WHERE id = 1")
+    with pytest.raises(SerializationError, match="read/write dependencies") as caught:
+        b.execute("UPDATE account SET balance = balance - 300 WHERE id = 2")
+    assert [d["what"] for d in caught.value.dependencies] == ["row (id = 1)", "row (id = 2)"]
+    assert b.txn is None  # the whole transaction was rolled back, as in PostgreSQL
+    a.execute("COMMIT")
+    assert db.execute("SELECT id, balance FROM account WHERE id <= 2 ORDER BY id").rows == [(1, -200), (2, 200)]
+    assert db.ssi.sx == {}  # nothing left to remember once nobody is concurrent
+
+
+def test_serializable_lets_independent_work_commit(db):
+    a, b = serializable(db, "a", "b")
+    assert value(a, "SELECT balance FROM account WHERE id = 1") == 100
+    assert value(b, "SELECT balance FROM account WHERE id BETWEEN 5 AND 6") == 500
+    a.execute("UPDATE account SET balance = 0 WHERE id = 1")
+    b.execute("UPDATE account SET balance = 0 WHERE id = 6")
+    a.execute("COMMIT")
+    b.execute("COMMIT")
+
+
+def test_serializable_sees_conflicts_through_a_committed_reader(db):
+    # a reads what b then writes (a -> b); b commits; a then writes what c read before b's commit.
+    a, b, c = serializable(db, "a", "b", "c")
+    value(c, "SELECT balance FROM account WHERE id = 3")
+    value(a, "SELECT balance FROM account WHERE id = 2")
+    b.execute("UPDATE account SET balance = 1 WHERE id = 2")  # a -> b
+    b.execute("COMMIT")
+    a.execute("UPDATE account SET balance = 1 WHERE id = 4")  # unrelated: fine
+    with pytest.raises(SerializationError, match="read/write dependencies"):
+        a.execute("UPDATE account SET balance = 1 WHERE id = 3")  # c -> a makes a a pivot
+    c.execute("COMMIT")
+
+
+def test_serializable_catches_phantoms_in_key_ranges(db):
+    a, b = serializable(db, "a", "b")
+    assert value(a, "SELECT count(*) FROM account WHERE id BETWEEN 30 AND 40") == 0
+    assert value(b, "SELECT count(*) FROM account WHERE id BETWEEN 50 AND 60") == 0
+    b.execute("INSERT INTO account VALUES (35, 'b', 1)")  # into a's range: a -> b
+    with pytest.raises(SerializationError):
+        a.execute("INSERT INTO account VALUES (55, 'a', 1)")  # into b's range: b -> a
+    b.execute("COMMIT")
+
+
+def test_other_levels_are_not_tracked(db):
+    a = db.connect("a")
+    a.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    value(a, "SELECT sum(balance) FROM account")
+    assert db.ssi.sx == {}
+    a.execute("COMMIT")
