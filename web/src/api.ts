@@ -81,6 +81,9 @@ export interface QueryStats {
   checkpoints: number;
   rollbacks: number;
   sort_spills: number;
+  /** Values moved to overflow pages (TOAST), and read back from them. */
+  toast_writes?: number;
+  toast_reads?: number;
   /** Constraint work: checks, foreign key cascades, sequence values and ON CONFLICT outcomes. */
   constraints?: ConstraintNote[];
 }
@@ -141,6 +144,8 @@ export interface Tree {
   key_columns: string[];
   nodes: TreeNode[];
   truncated: boolean;
+  /** A table's overflow pages: values too large for its leaves (TOAST). */
+  toast_pages?: number[];
 }
 
 export interface TableInfo {

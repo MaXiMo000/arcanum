@@ -300,6 +300,23 @@ b.execute("SELECT balance FROM account").rows  # [(0,)]
     so a session waiting on one of them goes on.
   - The row versions on the map show which subtransaction wrote what.
 
+## Large values: overflow pages (TOAST)
+
+A row, meaning all of its versions together, must fit in a quarter of a B+tree page. When it doesn't, its
+largest values move out, largest first, until it fits, the way PostgreSQL's TOAST does it:
+
+- Each value moved out is compressed with zlib when that saves at least a tenth.
+- It is written across a chain of overflow pages, and the row keeps a small pointer.
+- The pointer carries a digest of the value, so versions that keep a value unchanged share it. An
+  `UPDATE` of another column copies nothing.
+- Overflow pages are freed as soon as no version of the row needs them: after a delete, an update,
+  pruning or a rollback.
+- Everything goes through the pager and the write-ahead log. A power loss never leaves a torn value,
+  which a randomized crash test checks.
+
+Index entries still have a size limit, as in PostgreSQL. The map colours overflow pages with their
+table's colour, and **What happened** says when values moved out or were read back.
+
 ## B+tree versus LSM tree
 
 The **LSM** view runs one workload on two storage engines and counts every byte each one reads,
@@ -602,7 +619,6 @@ Arcanum aims to be the clearest way to see how a database works from the inside.
 - **Replication**: a Raft-replicated log across three engines, with leader election, network partitions
   and catch-up you can trigger.
 - **Buffer pool policies**: LRU, Clock and 2Q on the same workload, with their hit rates over time.
-- **Overflow pages** for rows larger than a page, and **TOAST-style** compression.
 - **Merge join and sort-order awareness**: indexes that satisfy `ORDER BY`, and startup costs so
   `LIMIT` can prefer plans that produce their first rows early.
 - **More advisor rules**: unused and duplicate indexes, an index advisor over a whole workload, and

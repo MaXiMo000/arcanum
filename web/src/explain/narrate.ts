@@ -132,6 +132,20 @@ export function narrate(outcome: Outcome): Line[] {
       text: `A checkpoint copied the logged pages into the data file and emptied the log.`,
     });
   }
+  if (stats.toast_writes) {
+    lines.push({
+      tone: "write",
+      text: `${plural(stats.toast_writes, "large value")} moved to overflow pages, compressed where that helped.`,
+      why: "A row must fit in a quarter of a page; like PostgreSQL's TOAST, bigger values live in a chain of overflow pages and the row keeps a pointer.",
+    });
+  }
+  if (stats.toast_reads) {
+    lines.push({
+      tone: "read",
+      text: `${plural(stats.toast_reads, "large value")} read back from overflow pages.`,
+      why: "Reading a row follows its pointers to the overflow pages, one more page per few kilobytes.",
+    });
+  }
   if (stats.sort_spills) {
     lines.push({ tone: "write", text: "The sort was too big for memory, so it wrote sorted runs to disk and merged them." });
   }

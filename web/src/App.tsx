@@ -1,3 +1,4 @@
+import { type PageOwner } from "./format";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Comparison } from "./advisor/Advisor";
 import {
@@ -484,10 +485,11 @@ export default function App() {
   }, []);
 
   const owners = useMemo(() => {
-    const map = new Map<number, { tree: string; color: number; leaf: boolean }>();
+    const map = new Map<number, PageOwner>();
     state?.trees.forEach((tree, i) => {
       const color = tree.kind === "catalog" ? 7 : (i - 1) % 7;
       for (const node of tree.nodes) map.set(node.page, { tree: tree.name, color, leaf: node.leaf });
+      for (const page of tree.toast_pages ?? []) map.set(page, { tree: tree.name, color, leaf: false, overflow: true });
     });
     return map;
   }, [state]);

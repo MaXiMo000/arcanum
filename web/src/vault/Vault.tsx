@@ -1,5 +1,6 @@
 // The 3D crystal vault: the selected B+tree as glowing crystals above a floor of pages, with the
 // write-ahead log spiralling beside them. Loaded on demand; the 2D panels stay alongside it.
+import { type PageOwner, ownerLabel } from "../format";
 import { Canvas, useFrame, type ThreeEvent } from "@react-three/fiber";
 import { useCallback, useMemo, useRef, useState, type RefObject } from "react";
 import type { EngineState, Tree } from "../api";
@@ -20,7 +21,7 @@ interface Props {
   feed: FeedState;
   flashMs: number;
   state: EngineState;
-  owners: Map<number, { tree: string; color: number; leaf: boolean }>;
+  owners: Map<number, PageOwner>;
   onUnavailable: () => void;
 }
 
@@ -98,7 +99,7 @@ export default function Vault({ trees, selected, onSelect, feed, flashMs, state,
       }
       const info = pages[page];
       const owner = owners.get(page);
-      const what = page === 0 ? "file header" : info?.free ? "free" : owner ? `${owner.tree} ${owner.leaf ? "leaf" : "node"}` : "unused";
+      const what = page === 0 ? "file header" : info?.free ? "free" : owner ? `${ownerLabel(owner)}` : "unused";
       const where = info?.cached ? (info.dirty ? "cached, changed" : "cached") : "on disk";
       return `page ${page} · ${what} · ${where}`;
     },

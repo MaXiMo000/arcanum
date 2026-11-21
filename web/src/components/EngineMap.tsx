@@ -2,6 +2,7 @@
 // query walks sits on top; below it the buffer pool, the fixed set of page slots in memory, in the
 // engine's own least-recently-used order; at the bottom the disk: the data file, page by page, and the
 // write-ahead log. Every page a query touches lights up in each layer it passes through.
+import { type PageOwner, ownerLabel } from "../format";
 import { useEffect, useRef } from "react";
 import type { EngineState, Tree } from "../api";
 import type { FeedState, Flash } from "../feed";
@@ -18,7 +19,7 @@ interface Props {
   feed: FeedState;
   flashMs: number;
   state: EngineState;
-  owners: Map<number, { tree: string; color: number; leaf: boolean }>;
+  owners: Map<number, PageOwner>;
   focus: MapFocus;
   marker: ReplayMarker | null;
 }
@@ -104,7 +105,7 @@ function Bus({ up, upLabel, down, downLabel }: { up: boolean; upLabel: string; d
 function BufferPool({ feed, flashMs, owners, now, current }: {
   feed: FeedState;
   flashMs: number;
-  owners: Map<number, { tree: string; color: number; leaf: boolean }>;
+  owners: Map<number, PageOwner>;
   now: number;
   current: number | null;
 }) {
@@ -156,7 +157,7 @@ function BufferPool({ feed, flashMs, owners, now, current }: {
           const entry = pool.pages.get(page)!;
           const flash = recent(feed.pageFlash.get(page), now, flashMs);
           const freshness = 0.62 + 0.38 * ((rank.get(page) ?? 0) / Math.max(1, pool.pages.size - 1));
-          const label = `slot ${slot}: page ${page}${owner ? `, ${owner.tree} ${owner.leaf ? "leaf" : "node"}` : ""}${entry.dirty ? ", changed since the last commit" : ""}${page === nextOut ? ", next to be evicted" : ""}`;
+          const label = `slot ${slot}: page ${page}${owner ? `, ${ownerLabel(owner)}` : ""}${entry.dirty ? ", changed since the last commit" : ""}${page === nextOut ? ", next to be evicted" : ""}`;
           return (
             <li
               key={slot}
@@ -197,7 +198,7 @@ function DataFile({ state, feed, flashMs, owners, now, current }: {
   state: EngineState;
   feed: FeedState;
   flashMs: number;
-  owners: Map<number, { tree: string; color: number; leaf: boolean }>;
+  owners: Map<number, PageOwner>;
   now: number;
   current: number | null;
 }) {
@@ -225,7 +226,7 @@ function DataFile({ state, feed, flashMs, owners, now, current }: {
             <span
               key={page}
               className={`file-page ${kind} ${cached.has(page) ? "cached" : ""} ${page === current ? "current" : ""}`}
-              title={`page ${page} · ${page === 0 ? "file header" : freeSet.has(page) ? "free" : owner ? `${owner.tree} ${owner.leaf ? "leaf" : "node"}` : "unused"}${cached.has(page) ? " · also in memory" : ""}`}
+              title={`page ${page} · ${page === 0 ? "file header" : freeSet.has(page) ? "free" : owner ? `${ownerLabel(owner)}` : "unused"}${cached.has(page) ? " · also in memory" : ""}`}
             >
               {flash?.kind === "miss" && <span key={flash.at} className="file-flash" />}
             </span>

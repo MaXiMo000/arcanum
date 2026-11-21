@@ -447,7 +447,9 @@ def cast(v, target):
             return check_int(int(v))
     except (ValueError, InvalidOperation, OverflowError):
         pass
-    raise ExecutionError(f"cannot convert {to_text(v)!r} to {target}")
+    shown = to_text(v)
+    shown = shown if len(shown) <= 60 else shown[:57] + "..."
+    raise ExecutionError(f"cannot convert {shown!r} to {target}")
 
 
 def scale_decimal(v, scale, precision=None):

@@ -15,6 +15,7 @@ Each value is a tag byte followed by its payload:
     ARRAY    0x08 + elements + 0x00    each element in this format; 0x00 sorts before any element, so a
                                        prefix sorts first ({1,2} < {1,2,3}), as PostgreSQL orders arrays
     JSONB    0x09 + text as TEXT       the canonical text (see values.py)
+    TOAST    0x0A + 25 bytes           a pointer to a value in overflow pages (stored rows only, never keys)
 
 A shorter tuple sorts before any longer tuple it is a prefix of. A column holds
 one type, so INTEGER and REAL values never meet at the same position.
@@ -24,9 +25,11 @@ import datetime
 import struct
 from decimal import Decimal
 
-from ..values import Jsonb
+from ..values import Jsonb, Toast
 
-NULL, INTEGER, REAL, TEXT, DATE, TIMESTAMP, NUMERIC, ARRAY, JSONB = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09
+NULL, INTEGER, REAL, TEXT, DATE, TIMESTAMP, NUMERIC, ARRAY, JSONB, TOAST = (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                                                                         0x08, 0x09, 0x0A)
+_TOAST = struct.Struct(">III?8s")
 EPOCH = datetime.datetime(1970, 1, 1)
 _EPOCH_DAY = EPOCH.date().toordinal()
 _MICRO = datetime.timedelta(microseconds=1)
@@ -66,6 +69,9 @@ def _encode_into(out, values):
         elif isinstance(v, Jsonb):
             out.append(JSONB)
             _text_into(out, v.text)
+        elif isinstance(v, Toast):
+            out.append(TOAST)
+            out += _TOAST.pack(v.page, v.size, v.raw, v.compressed, v.digest)
         elif isinstance(v, datetime.datetime):  # before date: a datetime is also a date
             out.append(TIMESTAMP)
             out += _U64.pack((v - EPOCH) // _MICRO + _SIGN)
@@ -130,6 +136,8 @@ def _decode_one(data, i):
     if tag == JSONB:
         text, i = _decode_text(data, i)
         return Jsonb.parse(text), i
+    if tag == TOAST:
+        return Toast(*_TOAST.unpack_from(data, i)), i + _TOAST.size
     raise ValueError(f"corrupt value: unknown tag {tag:#04x} at byte {i - 1}")
 
 

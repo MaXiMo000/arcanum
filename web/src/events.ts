@@ -35,6 +35,13 @@ export function describeEvent(e: EngineEvent): { text: string; tone: Tone } {
       return { text: `session ${e.session} got its lock after ${num(e.waited_ms)} ms and goes on`, tone: "ok" };
     case "deadlock":
       return { text: `deadlock detected: session ${e.session}'s transaction ${num(e.victim)} rolled back`, tone: "danger" };
+    case "toast_write":
+      return {
+        text: `TOAST: a ${num(e.bytes).toLocaleString()}-byte value of ${e.table} moved to overflow pages from page ${num(e.page)}${e.compressed ? ` (compressed to ${num(e.stored).toLocaleString()} bytes)` : ""}`,
+        tone: "write",
+      };
+    case "toast_read":
+      return { text: `TOAST: read a value of ${e.table} back from overflow page ${num(e.page)}`, tone: "read" };
     case "savepoint":
       return { text: `session ${e.session}: savepoint ${e.name} starts subtransaction ${num(e.xid)}`, tone: "log" };
     case "release":

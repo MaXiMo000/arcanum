@@ -20,3 +20,15 @@ export function formatKey(key: Value[], maxChars = 9): string {
 export function formatCount(n: number): string {
   return n.toLocaleString("en-US", { maximumFractionDigits: n < 10 ? 1 : 0 });
 }
+
+/** Which tree (or table's overflow pages) a page belongs to, for colouring and labelling pages. */
+export interface PageOwner {
+  tree: string;
+  color: number;
+  leaf: boolean;
+  overflow?: boolean;
+}
+
+export function ownerLabel(owner: PageOwner): string {
+  return `${owner.tree} ${owner.overflow ? "overflow page (TOAST)" : owner.leaf ? "leaf" : "node"}`;
+}

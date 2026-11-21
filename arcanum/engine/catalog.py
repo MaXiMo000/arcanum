@@ -24,8 +24,9 @@ from functools import cached_property
 from ..errors import ConstraintError, ExecutionError, LockWaitError, SerializationError, SqlError
 from ..sql import nodes as n
 from ..sql.parser import parse
-from ..storage import BTree, decode, encode
+from ..storage import BTree, decode, encode, toast
 from ..storage.btree import MAX_ENTRY
+from ..values import Toast
 from .expr import (
     BOOLEAN,
     INTEGER,
@@ -41,6 +42,9 @@ from .expr import (
 from .mvcc import FROZEN, pack, prune, settled, unpack
 
 CATALOG_ROOT = 1
+ROW_LIMIT = MAX_ENTRY - 6  # a row's key and versions together must fit this, or values move to overflow pages
+TOAST_MIN = 64  # values smaller than this stay in the row
+_TOAST_TAG = bytes([0x0A])  # the codec's tag for an overflow pointer (a cheap test before decoding a row)
 HISTOGRAM_BUCKETS = 16
 HISTOGRAM_TEXT = 32  # text histogram bounds keep this many characters; enough to estimate ranges
 COMMON_VALUES = 8  # most common values kept per column, so skewed equalities are estimated well
@@ -254,13 +258,9 @@ class Catalog:
 
     def rewrite_rows(self, table, change):
         """Replace every version of every row by change(key, row), which may change the row's width."""
-        old_width = len(table.columns)
-        tree = self.btree(table.root)
-        for key, value in list(tree.scan()):
-            versions = [[xmin, xmax, tuple(change(key, row))] for xmin, xmax, row in unpack(decode(value), old_width)]
-            encoded = encode(pack(versions))
-            _check_size(len(key) + len(encoded), f"row of table {table.name}")
-            tree.insert(key, encoded, replace=True)
+        for key, value in list(self.btree(table.root).scan()):
+            versions = [[xmin, xmax, tuple(change(key, row))] for xmin, xmax, row in self._versions(table, value)]
+            self._store(table, key, versions)
 
     def drop_meta(self, name):
         if self.meta.pop(name, None) is not None:
@@ -326,8 +326,8 @@ class Catalog:
                     keys.append(key)
             candidates = ((k, self.chain(table, k) or []) for k in keys)
         else:
-            width = len(table.columns)
-            candidates = [(k, unpack(decode(v), width)) for k, v in self.btree(table.root).scan()]
+            len(table.columns)
+            candidates = [(k, self._versions(table, v)) for k, v in list(self.btree(table.root).scan())]
         for key, versions in candidates:
             if self._live(versions, txn, matches):
                 yield key
@@ -358,6 +358,9 @@ class Catalog:
 
     def drop_table(self, name):
         table = self.tables.pop(name)
+        for _, value in list(self.btree(table.root).scan()):
+            if _TOAST_TAG in value:
+                self._free_pointers(self._pointers(value))
         for index in table.indexes:
             self.btree(index.root).drop()
             self.tree.delete(encode((index.name,)))
@@ -433,16 +436,80 @@ class Catalog:
     def chain(self, table, key):
         """The versions stored under key, oldest first, or None."""
         value = self.btree(table.root).get(key)
-        return None if value is None else unpack(decode(value), len(table.columns))
+        return None if value is None else self._versions(table, value)
+
+    def _versions(self, table, value):
+        """A stored chain as [xmin, xmax, row] versions, with values moved to overflow pages read back."""
+        versions = unpack(decode(value), len(table.columns))
+        if _TOAST_TAG in value:
+            cache = {}
+            for version in versions:
+                if any(isinstance(v, Toast) for v in version[2]):
+                    version[2] = tuple(self._detoast(table, v, cache) if isinstance(v, Toast) else v
+                                       for v in version[2])
+        return versions
+
+    def _detoast(self, table, pointer, cache):
+        if pointer not in cache:
+            cache[pointer] = decode(toast.read(self.pager, pointer))[0]
+            self.pager.events.emit("toast_read", table=table.name, page=pointer.page, bytes=pointer.size)
+        return cache[pointer]
 
     def _store(self, table, key, versions):
+        """Write a row's chain of versions. A chain too large for a B+tree leaf has its largest values moved
+        to overflow pages (largest first) until it fits; pointers already stored for the same values are
+        reused, and overflow pages the row no longer needs are freed."""
         tree = self.btree(table.root)
+        old = tree.get(key)
+        stored = self._pointers(old) if old is not None and _TOAST_TAG in old else set()
         if not versions:
             tree.delete(key)
+            self._free_pointers(stored)
             return
         value = encode(pack(versions))
+        if len(key) + len(value) > ROW_LIMIT:
+            value = self._toast(table, key, versions, {(t.digest, t.raw): t for t in stored})
         _check_size(len(key) + len(value), f"row of table {table.name}")
         tree.insert(key, value, replace=True)
+        if stored:
+            self._free_pointers(stored - self._pointers(value))
+
+    def _toast(self, table, key, versions, reuse):
+        rows = [list(row) for _, _, row in versions]
+        cells = sorted(((len(encoded), i, c, encoded) for i, row in enumerate(rows) for c, v in enumerate(row)
+                        if v is not None and len(encoded := encode((v,))) > TOAST_MIN), reverse=True)
+        value = encode(pack(versions))
+        for _, i, c, encoded in cells:
+            ident = (toast.digest(encoded), len(encoded))
+            pointer = reuse.get(ident)
+            if pointer is None:
+                pointer = reuse[ident] = toast.write(self.pager, encoded)
+                self.pager.events.emit("toast_write", table=table.name, page=pointer.page, bytes=pointer.raw,
+                                       stored=pointer.size, compressed=pointer.compressed)
+            rows[i][c] = pointer
+            value = encode(pack([[x, d, tuple(r)] for (x, d, _), r in zip(versions, rows, strict=True)]))
+            if len(key) + len(value) <= ROW_LIMIT:
+                break
+        return value
+
+    @staticmethod
+    def _pointers(value):
+        return {v for v in decode(value) if isinstance(v, Toast)}
+
+    def _free_pointers(self, pointers):
+        for pointer in pointers:
+            toast.free(self.pager, pointer)
+
+    def toast_pages(self, table, limit=2000):
+        """Overflow pages a table's rows point to, for drawing (read without touching the buffer pool)."""
+        out = []
+        for _, value in self.btree(table.root).scan():
+            if _TOAST_TAG in value:
+                for pointer in self._pointers(value):
+                    out.extend(toast.pages(self.pager, pointer))
+                    if len(out) >= limit:
+                        return out
+        return out
 
     def _visible(self, table, versions, snapshot, sx=None, key=None):
         """The version of a row that snapshot sees (raw, untyped), or None. sx: the SERIALIZABLE reader,
@@ -461,20 +528,20 @@ class Catalog:
 
     def scan(self, table, snapshot):
         """Yield (key, row) for every row the snapshot sees, in primary key order."""
-        width = len(table.columns)
+        len(table.columns)
         sx = self.ssi.reader(snapshot)
         if sx is not None:
             self.ssi.read(sx, table.name)
         for key, value in self.btree(table.root).scan():
-            row = self._visible(table, unpack(decode(value), width), snapshot, sx, key)
+            row = self._visible(table, self._versions(table, value), snapshot, sx, key)
             if row is not None:
                 yield key, self._typed(table, row)
 
     def versions(self, table):
         """Yield (key, row) for every version of every row, whoever can see it (for building an index)."""
-        width = len(table.columns)
-        for key, value in self.btree(table.root).scan():
-            for _, _, row in unpack(decode(value), width):
+        len(table.columns)
+        for key, value in list(self.btree(table.root).scan()):
+            for _, _, row in self._versions(table, value):
                 yield key, row
 
     def scan_range(self, table, index, snapshot, lo=None, hi=None, hi_inclusive=False, index_only=False):
@@ -494,7 +561,7 @@ class Catalog:
             self.ssi.read(sx, table.name, *((lo, hi, hi_inclusive) if index is None else ()))
         if index is None:
             for key, value in self.btree(table.root).scan(lo, hi, hi_inclusive=hi_inclusive):
-                row = self._visible(table, unpack(decode(value), width), snapshot, sx, key)
+                row = self._visible(table, self._versions(table, value), snapshot, sx, key)
                 if row is not None:
                     yield key, self._typed(table, row)
             return
@@ -511,7 +578,7 @@ class Catalog:
                 yield key, self._typed(table, tuple(row))
                 continue
             stored = tree.get(key)
-            row = self._visible(table, unpack(decode(stored), width), snapshot, sx, key) if stored is not None else None
+            row = self._visible(table, self._versions(table, stored), snapshot, sx, key) if stored is not None else None
             if row is not None and tuple(row[i] for i in index.columns) == tuple(values[:size]):
                 yield key, self._typed(table, row)
 
@@ -767,8 +834,8 @@ class Catalog:
     def _check_unique_all(self, table, index):
         """CREATE UNIQUE INDEX on existing rows: no two live rows may share a value."""
         seen = {}
-        for key, value in self.btree(table.root).scan():
-            for xmin, xmax, row in unpack(decode(value), len(table.columns)):
+        for key, value in list(self.btree(table.root).scan()):
+            for xmin, xmax, row in self._versions(table, value):
                 if self.mvcc.status(xmin) == "aborted" or (xmax is not None and self.mvcc.status(xmax) == "committed"):
                     continue
                 values = tuple(row[i] for i in index.columns)

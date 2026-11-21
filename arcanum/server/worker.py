@@ -106,6 +106,8 @@ class EventPump:
             "checkpoints": k["checkpoint"],
             "rollbacks": k["rollback"],
             "sort_spills": k["sort_spill"],
+            "toast_writes": k["toast_write"],
+            "toast_reads": k["toast_read"],
             "constraints": self.notes[:NOTES],
         }
 
@@ -452,7 +454,7 @@ def _state(db, message, jobs):
     trees = [tree("catalog", "catalog", catalog.tree.root, ["name"])]
     for table in catalog.tables.values():
         key = [table.columns[i].name for i in table.primary_key] or ["rowid"]
-        trees.append(tree("table", table.name, table.root, key))
+        trees.append({**tree("table", table.name, table.root, key), "toast_pages": catalog.toast_pages(table, limit)})
         trees.extend(tree("index", index.name, index.root, [table.columns[i].name for i in index.columns] + key,
                           table.name) for index in table.indexes)
     tables = [{"name": t.name, "columns": [{"name": c.name, "type": c.type} for c in t.columns],

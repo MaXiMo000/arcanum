@@ -11,6 +11,7 @@ them to and from PostgreSQL's '{1,2,NULL}' text form.
 """
 
 import json
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
 from .errors import ExecutionError
@@ -53,6 +54,16 @@ class Jsonb:
 
     def __repr__(self):
         return f"Jsonb({self.text})"
+
+
+@dataclass(frozen=True, slots=True)
+class Toast:
+    """A stored row's pointer to a value kept in overflow pages (see storage/toast.py)."""
+    page: int  # the first overflow page
+    size: int  # bytes stored (compressed, if compressed)
+    raw: int  # bytes of the encoded value
+    compressed: bool
+    digest: bytes  # identifies the value, so versions that keep it unchanged share the pages
 
 
 def _no_constant(name):
