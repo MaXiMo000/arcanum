@@ -161,6 +161,7 @@ export interface Limits {
   max_rows: number;
   max_pages: number;
   max_sql_bytes: number;
+  max_import_bytes: number;
 }
 
 /** The two database sessions each visitor gets, side by side. */
@@ -398,6 +399,21 @@ export type ClusterRequest =
   | { action: "partition"; groups: NodeName[][] }
   | { action: "crash" | "restart"; node: NodeName };
 
+/** What a CSV import would do (POST /sessions/{id}/import with dry_run). */
+export interface ImportPreview {
+  table: string;
+  create: boolean;
+  rows_total: number;
+  columns: { name: string; type: string }[];
+  sample: string[][];
+}
+
+export interface ImportRequest {
+  table: string;
+  csv: string;
+  header: boolean;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -448,6 +464,10 @@ export const api = {
   lab: (id: string, params: LabParams) => call<LabResult>("POST", `${sessionPath(id)}/labs/engines`, params),
   poolLab: (id: string, params: PoolLabParams) => call<PoolLabResult>("POST", `${sessionPath(id)}/labs/buffer-pool`, params),
   cluster: (id: string, request: ClusterRequest) => call<ClusterReply>("POST", `${sessionPath(id)}/cluster`, request),
+  previewImport: (id: string, request: ImportRequest) =>
+    call<ImportPreview>("POST", `${sessionPath(id)}/import`, { ...request, dry_run: true }),
+  importCsv: (id: string, request: ImportRequest, session: SessionName = "A") =>
+    call<QueryReply>("POST", `${sessionPath(id)}/import`, { ...request, session }),
   crash: (id: string, duringWrite: boolean) =>
     call<CrashSummary>("POST", `${sessionPath(id)}/crash`, { during_write: duringWrite }),
   eventsUrl: (id: string) => {

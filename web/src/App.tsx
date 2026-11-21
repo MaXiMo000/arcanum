@@ -6,6 +6,8 @@ import {
   type AdviceFix,
   type CrashSummary,
   type EngineState,
+  type ImportRequest,
+  type QueryReply,
   type QueryResult,
   type QueryStats,
   type SessionName,
@@ -66,7 +68,7 @@ function firstTable(state: EngineState): string | null {
 }
 
 export default function App() {
-  const { sessionId, idRef, state, setState, startError, start: startSession, lost: onSessionGone, refresh, remember, replay: replaySetup, setup } =
+  const { sessionId, idRef, state, setState, startError, start: startSession, lost: onSessionGone, refresh, remember, unreplayable, replay: replaySetup, setup } =
     useSession();
   const [selectedTree, setSelectedTree] = useState<string | null>(null); // set to the first table on load
   const [outcome, setOutcome] = useState<Outcome | null>(null);
@@ -216,7 +218,13 @@ export default function App() {
   const cancelWait = useCallback((ticket: string) => cancelled.current.add(ticket), []);
 
   const execute = useCallback(
-    async (sql: string, focus?: InspectorTab, session: SessionName = "A"): Promise<Outcome | ApiError | Waiting | null> => {
+    async (
+      sql: string,
+      focus?: InspectorTab,
+      session: SessionName = "A",
+      /** Sends the work instead of running `sql` (a CSV import); `sql` then only describes it. */
+      send?: (id: string) => Promise<QueryReply>,
+    ): Promise<Outcome | ApiError | Waiting | null> => {
       const id = idRef.current;
       if (!id) return null;
       setRunError(null);
@@ -240,7 +248,10 @@ export default function App() {
           // The outcome still stands without the fresh picture.
         }
         const next: Outcome = { id: ++outcomeIds.current, session, sql, results, stats, state: after };
-        if (results.some((r) => CHANGES.test(r.status))) remember([[session, sql]]);
+        if (results.some((r) => CHANGES.test(r.status))) {
+          if (send) unreplayable();
+          else remember([[session, sql]]);
+        }
         setOutcome(next);
         const read = treeRead(results);
         if (read && after?.trees.some((t) => t.name === read)) setSelectedTree(read);
@@ -252,7 +263,7 @@ export default function App() {
       };
 
       try {
-        let reply = await api.query(id, sql, session);
+        let reply = await (send ? send(id) : api.query(id, sql, session));
         if (!reply.waiting) return await finish(reply);
         // A statement is waiting for another session's transaction: show the lock, then follow the
         // ticket until the holder finishes (or the wait is cancelled or times out).
@@ -277,7 +288,7 @@ export default function App() {
         return fail(e);
       }
     },
-    [mode, judge, onSessionGone, refresh, remember],
+    [mode, judge, onSessionGone, refresh, remember, unreplayable],
   );
 
   const runQuery = useCallback(
@@ -286,6 +297,12 @@ export default function App() {
       if (result && "waiting" in result) result = await result.done;
       return result instanceof ApiError ? null : result;
     },
+    [execute],
+  );
+
+  const importCsv = useCallback(
+    (request: ImportRequest, session: SessionName) =>
+      execute(`-- CSV import into ${request.table}`, "results", session, (id) => api.importCsv(id, request, session)),
     [execute],
   );
 
@@ -467,6 +484,9 @@ export default function App() {
             onShare={() => void share()}
             sessions={state?.sessions ?? null}
             maxSqlBytes={state?.limits.max_sql_bytes ?? null}
+            sessionId={sessionId}
+            onImport={importCsv}
+            maxImportBytes={state?.limits.max_import_bytes ?? null}
             disabled={!state || measuring}
             completed={progress.challenges}
             tables={state?.tables ?? []}

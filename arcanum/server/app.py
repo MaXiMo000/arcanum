@@ -3,6 +3,7 @@
     POST   /sessions                 create a session with its own seeded database
     DELETE /sessions/{id}            close it and delete its files
     POST   /sessions/{id}/query      run SQL; returns rows plus the traced query plan
+    POST   /sessions/{id}/import     load CSV into a new or existing table (or preview it)
     GET    /sessions/{id}/state      B+trees, buffer pool and log, for drawing the database
     POST   /sessions/{id}/crash      kill the engine (optionally mid-write) and recover
     POST   /sessions/{id}/labs/{lab} an experiment: "engines" (B+tree vs LSM tree), "buffer-pool" (policies)
@@ -66,6 +67,7 @@ class Settings:
     max_pages: int = 2500  # per-session database size, in 4 KB pages (10 MB)
     max_rows: int = 1000  # rows returned per result; the rest are counted, not sent
     max_sql_bytes: int = 20_000
+    max_import_bytes: int = 512 * 1024  # CSV text per import
     memory_rows: int = 200_000  # rows a statement may hold in memory at once
     sort_memory_rows: int = 10_000
     spill_bytes: int = 64 * 1024 * 1024  # temporary sort space per statement
@@ -91,7 +93,7 @@ class Settings:
     def from_env(cls):
         d = cls()
         int_fields = ["max_sessions", "max_sessions_per_client", "max_concurrent_queries", "max_pages", "max_rows",
-                      "max_sql_bytes", "memory_rows", "sort_memory_rows", "spill_bytes", "recursive_rows",
+                      "max_sql_bytes", "max_import_bytes", "memory_rows", "sort_memory_rows", "spill_bytes", "recursive_rows",
                       "worker_memory_mb", "max_keys", "pool_size", "event_limit", "rate_burst", "sessions_per_minute",
                       "crashes_per_minute", "labs_per_minute", "max_websockets", "max_websockets_per_client", "max_websockets_per_session"]
         float_fields = ["session_ttl", "query_timeout", "lock_timeout", "queue_timeout", "rate_per_second",
@@ -130,6 +132,16 @@ class RateLimiter:
 class QueryRequest(BaseModel):
     sql: str
     session: Literal["A", "B"] = "A"  # which of the visitor's two database sessions runs it
+
+
+class ImportRequest(BaseModel):
+    """CSV text loaded into a table (engine/csvimport.py); dry_run only reads it and returns a preview."""
+    model_config = ConfigDict(extra="forbid")
+    table: str = Field(min_length=1, max_length=63, pattern=r"^[a-z_][a-z0-9_]*$")
+    csv: str = Field(min_length=1)
+    header: bool = True
+    dry_run: bool = False
+    session: Literal["A", "B"] = "A"
 
 
 class CrashRequest(BaseModel):
@@ -220,6 +232,7 @@ def create_app(settings=None):
     limiter = RateLimiter()
     sockets = {"total": 0, "by_client": {}}
     max_body = settings.max_sql_bytes + 4096
+    max_import_body = settings.max_import_bytes * 2 + 4096  # JSON escaping can double the CSV text
 
     @asynccontextmanager
     async def lifespan(app):
@@ -255,8 +268,9 @@ def create_app(settings=None):
             length = request.headers.get("content-length")
             if length is None:
                 return _error(411, "LengthRequired", "requests with a body must send Content-Length")
-            if not length.isdigit() or int(length) > max_body:
-                return _error(413, "RequestTooLarge", f"request bodies are limited to {max_body} bytes")
+            limit = max_import_body if request.url.path.endswith("/import") else max_body
+            if not length.isdigit() or int(length) > limit:
+                return _error(413, "RequestTooLarge", f"request bodies are limited to {limit} bytes")
         response = await call_next(request)
         response.headers.update(API_HEADERS)
         if settings.hsts:
@@ -293,7 +307,8 @@ def create_app(settings=None):
         return {"status": "ok"}
 
     limits = {"query_timeout": settings.query_timeout, "max_rows": settings.max_rows,
-              "max_pages": settings.max_pages, "max_sql_bytes": settings.max_sql_bytes}
+              "max_pages": settings.max_pages, "max_sql_bytes": settings.max_sql_bytes,
+              "max_import_bytes": settings.max_import_bytes}
 
     @app.post("/sessions", status_code=201)
     async def create_session(request: Request):
@@ -317,6 +332,16 @@ def create_app(settings=None):
             return _error(413, "SqlTooLong", f"SQL is limited to {settings.max_sql_bytes} bytes")
         reply = await session.request({"op": "query", "sql": body.sql, "session": body.session,
                                        "max_rows": settings.max_rows})
+        return _query_reply(reply)
+
+    @app.post("/sessions/{session_id}/import")
+    async def import_csv(session_id: str, body: ImportRequest):
+        session = manager.get(session_id)
+        if len(body.csv.encode()) > settings.max_import_bytes:
+            return _error(413, "CsvTooLarge", f"CSV imports are limited to {settings.max_import_bytes // 1024} KB")
+        reply = await session.request({"op": "import", **body.model_dump(), "max_rows": settings.max_rows})
+        if reply.get("ok") and "preview" in reply:
+            return reply["preview"]
         return _query_reply(reply)
 
     # A statement waiting for another transaction's lock answers 202 with a ticket; fetch the ticket

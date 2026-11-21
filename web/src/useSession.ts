@@ -15,7 +15,7 @@ export const CHANGES = /^(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|ANALYZE|BEGIN|C
 export interface SetupLog {
   session: string | null;
   statements: [SessionName, string][];
-  /** Whether statements were dropped because the log was full. */
+  /** Whether changes are missing: the log was full, or data came from an imported file. */
   full: boolean;
 }
 
@@ -122,6 +122,12 @@ export function useSession() {
     writeStorage(tab, SETUP_KEY, JSON.stringify(log));
   }, []);
 
+  /** Note a change a share link cannot replay (rows imported from a file). */
+  const unreplayable = useCallback(() => {
+    setup.current.full = true;
+    writeStorage(tab, SETUP_KEY, JSON.stringify(setup.current));
+  }, []);
+
   /** Run a share link's setup statements on this session. Returns how many failed. */
   const replay = useCallback(
     async (statements: [SessionName, string][]) => {
@@ -148,5 +154,5 @@ export function useSession() {
     [refresh, remember],
   );
 
-  return { sessionId, idRef, state, setState, startError, start, lost, refresh, remember, replay, setup };
+  return { sessionId, idRef, state, setState, startError, start, lost, refresh, remember, unreplayable, replay, setup };
 }

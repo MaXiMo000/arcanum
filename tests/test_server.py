@@ -513,3 +513,22 @@ def test_the_replication_cluster_elects_replicates_and_refuses_bad_steps(client)
     split = client.post(path, json={"action": "partition", "groups": [["n1"], ["n2", "n3"]]}).json()
     assert split["state"]["groups"] == [["n1"], ["n2", "n3"]]
     assert client.post(path, json={"action": "reset"}).json()["state"]["now"] == 0
+
+
+def test_csv_import_previews_then_loads_a_table(client):
+    session = new_session(client)
+    path = f"/sessions/{session}/import"
+    text = "City,Population,Founded\nLisbon,545000,1179-01-01\nOsaka,2750000,\n"
+    preview = client.post(path, json={"table": "cities", "csv": text, "dry_run": True}).json()
+    assert preview["create"] and preview["rows_total"] == 2
+    assert [c["type"] for c in preview["columns"]] == ["TEXT", "INTEGER", "DATE"]
+    assert "cities" not in [t["name"] for t in client.get(f"/sessions/{session}/state").json()["tables"]]
+    reply = client.post(path, json={"table": "cities", "csv": text})
+    assert reply.status_code == 200 and [r["status"] for r in reply.json()["results"]] == ["CREATE TABLE", "INSERT 2"]
+    rows = client.post(f"/sessions/{session}/query", json={"sql": "SELECT city, population FROM cities ORDER BY 1"})
+    assert rows.json()["results"][0]["rows"] == [["Lisbon", 545000], ["Osaka", 2750000]]
+    bad = client.post(path, json={"table": "cities", "csv": "population\nmany\n"})
+    assert bad.status_code == 400 and "line 2" in bad.json()["error"]["message"]
+    assert client.post(path, json={"table": "Bad Name", "csv": "a\n1"}).status_code == 422
+    huge = "a\n" + "1\n" * 300_000
+    assert client.post(path, json={"table": "big", "csv": huge}).status_code == 413

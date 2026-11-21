@@ -213,6 +213,17 @@ could not be used and why), the join orders considered with their costs, sorts r
 check. Each
 decision points at the plan node it produced.
 
+## CSV import
+
+`Database.import_csv(table, text, header=True)` loads CSV text. A new table gets a type per column,
+inferred from every value (INTEGER, REAL, BOOLEAN, DATE, TIMESTAMP, otherwise TEXT), with header names
+turned into plain identifiers; an existing table is filled by header name, or by position without a
+header. The delimiter is detected, quoted fields may hold delimiters, quotes and newlines, and an empty
+field is NULL. Every value is checked against its column first, so a bad one is reported by line and
+column before anything is written. The import then runs as a `CREATE TABLE` (for a new table) and a single
+`INSERT`, so it is traced and animated like any statement, and either every row arrives or none does.
+Values become quoted SQL literals; nothing in the file is ever read as SQL.
+
 ## Query advisor and error doctor
 
 Every traced statement (`Database.execute(sql, trace=True)`, which the API server uses) comes back with
@@ -433,6 +444,7 @@ Two modes share one screen: the database in the middle, an inspector on the righ
 - **Play**: an editor with syntax highlighting, name completion and errors underlined, example queries,
   and challenges judged from what the engine really did. Switch to two sessions to get a second editor on
   the same database, like two psql terminals, and watch transactions see (or not see) each other.
+  **Import CSV** loads a file into a new or existing table after previewing the inferred columns.
 - **Row versions** on the map: every row that currently holds versions, each version's `xmin` and `xmax`
   coloured by whether that transaction is open, committed or rolled back, and which session sees which
   version. While a session waits for a lock, a lock graph shows who waits for whom; under
@@ -535,6 +547,7 @@ python -m arcanum.server
 | `POST /sessions/{id}/labs/engines` | Run one workload (`keys`, `order`, `updates`, `value_bytes`, `memory_pages`) on a B+tree and an LSM tree; returns both engines' amplifications, the bytes-written curves and the LSM tree's shape after every flush and compaction. |
 | `POST /sessions/{id}/labs/buffer-pool` | Record one workload's page accesses (`workload`, `pool_pages`, `rows`, `lookups`) and replay them through every replacement policy; returns hits, misses and hit-rate curves over time and against pool size. |
 | `POST /sessions/{id}/cluster` | Drive the session's Raft cluster: `action` is `state`, `tick` (`ticks`), `write` (`sql`), `read` (`node`, `sql`), `partition` (`groups`), `heal`, `crash` / `restart` (`node`) or `reset`. Returns every node's role, term and log, the messages in flight, the statements behind the log entries and what happened; `tick` also returns one frame per tick. |
+| `POST /sessions/{id}/import` | Load CSV text (`table`, `csv`, `header`) into a new table with inferred column types or into an existing one by column name; replies like `/query`. With `dry_run` it returns a preview instead: the columns and types, the row count and the first rows. |
 | `GET /sessions/{id}/state` | Every B+tree (nodes, keys, children), the buffer pool (cached and dirty pages) and the log, for drawing the database. |
 | `POST /sessions/{id}/crash` | Pull the plug: kill the engine process, by default in the middle of a stream of write transactions, then restart it. The reply compares the rows acknowledged before the crash with the rows after recovery. |
 | `WS /sessions/{id}/events` | Live engine events in batches: `page_read`, `page_write`, `cache_evict`, `node_visit`, `node_split`, `node_merge`, `root_grow`, `wal_append`, `commit`, `checkpoint`, `sort_spill`, `crash`, `recovery`, `recovered`. |
@@ -709,5 +722,5 @@ tests/
 
 Arcanum aims to be the clearest way to see how a database works from the inside. Next:
 
-- **Classroom mode**: a teacher's statements appear live on every student's screen, and CSV import.
+- **Classroom mode**: a teacher's statements appear live on every student's screen.
 - **Benchmarks**: a TPC-H-style dataset generator and a mode that charts a query's cost as the data grows.

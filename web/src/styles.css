@@ -3943,6 +3943,84 @@ p.session-badge {
   color: var(--warn);
 }
 
+.import-csv {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.import-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: end;
+  justify-content: space-between;
+}
+
+.import-row label {
+  display: grid;
+  gap: 4px;
+  color: var(--ink-2);
+  font-size: 12px;
+}
+
+.import-row input:not([type]),
+.import-row input[list] {
+  padding: 6px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--ink);
+  font: 12.5px var(--mono);
+}
+
+.import-row input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.import-file {
+  max-width: 100%;
+  color: var(--ink-2);
+  font-size: 12px;
+}
+
+.import-row .import-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.import-csv > .button {
+  justify-self: start;
+}
+
+.import-columns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.import-sample {
+  max-height: 140px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.import-sample table {
+  border-collapse: collapse;
+  font: 11.5px var(--mono);
+}
+
+.import-sample td {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
 .chip:disabled {
   opacity: 0.45;
   cursor: default;

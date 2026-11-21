@@ -16,6 +16,7 @@ import time
 from collections import Counter
 
 from ..engine import Database, QueryLimits
+from ..engine.csvimport import import_sql, plan_import
 from ..engine.doctor import diagnose
 from ..engine.expr import to_text
 from ..errors import (
@@ -216,6 +217,7 @@ def worker_main(path, conn, event_conn, options):
         "workload": lambda m: _workload(db, m, conn, pump),
         "lab": lambda m: {"ok": True, **LABS[m["lab"]](**m["params"])},
         "cluster": replication.handle,
+        "import": lambda m: _import(db, jobs, m),
     }
     while True:
         try:
@@ -425,6 +427,17 @@ class Jobs:
                                 "holder_session": holder.owner if holder else None, "what": job.what,
                                 "waited_ms": self._waited(job)}
         return reply
+
+
+def _import(db, jobs, message):
+    """A CSV import: its preview, or its CREATE TABLE and INSERT run like a script the session sent."""
+    try:
+        plan = plan_import(db.catalog, message["table"], message["csv"], message["header"])
+    except SqlError as e:
+        return {"ok": False, "error": error_json(e)}
+    if message["dry_run"]:
+        return {"ok": True, "preview": plan.preview()}
+    return jobs.start({"session": message["session"], "sql": import_sql(plan), "max_rows": message["max_rows"]})
 
 
 class Replication:

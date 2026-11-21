@@ -12,6 +12,7 @@ from ..values import Jsonb
 from .advisor import Workload, advise
 from .binder import Binder
 from .catalog import Catalog
+from .csvimport import import_sql, plan_import
 from .ddl import Alter
 from .dml import Writer
 from .executor import Context, QueryLimits, index_scan_pairs, run
@@ -100,6 +101,11 @@ class Database:
     def in_transaction(self):
         """Whether the default session has a transaction open."""
         return self._main.in_transaction
+
+    def import_csv(self, table, text, header=True):
+        """Load CSV text into `table`, creating it with inferred column types if it does not exist
+        (engine/csvimport.py). Returns the Results of the CREATE TABLE (if any) and the INSERT."""
+        return self.execute_script(import_sql(plan_import(self.catalog, table, text, header)))
 
     def index_report(self):
         """Every index with its scans since the database was opened and whether another index makes it

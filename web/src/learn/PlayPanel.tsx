@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { ApiError, type SessionName, type SessionTxn, type TableInfo } from "../api";
+import { ApiError, type ImportRequest, type SessionName, type SessionTxn, type TableInfo } from "../api";
 import { formatValue } from "../format";
 import { EXAMPLES } from "../examples";
 import { CHALLENGES } from "./challenges";
 import { Editor } from "./Editor";
+import { ImportCsv } from "./ImportCsv";
 import { isWaiting, type Outcome, type Waiting } from "./outcome";
 
 export const SECOND_SESSION_SQL = "SELECT id, name, city FROM customers WHERE id = 1;";
@@ -20,6 +21,9 @@ interface Props {
   onCancel: (ticket: string) => void;
   sessions: Record<SessionName, SessionTxn> | null;
   maxSqlBytes: number | null;
+  sessionId: string | null;
+  onImport: (request: ImportRequest, session: SessionName) => Promise<Outcome | ApiError | Waiting | null>;
+  maxImportBytes: number | null;
   disabled: boolean;
   completed: Record<string, number>;
   tables: TableInfo[];
@@ -42,6 +46,7 @@ export function PlayPanel(props: Props) {
   const { sql, onSql, onRun, sessions, maxSqlBytes, disabled, completed, tables, error } = props;
   const { two, onTwo: setTwo, sqlB, onSqlB: setSqlB } = props;
   const [showHints, setShowHints] = useState(false);
+  const [importing, setImporting] = useState(false);
   const done = CHALLENGES.filter((c) => c.id in completed).length;
 
   return (
@@ -71,7 +76,23 @@ export function PlayPanel(props: Props) {
       >
         ⤴ Share
       </button>
+      <button className="button ghost small" onClick={() => setImporting((v) => !v)} disabled={disabled} aria-expanded={importing}>
+        ⇪ Import CSV
+      </button>
       </div>
+      {importing && (
+        <ImportCsv
+          sessionId={props.sessionId}
+          maxBytes={props.maxImportBytes}
+          tables={tables}
+          onImport={async (request) => {
+            const result = await props.onImport(request, "A");
+            if (result && !(result instanceof ApiError)) setImporting(false);
+            return result instanceof ApiError ? result.message : null;
+          }}
+          onClose={() => setImporting(false)}
+        />
+      )}
       {two && (
         <p className="muted small">
           Two connections to the same database, like two terminals running psql. BEGIN in one, change a row, and see what the
