@@ -67,6 +67,7 @@ with Database("company.db") as db:
 | MVCC: row versions, snapshots, `READ COMMITTED` / `REPEATABLE READ`, concurrent sessions | done |
 | Lock waits, deadlock detection, `SERIALIZABLE` (serializable snapshot isolation) | done |
 | LSM tree (memtable, SSTables, Bloom filters, leveled compaction) compared with the B+tree | done |
+| Replication: a three-node Raft cluster with elections, partitions and crash recovery | done |
 | Write-ahead log, checkpoints and crash recovery | done |
 | Cost-based optimizer: index scans, statistics, join ordering, subquery decorrelation | done |
 | Index-only scans | done |
@@ -334,7 +335,7 @@ table's colour, and **What happened** says when values moved out or were read ba
 
 ## B+tree versus LSM tree
 
-The **Labs** view holds two experiments. The first runs one workload on two storage engines and counts every byte each one reads,
+The **Labs** view holds three experiments. The first runs one workload on two storage engines and counts every byte each one reads,
 writes and syncs. One engine is Arcanum's own B+tree (pager, write-ahead log and checkpoints). The other
 is an LSM tree, the design behind RocksDB, LevelDB and Cassandra:
 
@@ -371,6 +372,32 @@ trace through each policy, and through Belady's optimal policy, which evicts the
 the future: no real policy can beat it, so it shows how much room each one leaves. It charts hit rates
 over the trace and against pool size.
 
+## Replication with Raft
+
+The third lab is a cluster of three Arcanum databases kept identical by Raft. Each node has a log of SQL
+statements and applies the committed ones to its own database:
+
+- **Elections.** A follower that hears nothing from a leader for its randomized election timeout stands
+  for the next term. A node grants one vote per term, and only to a candidate whose log is at least as up
+  to date as its own, so a new leader always holds every committed entry.
+- **Replication.** Writes go to the leader, which sends new entries in AppendEntries messages (empty ones
+  are heartbeats). A follower accepts entries only where its log matches the leader's; otherwise the
+  leader backs up until they agree, and the follower's conflicting entries are replaced.
+- **Commitment.** An entry of the leader's term is committed once a majority store it; every node then
+  applies it. A new leader commits a no-op first, which also commits what earlier leaders left behind.
+
+The network is simulated in ticks, with message delays, so every message is drawn in flight. Isolate a
+node or crash it and watch the rest elect a new leader. A leader cut off from the majority keeps
+accepting writes it can never commit; reading from it, or from a lagging follower, returns stale data.
+When the network heals, its log is repaired and those writes disappear. A crashed node keeps its term,
+vote and log, and rebuilds its database by reapplying the log.
+
+Statements are replicated, not their effects, so each node runs every statement itself. Statements that
+read the clock or random numbers would give each node a different answer, so they are refused, as are
+transaction control statements: each log entry is one autocommit statement. A randomized test injects
+crashes, restarts and partitions and checks Raft's safety properties: at most one leader per term, and
+committed log prefixes that never disagree.
+
 ## Durability and crash recovery
 
 Arcanum keeps a write-ahead log next to the database file (`<name>-wal`):
@@ -405,7 +432,8 @@ Two modes share one screen: the database in the middle, an inspector on the righ
   version. While a session waits for a lock, a lock graph shows who waits for whom; under
   `SERIALIZABLE`, the read/write dependencies between transactions appear as they form.
 - **Labs**: the B+tree versus LSM tree comparison, with a scrubber over the LSM tree's levels, and the
-  buffer pool policies compared on one recorded trace (see above).
+  buffer pool policies compared on one recorded trace, and a three-node Raft cluster you can step, partition
+  and crash (see above).
 
 The inspector explains every statement:
 
@@ -499,6 +527,7 @@ python -m arcanum.server
 | `POST /sessions/{id}/tickets/{ticket}/cancel` | Cancel a waiting statement. |
 | `POST /sessions/{id}/labs/engines` | Run one workload (`keys`, `order`, `updates`, `value_bytes`, `memory_pages`) on a B+tree and an LSM tree; returns both engines' amplifications, the bytes-written curves and the LSM tree's shape after every flush and compaction. |
 | `POST /sessions/{id}/labs/buffer-pool` | Record one workload's page accesses (`workload`, `pool_pages`, `rows`, `lookups`) and replay them through every replacement policy; returns hits, misses and hit-rate curves over time and against pool size. |
+| `POST /sessions/{id}/cluster` | Drive the session's Raft cluster: `action` is `state`, `tick` (`ticks`), `write` (`sql`), `read` (`node`, `sql`), `partition` (`groups`), `heal`, `crash` / `restart` (`node`) or `reset`. Returns every node's role, term and log, the messages in flight, the statements behind the log entries and what happened; `tick` also returns one frame per tick. |
 | `GET /sessions/{id}/state` | Every B+tree (nodes, keys, children), the buffer pool (cached and dirty pages) and the log, for drawing the database. |
 | `POST /sessions/{id}/crash` | Pull the plug: kill the engine process, by default in the middle of a stream of write transactions, then restart it. The reply compares the rows acknowledged before the crash with the rows after recovery. |
 | `WS /sessions/{id}/events` | Live engine events in batches: `page_read`, `page_write`, `cache_evict`, `node_visit`, `node_split`, `node_merge`, `root_grow`, `wal_append`, `commit`, `checkpoint`, `sort_spill`, `crash`, `recovery`, `recovered`. |
@@ -646,6 +675,8 @@ arcanum/
   labs/
     engines.py     the B+tree versus LSM tree comparison
     buffer_pool.py replacement policies replayed on a recorded page-access trace
+  replication/
+    raft.py        Raft over three databases: elections, log replication, faults, simulated network
   server/
     app.py         FastAPI routes and WebSocket
     sessions.py    session and worker-process management, crash demo
@@ -671,8 +702,6 @@ tests/
 
 Arcanum aims to be the clearest way to see how a database works from the inside. Next:
 
-- **Replication**: a Raft-replicated log across three engines, with leader election, network partitions
-  and catch-up you can trigger.
 - **More advisor rules**: unused and duplicate indexes, an index advisor over a whole workload, and
   rewrites for `OR` across indexed columns.
 - **Classroom mode**: a teacher's statements appear live on every student's screen, and CSV import.

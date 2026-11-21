@@ -3883,6 +3883,254 @@ p.session-badge {
   flex-wrap: wrap;
 }
 
+.chip:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.raft-controls {
+  grid-template-columns: 1fr;
+}
+
+.raft-buttons,
+.raft-presets,
+.raft-node-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.raft-write {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px 10px;
+  align-items: end;
+}
+
+.raft-presets {
+  grid-column: 1 / -1;
+}
+
+.raft-write input,
+.raft-read input {
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--ink);
+  font: 12.5px var(--mono);
+}
+
+.raft-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 380px) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.raft-history {
+  grid-column: 1 / -1;
+}
+
+.raft-svg {
+  display: block;
+  width: 100%;
+  max-width: 380px;
+  height: auto;
+  margin: 0 auto;
+}
+
+.raft-link {
+  stroke: var(--line-2);
+  stroke-width: 2;
+}
+
+.raft-link.cut {
+  stroke: var(--danger);
+  stroke-dasharray: 5 6;
+  opacity: 0.7;
+}
+
+.raft-msg {
+  transition: transform 150ms linear;
+}
+
+.raft-msg circle {
+  fill: var(--accent);
+  stroke: var(--bg);
+  stroke-width: 1.5;
+}
+
+.raft-msg.vote circle {
+  fill: var(--eng-lsm);
+}
+
+.raft-msg.reply circle {
+  fill: var(--bg);
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.raft-msg.vote.reply circle {
+  stroke: var(--eng-lsm);
+}
+
+.raft-msg.refused circle {
+  stroke: var(--danger);
+}
+
+.raft-body {
+  fill: color-mix(in srgb, var(--ink) 7%, var(--bg)); /* opaque: the links stop at the edge */
+  stroke: var(--line-2);
+  stroke-width: 2;
+}
+
+.raft-node.leader .raft-body {
+  fill: color-mix(in srgb, var(--accent) 24%, var(--bg));
+  stroke: var(--accent);
+  stroke-width: 3;
+}
+
+.raft-node.candidate .raft-body {
+  stroke: var(--eng-lsm);
+  stroke-dasharray: 4 3;
+}
+
+.raft-node.down .raft-body {
+  stroke: var(--ink-3);
+  stroke-dasharray: 2 4;
+}
+
+.raft-timer {
+  fill: none;
+  stroke: var(--eng-lsm);
+  stroke-width: 2.5;
+  opacity: 0.6;
+}
+
+.raft-node text {
+  fill: var(--ink-2);
+  font: 10px var(--mono);
+}
+
+.raft-node .raft-name {
+  fill: var(--ink);
+  font: 700 13px var(--mono);
+}
+
+.raft-node.down text {
+  fill: var(--ink-3);
+}
+
+.raft-node-actions {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.raft-node-row b {
+  width: 24px;
+  font: 600 12.5px var(--mono);
+}
+
+.raft-log {
+  display: grid;
+  grid-template-columns: 136px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.raft-log.down {
+  opacity: 0.5;
+}
+
+.raft-log-name {
+  display: grid;
+  font: 600 12.5px var(--mono);
+}
+
+.raft-log-name small {
+  color: var(--ink-3);
+  white-space: nowrap;
+  font-weight: 400;
+  font-size: 10.5px;
+}
+
+.raft-entries {
+  display: flex;
+  gap: 3px;
+  min-height: 24px;
+  margin: 0;
+  padding: 0 0 4px;
+  overflow-x: auto;
+  list-style: none;
+}
+
+.raft-entries li {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 2px solid var(--term);
+  border-radius: 5px;
+  color: var(--ink-2);
+  font: 600 10.5px var(--mono);
+}
+
+.raft-entries li.committed {
+  background: var(--term);
+  color: #10131f;
+}
+
+.raft-read {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  color: var(--ink-2);
+  font-size: 12px;
+}
+
+.raft-result table {
+  width: 100%;
+  border-collapse: collapse;
+  font: 12px var(--mono);
+}
+
+.raft-result th,
+.raft-result td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+}
+
+.raft-history ol {
+  display: grid;
+  gap: 4px;
+  max-height: 180px;
+  margin: 8px 0 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+  font-size: 12.5px;
+}
+
+.raft-history .muted {
+  display: inline-block;
+  min-width: 34px;
+  font: 11px var(--mono);
+}
+
+@media (max-width: 760px) {
+  .raft-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .lab-facts {
   display: grid;
   grid-template-columns: auto 1fr;

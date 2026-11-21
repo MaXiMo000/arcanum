@@ -6,6 +6,7 @@
     GET    /sessions/{id}/state      B+trees, buffer pool and log, for drawing the database
     POST   /sessions/{id}/crash      kill the engine (optionally mid-write) and recover
     POST   /sessions/{id}/labs/{lab} an experiment: "engines" (B+tree vs LSM tree), "buffer-pool" (policies)
+    POST   /sessions/{id}/cluster    the replication demo: a three-node Raft cluster, stepped and faulted
     WS     /sessions/{id}/events     live engine events: page reads, splits, log writes, recovery
     GET    /health
 
@@ -34,7 +35,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .sessions import SessionError, SessionManager, Subscriber
 
@@ -154,7 +155,30 @@ class BufferPoolLab(BaseModel):
     lookups: int = Field(1500, ge=100, le=5_000)
 
 
-LABS = {"engines": EnginesLab, "buffer-pool": BufferPoolLab}  # the worker runs each by the same name
+LABS = {"engines": EnginesLab, "buffer-pool": BufferPoolLab}
+
+NodeName = Literal["n1", "n2", "n3"]
+
+
+class ClusterRequest(BaseModel):
+    """One step of the replication demo (replication/raft.py)."""
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["state", "tick", "write", "read", "partition", "heal", "crash", "restart", "reset"]
+    ticks: int = Field(1, ge=1, le=60)
+    sql: str | None = Field(None, min_length=1, max_length=2000)
+    node: NodeName | None = None
+    groups: list[list[NodeName]] | None = Field(None, min_length=1, max_length=3)
+
+    @model_validator(mode="after")
+    def _complete(self):
+        needs = {"write": ("sql",), "read": ("sql", "node"), "partition": ("groups",), "crash": ("node",),
+                 "restart": ("node",)}
+        missing = [name for name in needs.get(self.action, ()) if getattr(self, name) is None]
+        if missing:
+            raise ValueError(f"{self.action} needs {', '.join(missing)}")
+        if self.groups is not None and sorted(name for group in self.groups for name in group) != ["n1", "n2", "n3"]:
+            raise ValueError("a partition puts each node in exactly one group")
+        return self  # the worker runs each by the same name
 
 
 TICKET = re.compile(r"^t[0-9]{1,9}$")
@@ -324,6 +348,12 @@ def create_app(settings=None):
         if not limiter.allow(_client(request), "crash", settings.crashes_per_minute / 60, burst):
             return _error(429, "RateLimited", "the crash demo is limited; wait a few seconds", {"Retry-After": "10"})
         return await session.crash(body.during_write if body is not None else True)
+
+    @app.post("/sessions/{session_id}/cluster")
+    async def cluster(session_id: str, body: ClusterRequest):
+        reply = await manager.get(session_id).request({"op": "cluster", **body.model_dump()})
+        status = 200 if reply.pop("ok") else 400
+        return JSONResponse(reply, status_code=status)
 
     @app.post("/sessions/{session_id}/labs/{lab}")
     async def run_lab(session_id: str, lab: str, request: Request):

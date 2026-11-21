@@ -489,3 +489,27 @@ def test_long_values_are_shortened_in_responses(client):
     long, short = result["rows"][0]
     assert result["clipped"] == 1 and short == "short"
     assert long.startswith("x" * 2000) and long.endswith("(5,000 characters in all)")
+
+
+def test_the_replication_cluster_elects_replicates_and_refuses_bad_steps(client):
+    session = new_session(client)
+    path = f"/sessions/{session}/cluster"
+    frames = client.post(path, json={"action": "tick", "ticks": 40}).json()["frames"]
+    assert len(frames) == 40
+    leader = next(n["name"] for n in frames[-1]["nodes"] if n["role"] == "leader")
+    reply = client.post(path, json={"action": "write", "sql": "UPDATE accounts SET balance = 1 WHERE id = 1"})
+    assert reply.status_code == 200 and reply.json()["position"] == 2
+    client.post(path, json={"action": "tick", "ticks": 20})
+    follower = next(n for n in ("n1", "n2", "n3") if n != leader)
+    read = client.post(path, json={"action": "read", "node": follower, "sql": "SELECT balance FROM accounts WHERE id = 1"})
+    assert read.json()["read"]["rows"] == [[1]]
+    refused = client.post(path, json={"action": "write", "sql": "UPDATE accounts SET balance = random()"})
+    assert refused.status_code == 400 and "random" in refused.json()["error"]["message"]
+    assert refused.json()["state"]["now"] == 60  # the state still comes back, to keep the view current
+    for bad in ({"action": "tick", "ticks": 1000}, {"action": "read", "sql": "SELECT 1"},
+                {"action": "partition", "groups": [["n1"], ["n1", "n2"]]}, {"action": "crash", "node": "n9"},
+                {"action": "write", "sql": "x", "extra": 1}):
+        assert client.post(path, json=bad).status_code == 422
+    split = client.post(path, json={"action": "partition", "groups": [["n1"], ["n2", "n3"]]}).json()
+    assert split["state"]["groups"] == [["n1"], ["n2", "n3"]]
+    assert client.post(path, json={"action": "reset"}).json()["state"]["now"] == 0

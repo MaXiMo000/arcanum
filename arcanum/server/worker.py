@@ -29,6 +29,7 @@ from ..errors import (
 )
 from ..events import EventBus
 from ..labs import buffer_pool, engines
+from ..replication.raft import Cluster
 from ..sql.parser import parse_statements
 from ..storage import PAGE_SIZE, decode
 
@@ -206,6 +207,7 @@ def worker_main(path, conn, event_conn, options):
     pump.flush()
     send(conn, {"ready": True, "recovered_frames": db.recovered_frames})
     jobs = Jobs(db, pump, options["lock_timeout"])
+    replication = Replication(limits)
     handlers = {
         "query": jobs.start,
         "ticket": lambda m: jobs.ticket(m["ticket"]),
@@ -213,6 +215,7 @@ def worker_main(path, conn, event_conn, options):
         "state": lambda m: _state(db, m, jobs),
         "workload": lambda m: _workload(db, m, conn, pump),
         "lab": lambda m: {"ok": True, **LABS[m["lab"]](**m["params"])},
+        "cluster": replication.handle,
     }
     while True:
         try:
@@ -422,6 +425,38 @@ class Jobs:
                                 "holder_session": holder.owner if holder else None, "what": job.what,
                                 "waited_ms": self._waited(job)}
         return reply
+
+
+class Replication:
+    """The session's Raft cluster (replication/raft.py), created on first use and kept between requests."""
+
+    def __init__(self, limits):
+        self.limits = limits
+        self.cluster = None
+
+    def handle(self, message):
+        if self.cluster is None or message["action"] == "reset":
+            self.cluster = Cluster(seed=secrets.randbelow(2**32), limits=self.limits)
+        cluster, action, reply = self.cluster, message["action"], {"ok": True}
+        try:
+            if action == "tick":
+                frames = []
+                for _ in range(message["ticks"]):
+                    cluster.tick()
+                    frames.append(cluster.snapshot())
+                reply["frames"] = frames
+            elif action == "write":
+                reply["position"] = cluster.write(message["sql"], message.get("node"))
+            elif action == "read":
+                result = cluster.read(message["node"], message["sql"])
+                reply["read"] = result | {"rows": [[_cell(v) for v in row] for row in result["rows"]]}
+            elif action == "partition":
+                cluster.partition(message["groups"])
+            elif action in ("heal", "crash", "restart"):
+                getattr(cluster, action)(*([message["node"]] if action != "heal" else []))
+        except (SqlError, ExecutionError) as e:
+            reply = {"ok": False, "error": error_json(e)}
+        return reply | {"state": cluster.snapshot(), "entries": cluster.entries(), "history": cluster.history}
 
 
 def _result_json(r):

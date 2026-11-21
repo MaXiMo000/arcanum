@@ -3,10 +3,12 @@ import { useState } from "react";
 import { local, readStorage, writeStorage } from "../storage";
 import { EngineLab } from "./EngineLab";
 import { PoolLab } from "./PoolLab";
+import { RaftLab } from "./RaftLab";
 
 const LABS = [
   { id: "engines", label: "B+tree vs LSM tree", Lab: EngineLab },
   { id: "buffer-pool", label: "Buffer pool policies", Lab: PoolLab },
+  { id: "replication", label: "Replication (Raft)", Lab: RaftLab },
 ] as const;
 type LabId = (typeof LABS)[number]["id"];
 const LAB_KEY = "arcanum.lab";

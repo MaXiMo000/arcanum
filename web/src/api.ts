@@ -327,6 +327,70 @@ export interface PoolLabResult {
   sweep: { sizes: number[]; hit_rates: Record<PoolPolicy, number[]> };
 }
 
+export type NodeName = "n1" | "n2" | "n3";
+
+export interface ClusterNode {
+  name: NodeName;
+  up: boolean;
+  role: "follower" | "candidate" | "leader";
+  term: number;
+  voted_for: NodeName | null;
+  leader: NodeName | null;
+  commit: number;
+  applied: number;
+  /** The term of each log entry, position 1 first. */
+  log: number[];
+  /** Ticks until this node stands for election; null for a leader or a node that is down. */
+  election_in: number | null;
+  /** Leader only: the highest log position known to be stored on each node. */
+  match: Record<NodeName, number> | null;
+}
+
+export interface ClusterMessage {
+  id: number;
+  kind: "vote" | "vote_reply" | "append" | "append_reply";
+  from: NodeName;
+  to: NodeName;
+  term: number;
+  sent: number;
+  deliver: number;
+  /** Entries carried by an AppendEntries; 0 for a heartbeat. */
+  size: number;
+  granted: boolean | null;
+  success: boolean | null;
+}
+
+export interface ClusterState {
+  now: number;
+  nodes: ClusterNode[];
+  messages: ClusterMessage[];
+  groups: NodeName[][];
+}
+
+export interface ClusterEntry {
+  /** null for the no-op a new leader appends. */
+  sql: string | null;
+  result?: { ok: boolean; rowcount?: number; error?: string };
+}
+
+export interface ClusterReply {
+  state: ClusterState;
+  /** Keyed "position:term". */
+  entries: Record<string, ClusterEntry>;
+  history: { tick: number; text: string }[];
+  frames?: ClusterState[];
+  position?: number;
+  read?: { columns: string[]; rows: Value[][]; applied: number; commit: number; role: ClusterNode["role"]; term: number };
+}
+
+export type ClusterRequest =
+  | { action: "state" | "heal" | "reset" }
+  | { action: "tick"; ticks: number }
+  | { action: "write"; sql: string; node?: NodeName }
+  | { action: "read"; sql: string; node: NodeName }
+  | { action: "partition"; groups: NodeName[][] }
+  | { action: "crash" | "restart"; node: NodeName };
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -376,6 +440,7 @@ export const api = {
   state: (id: string) => call<EngineState>("GET", `${sessionPath(id)}/state`),
   lab: (id: string, params: LabParams) => call<LabResult>("POST", `${sessionPath(id)}/labs/engines`, params),
   poolLab: (id: string, params: PoolLabParams) => call<PoolLabResult>("POST", `${sessionPath(id)}/labs/buffer-pool`, params),
+  cluster: (id: string, request: ClusterRequest) => call<ClusterReply>("POST", `${sessionPath(id)}/cluster`, request),
   crash: (id: string, duringWrite: boolean) =>
     call<CrashSummary>("POST", `${sessionPath(id)}/crash`, { during_write: duringWrite }),
   eventsUrl: (id: string) => {
