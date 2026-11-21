@@ -97,6 +97,8 @@ export default function App() {
   const { progress, markStep, unlock, open } = useProgress();
   const classroom = useClassroom();
   const [classOpen, setClassOpen] = useState(false);
+  // On phones and portrait tablets one part of the shell shows at a time (CSS ignores this when wider).
+  const [pane, setPane] = useState<"side" | "stage" | "inspector">("side");
   const publish = useRef(classroom.publish);
   publish.current = classroom.publish;
 
@@ -253,6 +255,7 @@ export default function App() {
         if (e instanceof ApiError && e.status === 404) onSessionGone();
         const error = e instanceof ApiError ? e : new ApiError(0, { type: "Error", message: String(e) });
         setRunError({ error, sql });
+        setPane((p) => (p === "stage" ? "inspector" : p)); // the doctor's diagnosis is in the inspector
         void publish.current(sql, [], `${error.body.type}: ${error.message}`);
         setTab("explain");
         void refresh(); // earlier statements of the script, or the transaction, may have changed things
@@ -495,7 +498,7 @@ export default function App() {
           onClose={() => setClassOpen(false)}
         />
       )}
-      <div className="shell">
+      <div className="shell" data-pane={pane}>
         <div className="side-column">
         {classroom.room?.role === "student" && (
           <ClassFeed
@@ -508,6 +511,7 @@ export default function App() {
             onRun={(sql) => {
               setPlaySql(sql);
               setMode("play");
+              setPane("stage");
               void runQuery(sql);
             }}
             onLeave={() => void classroom.leave()}
@@ -531,7 +535,10 @@ export default function App() {
           <PlayPanel
             sql={playSql}
             onSql={setPlaySql}
-            onRun={(sql, session) => execute(sql, undefined, session)}
+            onRun={(sql, session) => {
+              setPane("stage"); // on a phone, show the engine at work
+              return execute(sql, undefined, session);
+            }}
             onCancel={cancelWait}
             two={twoSessions}
             onTwo={setTwoSessions}
@@ -552,7 +559,13 @@ export default function App() {
         </div>
         <main className="stage glass" aria-label="The database">
           {stage}
-          <StoryBar outcome={outcome} onExplain={() => setTab("explain")} />
+          <StoryBar
+            outcome={outcome}
+            onExplain={() => {
+              setTab("explain");
+              setPane("inspector");
+            }}
+          />
           <Timeline
             recording={recording}
             index={replayIndex}
@@ -577,6 +590,24 @@ export default function App() {
           busy={!state || measuring || crashOpen}
         />
       </div>
+      <nav className="pane-nav" aria-label="Show">
+        {(
+          [
+            ["side", mode === "learn" ? "Lesson" : "SQL", "✎"],
+            ["stage", view === "lab" ? "Labs" : "Database", "◈"],
+            ["inspector", "Details", "☰"],
+          ] as const
+        ).map(([id, label, icon]) => (
+          <button key={id} className={pane === id ? "active" : ""} aria-pressed={pane === id} onClick={() => {
+            setPane(id);
+            window.scrollTo({ top: 0 });
+          }}>
+            <span aria-hidden="true">{icon}</span>
+            {label}
+            {id === "inspector" && runError && <i className="pane-alert" aria-label="an error to read" />}
+          </button>
+        ))}
+      </nav>
       {introOpen && (
         <Intro
           onClose={closeIntro}

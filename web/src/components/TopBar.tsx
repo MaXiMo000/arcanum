@@ -81,7 +81,7 @@ export function TopBar(p: Props) {
       <div className="topbar-spacer" />
       <span className={`status-pill ${p.connection}`} role="status" title="Live connection to your database">
         <i aria-hidden="true" />
-        {p.connection === "live" ? "live" : p.connection}
+        <span className="pill-text">{p.connection === "live" ? "live" : p.connection}</span>
       </span>
       {Object.entries(p.sessions ?? {}).map(([name, s]) =>
         s.xid === null ? null : (
@@ -96,6 +96,7 @@ export function TopBar(p: Props) {
           </span>
         ),
       )}
+      <span className="topbar-break" aria-hidden="true" />
       <Segmented<View>
         label="View"
         value={p.view}
@@ -118,13 +119,14 @@ export function TopBar(p: Props) {
       />
       <button className={`button ghost small class-button ${p.classLabel ? "active" : ""}`} onClick={p.onClass}
         title="Teach a class, or follow one with its code">
-        <span aria-hidden="true">◎</span> {p.classLabel ?? "Class"}
+        <span aria-hidden="true">◎</span> <span className="class-label">{p.classLabel ?? "Class"}</span>
       </button>
       <button className="icon-button" onClick={p.onTheme} aria-label={`Switch to ${p.theme === "dark" ? "light" : "dark"} theme`}>
         {p.theme === "dark" ? "☀" : "☾"}
       </button>
-      <button className="button danger plug" onClick={p.onCrash} disabled={p.crashDisabled}>
-        <span aria-hidden="true">⏻</span> Pull the plug
+      <button className="button danger plug" onClick={p.onCrash} disabled={p.crashDisabled} aria-label="Pull the plug"
+        title="Pull the plug: kill the engine mid-write and watch it recover">
+        <span aria-hidden="true">⏻</span> <span className="plug-label">Pull the plug</span>
       </button>
     </header>
   );
