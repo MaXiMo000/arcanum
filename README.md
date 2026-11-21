@@ -213,6 +213,17 @@ could not be used and why), the join orders considered with their costs, sorts r
 check. Each
 decision points at the plan node it produced.
 
+## Classroom mode
+
+A teacher opens a classroom from the **Class** button and gets a six-character code (no 0/O or 1/I/L, so
+it can be read aloud) and a join link. From then on every statement the teacher runs, from a lesson or
+the playground, is posted with its status and first rows. Students who join see each one arrive live,
+with the earlier ones below, and can open it in their own playground or run it on their own database.
+A student who joins late gets the recent history; one who loses the connection reconnects.
+
+Students only watch: nothing they do reaches the teacher or each other. Only the teacher's token, sent
+as a Bearer header, can post or end the classroom. Classrooms live in memory and close after sitting idle.
+
 ## CSV import
 
 `Database.import_csv(table, text, header=True)` loads CSV text. A new table gets a type per column,
@@ -558,6 +569,11 @@ python -m arcanum.server
 | `POST /sessions/{id}/labs/scaling` | Generate the TPC-H-style dataset at five sizes and run its queries at each; returns pages, rows and time per query and size, and each query's fitted growth. |
 | `POST /sessions/{id}/cluster` | Drive the session's Raft cluster: `action` is `state`, `tick` (`ticks`), `write` (`sql`), `read` (`node`, `sql`), `partition` (`groups`), `heal`, `crash` / `restart` (`node`) or `reset`. Returns every node's role, term and log, the messages in flight, the statements behind the log entries and what happened; `tick` also returns one frame per tick. |
 | `POST /sessions/{id}/import` | Load CSV text (`table`, `csv`, `header`) into a new table with inferred column types or into an existing one by column name; replies like `/query`. With `dry_run` it returns a preview instead: the columns and types, the row count and the first rows. |
+| `POST /classrooms` | Open a classroom (`title`); returns its `code` and the teacher's `token`. |
+| `GET /classrooms/{code}` | Its title, how many students are following and the recent posts. |
+| `POST /classrooms/{code}/posts` | The teacher (`Authorization: Bearer <token>`) posts a statement (`sql`), its results (`status`, `columns`, the first `rows`, `row_total`) or its `error`. |
+| `DELETE /classrooms/{code}` | The teacher ends the classroom; followers are told it ended. |
+| `WS /classrooms/{code}/live` | Students receive the recent posts on joining, then every new one. |
 | `GET /sessions/{id}/state` | Every B+tree (nodes, keys, children), the buffer pool (cached and dirty pages) and the log, for drawing the database. |
 | `POST /sessions/{id}/crash` | Pull the plug: kill the engine process, by default in the middle of a stream of write transactions, then restart it. The reply compares the rows acknowledged before the crash with the rows after recovery. |
 | `WS /sessions/{id}/events` | Live engine events in batches: `page_read`, `page_write`, `cache_evict`, `node_visit`, `node_split`, `node_merge`, `root_grow`, `wal_append`, `commit`, `checkpoint`, `sort_spill`, `crash`, `recovery`, `recovered`. |
@@ -712,6 +728,7 @@ arcanum/
   server/
     app.py         FastAPI routes and WebSocket
     sessions.py    session and worker-process management, crash demo
+    classroom.py   classrooms: codes, the teacher's token, live posts to students
     worker.py      the engine process behind each session
 web/
   src/
@@ -722,7 +739,7 @@ web/
     feed.ts        WebSocket event stream and playback
     layout.ts      B+tree layout
     components/    shell, inspector, tree, pages, log, events, results, crash dialog
-    learn/         lessons, challenges, progress, editor
+    learn/         lessons, challenges, progress, editor, CSV import panel
     flow/          the plan flow diagram and operator names
     advisor/       advisor findings and before/after comparison
     explain/       plain-language account of a run
@@ -734,4 +751,5 @@ tests/
 
 Arcanum aims to be the clearest way to see how a database works from the inside. Next:
 
-- **Classroom mode**: a teacher's statements appear live on every student's screen.
+- **More lessons** on the newer parts of the engine: replacement policies, replication, the index report.
+- **Classroom extras**: a teacher's lesson steps followed in lockstep, and questions sent back to the teacher.

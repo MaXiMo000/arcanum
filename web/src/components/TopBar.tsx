@@ -18,6 +18,9 @@ interface Props {
   theme: "light" | "dark";
   onTheme: () => void;
   onAbout: () => void;
+  /** What the class button says while teaching or following a class; null when in none. */
+  classLabel: string | null;
+  onClass: () => void;
 }
 
 function Segmented<T extends string>({ label, value, options, onChange }: {
@@ -100,7 +103,7 @@ export function TopBar(p: Props) {
         options={[
           { value: "2d", label: "Map", hint: "The engine map: tree, buffer pool and disk" },
           { value: "3d", label: "3D", hint: "The tree in 3D" },
-          { value: "lab", label: "Labs", hint: "Experiments: B+tree versus LSM tree, buffer pool policies" },
+          { value: "lab", label: "Labs", hint: "Experiments: storage engines, buffer pool policies, replication, scaling" },
         ]}
       />
       <Segmented<Speed>
@@ -113,6 +116,10 @@ export function TopBar(p: Props) {
           { value: "slow", label: "Slow", hint: "Slow motion: a few events per second" },
         ]}
       />
+      <button className={`button ghost small class-button ${p.classLabel ? "active" : ""}`} onClick={p.onClass}
+        title="Teach a class, or follow one with its code">
+        <span aria-hidden="true">◎</span> {p.classLabel ?? "Class"}
+      </button>
       <button className="icon-button" onClick={p.onTheme} aria-label={`Switch to ${p.theme === "dark" ? "light" : "dark"} theme`}>
         {p.theme === "dark" ? "☀" : "☾"}
       </button>

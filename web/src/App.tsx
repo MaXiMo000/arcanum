@@ -35,6 +35,9 @@ import type { PageOwner } from "./format";
 import type { StageProps } from "./stage";
 import { local, readStorage, writeStorage } from "./storage";
 import { CHANGES, useSession } from "./useSession";
+import { useClassroom } from "./useClassroom";
+import { ClassDialog } from "./components/ClassDialog";
+import { ClassFeed } from "./components/ClassFeed";
 
 const THEME_KEY = "arcanum.theme";
 const VIEW_KEY = "arcanum.view.v2"; // v2: the engine map became the default view
@@ -92,6 +95,22 @@ export default function App() {
   const [mapFocus, setMapFocus] = useState<MapFocus>(null);
   const [theme, setTheme] = useState<"light" | "dark">(() => (readStorage(local, THEME_KEY) === "light" ? "light" : "dark"));
   const { progress, markStep, unlock, open } = useProgress();
+  const classroom = useClassroom();
+  const [classOpen, setClassOpen] = useState(false);
+  const publish = useRef(classroom.publish);
+  publish.current = classroom.publish;
+
+  // A join link (?class=CODE) follows that class, once; the parameter is then removed from the address.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("class");
+    if (!code) return;
+    params.delete("class");
+    const rest = params.toString();
+    window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
+    if (/^[A-Za-z0-9]{6}$/.test(code)) classroom.follow(code);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once, on load
+  }, []);
 
   // Show the first table once the database is there; later tables do not steal the view.
   useEffect(() => {
@@ -234,6 +253,7 @@ export default function App() {
         if (e instanceof ApiError && e.status === 404) onSessionGone();
         const error = e instanceof ApiError ? e : new ApiError(0, { type: "Error", message: String(e) });
         setRunError({ error, sql });
+        void publish.current(sql, [], `${error.body.type}: ${error.message}`);
         setTab("explain");
         void refresh(); // earlier statements of the script, or the transaction, may have changed things
         return error;
@@ -248,6 +268,7 @@ export default function App() {
           // The outcome still stands without the fresh picture.
         }
         const next: Outcome = { id: ++outcomeIds.current, session, sql, results, stats, state: after };
+        void publish.current(sql, results);
         if (results.some((r) => CHANGES.test(r.status))) {
           if (send) unreplayable();
           else remember([[session, sql]]);
@@ -455,8 +476,43 @@ export default function App() {
         theme={theme}
         onTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
         onAbout={() => setIntroOpen(true)}
+        classLabel={
+          classroom.room?.role === "teacher"
+            ? `Teaching ${classroom.room.code} · ${classroom.room.students}`
+            : classroom.room?.role === "student"
+              ? `Class ${classroom.room.code}`
+              : null
+        }
+        onClass={() => setClassOpen(true)}
       />
+      {classOpen && (
+        <ClassDialog
+          room={classroom.room}
+          error={classroom.error}
+          onTeach={classroom.teach}
+          onFollow={classroom.follow}
+          onLeave={classroom.leave}
+          onClose={() => setClassOpen(false)}
+        />
+      )}
       <div className="shell">
+        <div className="side-column">
+        {classroom.room?.role === "student" && (
+          <ClassFeed
+            room={classroom.room}
+            busy={!state || measuring}
+            onOpen={(sql) => {
+              setPlaySql(sql);
+              setMode("play");
+            }}
+            onRun={(sql) => {
+              setPlaySql(sql);
+              setMode("play");
+              void runQuery(sql);
+            }}
+            onLeave={() => void classroom.leave()}
+          />
+        )}
         {mode === "learn" ? (
           <LessonPanel
             progress={progress}
@@ -493,6 +549,7 @@ export default function App() {
             error={errorSpan}
           />
         )}
+        </div>
         <main className="stage glass" aria-label="The database">
           {stage}
           <StoryBar outcome={outcome} onExplain={() => setTab("explain")} />

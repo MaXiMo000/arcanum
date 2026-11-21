@@ -542,3 +542,37 @@ def test_the_scaling_lab_names_how_each_query_grows(client):
     assert queries["point"]["growth"] == "logarithmic" and queries["q6"]["growth"] == "linear"
     assert all(len(q["points"]) == len(reply.json()["sizes"]) for q in queries.values())
     assert client.post(f"/sessions/{session}/labs/scaling", json={"sizes": [1]}).status_code == 422
+
+
+def test_a_classroom_streams_the_teachers_posts_to_students(client):
+    opened = client.post("/classrooms", json={"title": "Indexes 101"})
+    assert opened.status_code == 201
+    code, token = opened.json()["code"], opened.json()["token"]
+    teacher = {"authorization": f"Bearer {token}"}
+    post = {"sql": "SELECT 1 AS one", "results": [{"status": "SELECT 1", "columns": ["one"], "rows": [[1]], "row_total": 1}]}
+    assert client.post(f"/classrooms/{code}/posts", json=post, headers=teacher).json() == {"seq": 1, "students": 0}
+    with client.websocket_connect(f"/classrooms/{code.lower()}/live") as ws:  # codes are case-insensitive
+        joined = ws.receive_json()
+        assert joined["type"] == "joined" and joined["title"] == "Indexes 101" and len(joined["history"]) == 1
+        reply = client.post(f"/classrooms/{code}/posts", json={**post, "sql": "SELECT 2"}, headers=teacher)
+        assert reply.json()["students"] == 1
+        assert ws.receive_json()["post"]["sql"] == "SELECT 2"
+        # Students only watch: without the token nothing can be posted or ended.
+        for headers in ({}, {"authorization": "Bearer wrong"}, {"authorization": token}):
+            assert client.post(f"/classrooms/{code}/posts", json=post, headers=headers).status_code == 403
+            assert client.delete(f"/classrooms/{code}", headers=headers).status_code == 403
+        assert client.delete(f"/classrooms/{code}", headers=teacher).status_code == 204
+        with pytest.raises(WebSocketDisconnect) as ended:
+            ws.receive_json()
+        assert ended.value.code == 4410
+    assert client.get(f"/classrooms/{code}").status_code == 404
+    too_many_rows = {"sql": "SELECT 1", "results": [{"status": "x", "rows": [[1]] * 21}]}
+    room = client.post("/classrooms", json={}).json()
+    assert client.post(f"/classrooms/{room['code']}/posts", json=too_many_rows,
+                       headers={"authorization": f"Bearer {room['token']}"}).status_code == 422
+
+
+def test_classrooms_are_capped_per_client(make_client):
+    client = make_client(max_classrooms_per_client=1, classrooms_per_minute=10)
+    assert client.post("/classrooms", json={}).status_code == 201
+    assert client.post("/classrooms", json={}).status_code == 503

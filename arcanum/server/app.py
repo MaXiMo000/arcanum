@@ -8,6 +8,11 @@
     POST   /sessions/{id}/crash      kill the engine (optionally mid-write) and recover
     POST   /sessions/{id}/labs/{lab} an experiment: "engines", "buffer-pool" or "scaling"
     POST   /sessions/{id}/cluster    the replication demo: a three-node Raft cluster, stepped and faulted
+    POST   /classrooms               open a classroom: a code for students, a token for the teacher
+    GET    /classrooms/{code}        its title, student count and recent posts
+    POST   /classrooms/{code}/posts  the teacher posts a statement and its results (Bearer token)
+    DELETE /classrooms/{code}        the teacher ends it (Bearer token)
+    WS     /classrooms/{code}/live   students receive every post as it happens
     WS     /sessions/{id}/events     live engine events: page reads, splits, log writes, recovery
     GET    /health
 
@@ -29,7 +34,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
@@ -38,6 +43,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from .classroom import ClassroomManager, normalize
 from .sessions import SessionError, SessionManager, Subscriber
 
 log = logging.getLogger("arcanum.server")
@@ -85,6 +91,11 @@ class Settings:
     max_websockets: int = 200
     max_websockets_per_client: int = 4
     max_websockets_per_session: int = 4
+    max_classrooms: int = 50
+    max_classrooms_per_client: int = 2
+    max_students_per_classroom: int = 60
+    classrooms_per_minute: int = 2  # classrooms a client may open
+    classroom_ttl: float = 7200  # seconds a classroom with nobody connected may sit unused
     allowed_origins: list = field(default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"])
     enable_docs: bool = False
     hsts: bool = False  # send Strict-Transport-Security (only when served over HTTPS)
@@ -95,9 +106,11 @@ class Settings:
         int_fields = ["max_sessions", "max_sessions_per_client", "max_concurrent_queries", "max_pages", "max_rows",
                       "max_sql_bytes", "max_import_bytes", "memory_rows", "sort_memory_rows", "spill_bytes", "recursive_rows",
                       "worker_memory_mb", "max_keys", "pool_size", "event_limit", "rate_burst", "sessions_per_minute",
-                      "crashes_per_minute", "labs_per_minute", "max_websockets", "max_websockets_per_client", "max_websockets_per_session"]
+                      "crashes_per_minute", "labs_per_minute", "max_websockets", "max_websockets_per_client", "max_websockets_per_session",
+                      "max_classrooms", "max_classrooms_per_client", "max_students_per_classroom",
+                      "classrooms_per_minute"]
         float_fields = ["session_ttl", "query_timeout", "lock_timeout", "queue_timeout", "rate_per_second",
-                        "lab_timeout"]
+                        "lab_timeout", "classroom_ttl"]
         values = {name: _env(f"ARCANUM_{name.upper()}", getattr(d, name), int) for name in int_fields}
         values |= {name: _env(f"ARCANUM_{name.upper()}", getattr(d, name), float) for name in float_fields}
         origins = _env("ARCANUM_ALLOWED_ORIGINS", ",".join(d.allowed_origins))
@@ -142,6 +155,31 @@ class ImportRequest(BaseModel):
     header: bool = True
     dry_run: bool = False
     session: Literal["A", "B"] = "A"
+
+
+Cell = Annotated[str, Field(max_length=200)] | int | float | bool | None
+
+
+class ResultSummary(BaseModel):
+    """What students see of one statement's result: its status and its first rows."""
+    model_config = ConfigDict(extra="forbid")
+    status: str = Field("", max_length=100)
+    columns: list[Annotated[str, Field(max_length=100)]] = Field(default_factory=list, max_length=30)
+    rows: list[Annotated[list[Cell], Field(max_length=30)]] = Field(default_factory=list, max_length=20)
+    row_total: int = Field(0, ge=0)
+
+
+class ClassroomOpen(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field("", max_length=80)
+
+
+class ClassroomPost(BaseModel):
+    """A statement the teacher ran, its results, or the error it failed with."""
+    model_config = ConfigDict(extra="forbid")
+    sql: str = Field(min_length=1, max_length=20_000)
+    results: list[ResultSummary] = Field(default_factory=list, max_length=10)
+    error: str | None = Field(None, max_length=500)
 
 
 class CrashRequest(BaseModel):
@@ -214,6 +252,12 @@ def _error(status, error_type, message, headers=None):
     return JSONResponse({"error": {"type": error_type, "message": message}}, status_code=status, headers=headers)
 
 
+def _bearer(request):
+    """The token of an "Authorization: Bearer <token>" header, or None."""
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    return (token.strip() or None) if scheme.lower() == "bearer" else None
+
+
 def _client(scope_or_request):
     client = scope_or_request.client if hasattr(scope_or_request, "client") else scope_or_request.get("client")
     return client[0] if client else "unknown"
@@ -238,6 +282,8 @@ def create_app(settings=None):
     sockets = {"total": 0, "by_client": {}}
     max_body = settings.max_sql_bytes + 4096
     max_import_body = settings.max_import_bytes * 2 + 4096  # JSON escaping can double the CSV text
+    max_post_body = max_body + 256 * 1024  # a classroom post: the SQL plus the first rows of its results
+    classrooms = ClassroomManager(settings)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -245,6 +291,7 @@ def create_app(settings=None):
             while True:
                 await asyncio.sleep(60)
                 await manager.reap()
+                classrooms.reap()
 
         reaper = asyncio.create_task(reap_forever())
         try:
@@ -252,6 +299,7 @@ def create_app(settings=None):
         finally:
             reaper.cancel()
             await manager.close_all()
+            classrooms.close_all()
 
     docs = {} if settings.enable_docs else {"docs_url": None, "redoc_url": None, "openapi_url": None}
     app = FastAPI(title="Arcanum", description="A from-scratch database you can watch work.", lifespan=lifespan, **docs)
@@ -273,7 +321,9 @@ def create_app(settings=None):
             length = request.headers.get("content-length")
             if length is None:
                 return _error(411, "LengthRequired", "requests with a body must send Content-Length")
-            limit = max_import_body if request.url.path.endswith("/import") else max_body
+            path = request.url.path
+            limit = (max_import_body if path.endswith("/import")
+                     else max_post_body if path.startswith("/classrooms/") and path.endswith("/posts") else max_body)
             if not length.isdigit() or int(length) > limit:
                 return _error(413, "RequestTooLarge", f"request bodies are limited to {limit} bytes")
         response = await call_next(request)
@@ -384,6 +434,73 @@ def create_app(settings=None):
         reply = await manager.get(session_id).request({"op": "cluster", **body.model_dump()})
         status = 200 if reply.pop("ok") else 400
         return JSONResponse(reply, status_code=status)
+
+    # Classrooms. The teacher's token travels as "Authorization: Bearer <token>".
+    @app.post("/classrooms", status_code=201)
+    async def open_classroom(request: Request, body: ClassroomOpen | None = None):
+        client = _client(request)
+        if not limiter.allow(client, "classroom", settings.classrooms_per_minute / 60, settings.classrooms_per_minute):
+            return _error(429, "RateLimited", "classrooms are limited; wait a minute", {"Retry-After": "30"})
+        room, token = classrooms.create(client, (body or ClassroomOpen()).title.strip())
+        return {"code": room.code, "token": token, "title": room.title}
+
+    @app.get("/classrooms/{code}")
+    async def classroom(code: str):
+        return classrooms.get(code).summary()
+
+    @app.post("/classrooms/{code}/posts")
+    async def post_to_classroom(code: str, request: Request, body: ClassroomPost):
+        room = classrooms.teacher(code, _bearer(request))
+        if len(body.sql.encode()) > settings.max_sql_bytes:
+            return _error(413, "SqlTooLong", f"SQL is limited to {settings.max_sql_bytes} bytes")
+        item = room.post(body.model_dump())
+        return {"seq": item["seq"], "students": len(room.students)}
+
+    @app.delete("/classrooms/{code}", status_code=204)
+    async def end_classroom(code: str, request: Request):
+        classrooms.end(code, _bearer(request))
+        return Response(status_code=204)
+
+    @app.websocket("/classrooms/{code}/live")
+    async def classroom_live(websocket: WebSocket, code: str):
+        client = _client(websocket.scope)
+        origin = websocket.headers.get("origin")
+        room = classrooms.rooms.get(normalize(code))
+        if origin is not None and origin not in settings.allowed_origins and not _same_origin(websocket, origin):
+            await websocket.close(code=4403)
+            return
+        if room is None:
+            await websocket.close(code=4404)
+            return
+        if (not limiter.allow(client, "request", settings.rate_per_second, settings.rate_burst)
+                or sockets["total"] >= settings.max_websockets
+                or sockets["by_client"].get(client, 0) >= settings.max_websockets_per_client
+                or len(room.students) >= settings.max_students_per_classroom):
+            await websocket.close(code=4429)
+            return
+        await websocket.accept()
+        student = Subscriber(client)
+        room.students.add(student)
+        room.last_used = time.monotonic()
+        sockets["total"] += 1
+        sockets["by_client"][client] = sockets["by_client"].get(client, 0) + 1
+        try:
+            await websocket.send_json({"type": "joined", **room.summary()})
+            while True:
+                batch = await student.queue.get()
+                if batch is None:
+                    await websocket.close(code=4410)  # the teacher ended the classroom
+                    return
+                for item in batch:
+                    await websocket.send_json({"type": "post", "post": item})
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            room.students.discard(student)
+            sockets["total"] -= 1
+            sockets["by_client"][client] -= 1
+            if not sockets["by_client"][client]:
+                del sockets["by_client"][client]
 
     @app.post("/sessions/{session_id}/labs/{lab}")
     async def run_lab(session_id: str, lab: str, request: Request):

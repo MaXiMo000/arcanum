@@ -429,6 +429,23 @@ export interface ScalingResult {
   queries: Record<string, ScalingQuery>;
 }
 
+/** One statement a teacher ran, as the classroom's students receive it. */
+export interface ClassPost {
+  seq: number;
+  /** Seconds since the epoch. */
+  at: number;
+  sql: string;
+  results: { status: string; columns: string[]; rows: Value[][]; row_total: number }[];
+  error: string | null;
+}
+
+export interface ClassroomInfo {
+  code: string;
+  title: string;
+  students: number;
+  history: ClassPost[];
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -438,12 +455,15 @@ export class ApiError extends Error {
   }
 }
 
-async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function call<T>(method: string, path: string, body?: unknown, token?: string): Promise<T> {
   let response: Response;
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (token) headers.Authorization = `Bearer ${token}`;
   try {
     response = await fetch(path, {
       method,
-      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       credentials: "omit",
       cache: "no-store",
@@ -484,6 +504,15 @@ export const api = {
     call<ImportPreview>("POST", `${sessionPath(id)}/import`, { ...request, dry_run: true }),
   importCsv: (id: string, request: ImportRequest, session: SessionName = "A") =>
     call<QueryReply>("POST", `${sessionPath(id)}/import`, { ...request, session }),
+  openClass: (title: string) => call<{ code: string; token: string; title: string }>("POST", "/classrooms", { title }),
+  getClass: (code: string) => call<ClassroomInfo>("GET", `/classrooms/${encodeURIComponent(code)}`),
+  postClass: (code: string, token: string, post: Omit<ClassPost, "seq" | "at">) =>
+    call<{ seq: number; students: number }>("POST", `/classrooms/${encodeURIComponent(code)}/posts`, post, token),
+  endClass: (code: string, token: string) => call<void>("DELETE", `/classrooms/${encodeURIComponent(code)}`, undefined, token),
+  classLiveUrl: (code: string) => {
+    const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${scheme}//${window.location.host}/classrooms/${encodeURIComponent(code)}/live`;
+  },
   crash: (id: string, duringWrite: boolean) =>
     call<CrashSummary>("POST", `${sessionPath(id)}/crash`, { during_write: duringWrite }),
   eventsUrl: (id: string) => {

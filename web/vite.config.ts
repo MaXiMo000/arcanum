@@ -13,6 +13,7 @@ export default defineConfig(({ mode }) => {
       strictPort: true,
       proxy: {
         "/sessions": { target: api, ws: true },
+        "/classrooms": { target: api, ws: true },
         "/health": api,
       },
     },
