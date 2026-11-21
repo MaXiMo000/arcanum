@@ -14,9 +14,9 @@ on storage per byte of live data.
 import random
 import time
 
-from .storage import PAGE_SIZE, BTree, Pager, decode, encode
-from .storage.files import CountingMemFileSystem
-from .storage.lsm import LSMTree
+from ..storage import PAGE_SIZE, BTree, Pager, decode, encode
+from ..storage.files import CountingMemFileSystem
+from ..storage.lsm import LSMTree
 
 ORDERS = ("sequential", "random")
 BATCH = 64  # operations per commit, for both engines

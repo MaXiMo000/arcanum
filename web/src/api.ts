@@ -311,6 +311,22 @@ export interface LabResult {
   key_space: number;
 }
 
+export type PoolPolicy = "lru" | "clock" | "2q" | "optimal";
+
+export interface PoolLabParams {
+  workload: "hot" | "hot-scan" | "loop" | "index";
+  pool_pages: number;
+  rows: number;
+  lookups: number;
+}
+
+export interface PoolLabResult {
+  workload: PoolLabParams & { name: PoolLabParams["workload"]; about: string; accesses: number; distinct_pages: number; table_pages: number };
+  /** series: [accesses so far, hit rate over the recent window] */
+  policies: Record<PoolPolicy, { hits: number; misses: number; hit_rate: number; series: [number, number][] }>;
+  sweep: { sizes: number[]; hit_rates: Record<PoolPolicy, number[]> };
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -358,7 +374,8 @@ export const api = {
   cancel: (id: string, ticket: string) =>
     call<QueryReply>("POST", `${sessionPath(id)}/tickets/${encodeURIComponent(ticket)}/cancel`),
   state: (id: string) => call<EngineState>("GET", `${sessionPath(id)}/state`),
-  lab: (id: string, params: LabParams) => call<LabResult>("POST", `${sessionPath(id)}/lab`, params),
+  lab: (id: string, params: LabParams) => call<LabResult>("POST", `${sessionPath(id)}/labs/engines`, params),
+  poolLab: (id: string, params: PoolLabParams) => call<PoolLabResult>("POST", `${sessionPath(id)}/labs/buffer-pool`, params),
   crash: (id: string, duringWrite: boolean) =>
     call<CrashSummary>("POST", `${sessionPath(id)}/crash`, { during_write: duringWrite }),
   eventsUrl: (id: string) => {

@@ -5,7 +5,7 @@
     POST   /sessions/{id}/query      run SQL; returns rows plus the traced query plan
     GET    /sessions/{id}/state      B+trees, buffer pool and log, for drawing the database
     POST   /sessions/{id}/crash      kill the engine (optionally mid-write) and recover
-    POST   /sessions/{id}/lab        the same workload on a B+tree and an LSM tree, compared
+    POST   /sessions/{id}/labs/{lab} an experiment: "engines" (B+tree vs LSM tree), "buffer-pool" (policies)
     WS     /sessions/{id}/events     live engine events: page reads, splits, log writes, recovery
     GET    /health
 
@@ -34,7 +34,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .sessions import SessionError, SessionManager, Subscriber
 
@@ -135,12 +135,26 @@ class CrashRequest(BaseModel):
     during_write: bool = True
 
 
-class LabRequest(BaseModel):
+class EnginesLab(BaseModel):
+    """B+tree versus LSM tree (labs/engines.py)."""
+    model_config = ConfigDict(extra="forbid")
     keys: int = Field(5000, ge=500, le=10_000)
     order: Literal["sequential", "random"] = "random"
     updates: float = Field(0.5, ge=0, le=1)  # extra writes that overwrite existing keys, per key
     value_bytes: int = Field(64, ge=16, le=256)
     memory_pages: int = Field(16, ge=8, le=64)
+
+
+class BufferPoolLab(BaseModel):
+    """Buffer pool replacement policies on one page-access trace (labs/buffer_pool.py)."""
+    model_config = ConfigDict(extra="forbid")
+    workload: Literal["hot", "hot-scan", "loop", "index"] = "hot-scan"
+    pool_pages: int = Field(32, ge=4, le=512)
+    rows: int = Field(4000, ge=500, le=20_000)
+    lookups: int = Field(1500, ge=100, le=5_000)
+
+
+LABS = {"engines": EnginesLab, "buffer-pool": BufferPoolLab}  # the worker runs each by the same name
 
 
 TICKET = re.compile(r"^t[0-9]{1,9}$")
@@ -311,12 +325,21 @@ def create_app(settings=None):
             return _error(429, "RateLimited", "the crash demo is limited; wait a few seconds", {"Retry-After": "10"})
         return await session.crash(body.during_write if body is not None else True)
 
-    @app.post("/sessions/{session_id}/lab")
-    async def lab(session_id: str, request: Request, body: LabRequest | None = None):
+    @app.post("/sessions/{session_id}/labs/{lab}")
+    async def run_lab(session_id: str, lab: str, request: Request):
         session = manager.get(session_id)
+        model = LABS.get(lab)
+        if model is None:
+            return _error(404, "UnknownLab", f"no such lab; choose one of {', '.join(LABS)}")
+        try:
+            body = await request.body()
+            params = model.model_validate_json(body or b"{}")
+        except ValidationError as e:
+            fields = sorted({".".join(str(p) for p in err.get("loc", ())) or "body" for err in e.errors()})
+            return _error(422, "InvalidRequest", f"invalid request: check {', '.join(fields)}")
         if not limiter.allow(_client(request), "lab", settings.labs_per_minute / 60, max(1, settings.labs_per_minute // 2)):
-            return _error(429, "RateLimited", "engine comparisons are limited; wait a few seconds", {"Retry-After": "10"})
-        reply = await session.request({"op": "lab", "params": (body or LabRequest()).model_dump()},
+            return _error(429, "RateLimited", "labs are limited; wait a few seconds", {"Retry-After": "10"})
+        reply = await session.request({"op": "lab", "lab": lab, "params": params.model_dump()},
                                       timeout=settings.lab_timeout)
         if not reply.pop("ok"):
             return JSONResponse({"error": reply["error"]}, status_code=400)

@@ -1,4 +1,4 @@
-"""Fixed-size pages behind an LRU buffer pool, made durable by a write-ahead log.
+"""Fixed-size pages behind a buffer pool (LRU by default; see policies.py), made durable by a write-ahead log.
 
 Page 0 holds the file header; every other page belongs to a B+tree or to the
 free list. read() hands out immutable bytes and every change goes back through
@@ -18,11 +18,11 @@ puts them back. Statements and transactions are built on this.
 
 import os
 import struct
-from collections import OrderedDict
 
 from ..errors import ArcanumError, ExecutionError
 from ..events import EventBus
 from .files import OsFileSystem
+from .policies import make_policy
 from .wal import Wal
 
 PAGE_SIZE = 4096
@@ -38,9 +38,11 @@ class CorruptDatabaseError(ArcanumError):
 
 
 class Pager:
-    def __init__(self, path, pool_size=256, events=None, fs=None, checkpoint_frames=1000, max_pages=None):
+    def __init__(self, path, pool_size=256, events=None, fs=None, checkpoint_frames=1000, max_pages=None,
+                 policy="lru"):
         """checkpoint_frames: copy the log into the data file once it holds this many committed frames.
-        max_pages: refuse to grow the file beyond this many pages (None = no limit)."""
+        max_pages: refuse to grow the file beyond this many pages (None = no limit).
+        policy: the buffer pool's replacement policy, "lru", "clock" or "2q" (see policies.py)."""
         if pool_size < 1:
             raise ValueError("pool_size must be at least 1")
         self.path = os.fspath(path)
@@ -51,7 +53,8 @@ class Pager:
         self.max_pages = max_pages
         self.stats = {"hits": 0, "misses": 0, "evictions": 0, "disk_reads": 0, "wal_frames": 0, "checkpoints": 0}
         self.recovered_frames = 0  # committed frames replayed from the log when the file was opened
-        self._pool = OrderedDict()  # page id -> [data, dirty], least recently used first
+        self._pool = {}  # page id -> [data, dirty]
+        self.policy = make_policy(policy, pool_size)  # which page to evict when the pool is full
         # Decoded forms of cached pages, for the B+tree: page id -> (the exact bytes object decoded,
         # result). A page's bytes object is replaced on every write, so an identity check is enough to
         # know an entry is current; entries leave with their page so this stays as small as the pool.
@@ -83,7 +86,7 @@ class Pager:
         self._check(page_id)
         entry = self._pool.get(page_id)
         if entry is not None:
-            self._pool.move_to_end(page_id)
+            self.policy.touch(page_id)
             self.stats["hits"] += 1
             self.events.emit("page_read", page=page_id, source="cache")
             return entry[0]
@@ -155,6 +158,7 @@ class Pager:
         # the savepoint no longer exist at all.
         for page_id in [p for p in self._pool if p >= page_count or p in originals]:
             del self._pool[page_id]
+            self.policy.remove(page_id)
             self.decoded.pop(page_id, None)
         self.page_count, self.free_head = page_count, free_head
         outermost = not self._savepoints
@@ -228,9 +232,11 @@ class Pager:
     def _put(self, page_id, data, dirty):
         entry = self._pool.get(page_id)
         self._pool[page_id] = [data, dirty or (entry is not None and entry[1])]
-        self._pool.move_to_end(page_id)
+        self.policy.touch(page_id)
         while len(self._pool) > self.pool_size:
-            victim, (victim_data, victim_dirty) = self._pool.popitem(last=False)
+            victim = self.policy.victim()
+            victim_data, victim_dirty = self._pool.pop(victim)
+            self.policy.remove(victim, evicted=True)
             self.decoded.pop(victim, None)
             if victim_dirty:
                 self.wal.append(victim, victim_data)  # uncommitted until the next commit frame
@@ -249,13 +255,13 @@ class Pager:
         return data
 
     def peek(self, page_id):
-        """A page's bytes without touching LRU order, stats or events (for inspection)."""
+        """A page's bytes without touching the replacement policy, stats or events (for inspection)."""
         self._check(page_id)
         return self._current(page_id)
 
     def cached_pages(self):
-        """[(page id, dirty)] in the pool, least recently used first."""
-        return [(page_id, entry[1]) for page_id, entry in self._pool.items()]
+        """[(page id, dirty)] in the pool, in the order the policy would evict them (next victim first)."""
+        return [(page_id, self._pool[page_id][1]) for page_id in self.policy.eviction_order()]
 
     def free_pages(self):
         """Page ids on the free list, in list order."""
@@ -266,7 +272,7 @@ class Pager:
         return pages
 
     def _current(self, page_id):
-        """A page's bytes without touching LRU order, stats or events."""
+        """A page's bytes without touching the replacement policy, stats or events."""
         entry = self._pool.get(page_id)
         return entry[0] if entry is not None else self._stored(page_id)
 

@@ -441,14 +441,29 @@ def test_two_sessions_see_each_other_only_after_commit(client):
 
 def test_lab_compares_a_btree_and_an_lsm_tree_on_one_workload(client):
     session = new_session(client)
-    reply = client.post(f"/sessions/{session}/lab", json={"keys": 1500, "order": "random", "updates": 0.5})
+    reply = client.post(f"/sessions/{session}/labs/engines", json={"keys": 1500, "order": "random", "updates": 0.5})
     assert reply.status_code == 200
     lab = reply.json()
     assert lab["workload"]["operations"] == 2250
     # The classic trade-off: the LSM tree writes far less for random writes.
     assert lab["lsm"]["write_amp"] < lab["btree"]["write_amp"]
     assert lab["lsm"]["flushes"] > 0 and lab["shapes"]
-    assert client.post(f"/sessions/{session}/lab", json={"keys": 10**6}).status_code == 422
+    assert client.post(f"/sessions/{session}/labs/engines", json={"keys": 10**6}).status_code == 422
+    assert client.post(f"/sessions/{session}/labs/engines", json={"nope": 1}).status_code == 422
+    assert client.post(f"/sessions/{session}/labs/nope", json={}).status_code == 404
+
+
+def test_buffer_pool_lab_replays_one_trace_through_every_policy(client):
+    session = new_session(client)
+    reply = client.post(f"/sessions/{session}/labs/buffer-pool",
+                        json={"workload": "hot-scan", "pool_pages": 16, "rows": 800, "lookups": 300})
+    assert reply.status_code == 200
+    lab = reply.json()
+    rates = {name: p["hit_rate"] for name, p in lab["policies"].items()}
+    assert set(rates) == {"lru", "clock", "2q", "optimal"}
+    assert all(rates["optimal"] >= rate for rate in rates.values())  # nothing beats Belady
+    assert lab["sweep"]["sizes"][-1] == lab["workload"]["distinct_pages"]
+    assert all(rates[-1] == lab["sweep"]["hit_rates"]["optimal"][-1] for rates in lab["sweep"]["hit_rates"].values())
 
 
 def test_rolling_back_to_a_savepoint_wakes_waiting_statements(client):

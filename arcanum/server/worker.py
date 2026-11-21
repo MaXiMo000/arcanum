@@ -28,7 +28,7 @@ from ..errors import (
     SqlError,
 )
 from ..events import EventBus
-from ..lab import compare
+from ..labs import buffer_pool, engines
 from ..sql.parser import parse_statements
 from ..storage import PAGE_SIZE, decode
 
@@ -212,7 +212,7 @@ def worker_main(path, conn, event_conn, options):
         "cancel": lambda m: jobs.cancel(m["ticket"]),
         "state": lambda m: _state(db, m, jobs),
         "workload": lambda m: _workload(db, m, conn, pump),
-        "lab": lambda m: {"ok": True, **compare(**m["params"])},
+        "lab": lambda m: {"ok": True, **LABS[m["lab"]](**m["params"])},
     }
     while True:
         try:
@@ -241,6 +241,7 @@ def worker_main(path, conn, event_conn, options):
 
 SESSIONS = ("A", "B")  # the database sessions each visitor can type into, side by side
 NOTES = 50  # constraint notes kept per request
+LABS = {"engines": engines.compare, "buffer-pool": buffer_pool.compare}
 MAX_VALUE_CHARS = 2000  # longer values in results are shortened: a response stays small whatever the query
 VERSION_ROWS = 40  # rows with versions the state shows at most
 

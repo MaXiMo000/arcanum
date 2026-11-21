@@ -65,10 +65,10 @@ class Database:
     """
 
     def __init__(self, path, pool_size=256, max_keys=None, events=None, fs=None, checkpoint_frames=1000,
-                 optimize=True, limits=None, max_pages=None):
+                 optimize=True, limits=None, max_pages=None, pool_policy="lru"):
         self.optimize = optimize
         self.limits = limits or QueryLimits()
-        self.pager = Pager(path, pool_size, events, fs, checkpoint_frames, max_pages)
+        self.pager = Pager(path, pool_size, events, fs, checkpoint_frames, max_pages, pool_policy)
         self.events = self.pager.events
         self.catalog = Catalog(self.pager, max_keys)
         self.mvcc = TransactionManager(self.catalog.clog, self.catalog.meta.get("xid_limit", 1))

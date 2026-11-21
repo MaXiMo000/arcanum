@@ -100,7 +100,7 @@ export function TopBar(p: Props) {
         options={[
           { value: "2d", label: "Map", hint: "The engine map: tree, buffer pool and disk" },
           { value: "3d", label: "3D", hint: "The tree in 3D" },
-          { value: "lab", label: "LSM", hint: "B+tree versus LSM tree on the same workload" },
+          { value: "lab", label: "Labs", hint: "Experiments: B+tree versus LSM tree, buffer pool policies" },
         ]}
       />
       <Segmented<Speed>

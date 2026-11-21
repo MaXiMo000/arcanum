@@ -17,7 +17,7 @@ import type { RunError } from "./components/Results";
 import { StoryBar } from "./components/StoryBar";
 import { Timeline, replayMarker } from "./components/Timeline";
 import { Toasts, type Toast } from "./components/Toasts";
-import { EngineLab } from "./components/EngineLab";
+import { Labs } from "./components/Labs";
 import { TopBar, type Mode, type View } from "./components/TopBar";
 import { EngineMap, type MapFocus } from "./components/EngineMap";
 import { EXAMPLES } from "./examples";
@@ -401,7 +401,7 @@ export default function App() {
   };
   const stage =
     view === "lab" ? (
-      <EngineLab sessionId={sessionId} />
+      <Labs sessionId={sessionId} />
     ) : stageProps && view === "3d" ? (
       <Suspense fallback={<div className="stage-loading">Loading the 3D view…</div>}>
         <Vault {...stageProps} onUnavailable={use2d} />

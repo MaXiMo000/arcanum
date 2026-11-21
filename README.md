@@ -56,7 +56,7 @@ with Database("company.db") as db:
 
 | Layer | State |
 |---|---|
-| Pager: 4 KB pages, LRU buffer pool, free list, savepoints | done |
+| Pager: 4 KB pages, buffer pool (LRU, Clock or 2Q), free list, savepoints | done |
 | Order-preserving value encoding (keys and rows) | done |
 | B+tree: insert, delete with merge/redistribute, range scans, invariant checker | done |
 | SQL lexer and recursive-descent parser | done |
@@ -334,7 +334,7 @@ table's colour, and **What happened** says when values moved out or were read ba
 
 ## B+tree versus LSM tree
 
-The **LSM** view runs one workload on two storage engines and counts every byte each one reads,
+The **Labs** view holds two experiments. The first runs one workload on two storage engines and counts every byte each one reads,
 writes and syncs. One engine is Arcanum's own B+tree (pager, write-ahead log and checkpoints). The other
 is an LSM tree, the design behind RocksDB, LevelDB and Cassandra:
 
@@ -355,6 +355,21 @@ amplifications:
 It also charts bytes written over the workload and replays every flush, compaction and move on a
 picture of the levels. With random keys the B+tree logs a whole page for almost every write, so the LSM
 tree writes an order of magnitude less, while lookups cost about the same.
+
+## Buffer pool policies
+
+The pager's replacement policy is pluggable (`Database(..., pool_policy="lru" | "clock" | "2q")`):
+
+- **LRU** evicts the least recently used page. One large scan pushes every hot page out.
+- **Clock** approximates LRU with a reference bit per page and a sweeping hand, as PostgreSQL does.
+- **2Q** admits new pages to a small FIFO queue and promotes only pages that come back, so a scan passes
+  through without displacing the hot set.
+
+The second lab runs real queries (skewed point lookups, the same with periodic full scans, a repeated
+scan, or lookups through a secondary index) and records every page the engine asks for. It replays that
+trace through each policy, and through Belady's optimal policy, which evicts the page used furthest in
+the future: no real policy can beat it, so it shows how much room each one leaves. It charts hit rates
+over the trace and against pool size.
 
 ## Durability and crash recovery
 
@@ -389,7 +404,8 @@ Two modes share one screen: the database in the middle, an inspector on the righ
   coloured by whether that transaction is open, committed or rolled back, and which session sees which
   version. While a session waits for a lock, a lock graph shows who waits for whom; under
   `SERIALIZABLE`, the read/write dependencies between transactions appear as they form.
-- **LSM**: the B+tree versus LSM tree comparison (see above), with a scrubber over the LSM tree's levels.
+- **Labs**: the B+tree versus LSM tree comparison, with a scrubber over the LSM tree's levels, and the
+  buffer pool policies compared on one recorded trace (see above).
 
 The inspector explains every statement:
 
@@ -481,7 +497,8 @@ python -m arcanum.server
 | `POST /sessions/{id}/query` | Run SQL (`{"sql": "...", "session": "A"}`; several statements allowed; `session` is `A` or `B`, two connections to the same database). Each result has `columns`, `rows`, `status` and the executed `plan` as a tree with estimated and actual rows per operator. |
 | `GET /sessions/{id}/tickets/{ticket}` | A statement waiting for another session's lock. `query` answers `202` with `waiting` (its `ticket`, the transaction it waits for and what it needs) when a statement has to wait; fetch the ticket until it returns the results. |
 | `POST /sessions/{id}/tickets/{ticket}/cancel` | Cancel a waiting statement. |
-| `POST /sessions/{id}/lab` | Run one workload (`keys`, `order`, `updates`, `value_bytes`, `memory_pages`) on a B+tree and an LSM tree; returns both engines' amplifications, the bytes-written curves and the LSM tree's shape after every flush and compaction. |
+| `POST /sessions/{id}/labs/engines` | Run one workload (`keys`, `order`, `updates`, `value_bytes`, `memory_pages`) on a B+tree and an LSM tree; returns both engines' amplifications, the bytes-written curves and the LSM tree's shape after every flush and compaction. |
+| `POST /sessions/{id}/labs/buffer-pool` | Record one workload's page accesses (`workload`, `pool_pages`, `rows`, `lookups`) and replay them through every replacement policy; returns hits, misses and hit-rate curves over time and against pool size. |
 | `GET /sessions/{id}/state` | Every B+tree (nodes, keys, children), the buffer pool (cached and dirty pages) and the log, for drawing the database. |
 | `POST /sessions/{id}/crash` | Pull the plug: kill the engine process, by default in the middle of a stream of write transactions, then restart it. The reply compares the rows acknowledged before the crash with the rows after recovery. |
 | `WS /sessions/{id}/events` | Live engine events in batches: `page_read`, `page_write`, `cache_evict`, `node_visit`, `node_split`, `node_merge`, `root_grow`, `wal_append`, `commit`, `checkpoint`, `sort_spill`, `crash`, `recovery`, `recovered`. |
@@ -597,6 +614,7 @@ arcanum/
   values.py        values that are not Python scalars: intervals, JSONB, overflow pointers, array text
   storage/
     pager.py       pages, buffer pool, free list, savepoints, commit and checkpoint
+    policies.py    buffer pool replacement policies: LRU, Clock, 2Q
     wal.py         write-ahead log: frames, checksums, recovery
     files.py       file access (swappable for crash tests)
     codec.py       order-preserving encoding of value tuples
@@ -625,7 +643,9 @@ arcanum/
     executor.py    iterator-model operators, external sort
     mvcc.py        row versions, snapshots and visibility
     ssi.py         serializable snapshot isolation (SERIALIZABLE)
-  lab.py           the B+tree versus LSM tree comparison
+  labs/
+    engines.py     the B+tree versus LSM tree comparison
+    buffer_pool.py replacement policies replayed on a recorded page-access trace
   server/
     app.py         FastAPI routes and WebSocket
     sessions.py    session and worker-process management, crash demo
@@ -653,7 +673,6 @@ Arcanum aims to be the clearest way to see how a database works from the inside.
 
 - **Replication**: a Raft-replicated log across three engines, with leader election, network partitions
   and catch-up you can trigger.
-- **Buffer pool policies**: LRU, Clock and 2Q on the same workload, with their hit rates over time.
 - **More advisor rules**: unused and duplicate indexes, an index advisor over a whole workload, and
   rewrites for `OR` across indexed columns.
 - **Classroom mode**: a teacher's statements appear live on every student's screen, and CSV import.
