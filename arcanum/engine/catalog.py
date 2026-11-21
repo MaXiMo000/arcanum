@@ -30,7 +30,6 @@ from ..values import Toast
 from .expr import (
     BOOLEAN,
     INTEGER,
-    INTERVAL,
     REAL,
     TEXT,
     assignable,
@@ -48,6 +47,8 @@ _TOAST_TAG = bytes([0x0A])  # the codec's tag for an overflow pointer (a cheap t
 HISTOGRAM_BUCKETS = 16
 HISTOGRAM_TEXT = 32  # text histogram bounds keep this many characters; enough to estimate ranges
 COMMON_VALUES = 8  # most common values kept per column, so skewed equalities are estimated well
+HISTOGRAM_TYPES = {"INTEGER", "REAL", "NUMERIC", "TEXT", "BOOLEAN", "DATE", "TIMESTAMP"}
+STATS_BYTES = 900  # a column's statistics as JSON must fit one catalog entry (MAX_ENTRY with its key)
 
 
 @dataclass
@@ -413,22 +414,22 @@ class Catalog:
         """Collect row and column statistics for the optimizer and store them in the catalog."""
         rows = [row for _, row in self.scan(table, snapshot)]
         columns = []
-        for i in range(len(table.columns)):
-            values = sorted(row[i] for row in rows if row[i] is not None)
-            if values:
+        for i, column in enumerate(table.columns):
+            values = [row[i] for row in rows if row[i] is not None]
+            bounds, common = [], []
+            if values and column.type in HISTOGRAM_TYPES:  # ordered scalars; documents and arrays get counts only
+                values.sort()
                 step = (len(values) - 1) / HISTOGRAM_BUCKETS
                 bounds = [values[round(b * step)] for b in range(HISTOGRAM_BUCKETS + 1)]
                 bounds = [b[:HISTOGRAM_TEXT] if isinstance(b, str) else b for b in bounds]
-            else:
-                bounds = []
-            common = [[v, n / len(rows)] for v, n in Counter(values).most_common(COMMON_VALUES)
-                      if not isinstance(v, str) or len(v) <= HISTOGRAM_TEXT]
-            columns.append(ColumnStats(len(set(values)), len(rows) - len(values), bounds, common))
+                common = [[v, n / len(rows)] for v, n in Counter(values).most_common(COMMON_VALUES)
+                          if not isinstance(v, str) or len(v) <= HISTOGRAM_TEXT]
+            columns.append(_fit_stats(ColumnStats(len(set(values)), len(rows) - len(values), bounds, common)))
         table.stats = TableStats(len(rows), columns)
         parts = [(-1, {"rows": len(rows)})] + [(i, vars(c)) for i, c in enumerate(columns)]
         for column, data in parts:
             self.tree.insert(encode((table.name, "stats", column)),
-                             encode(("stats", table.name, json.dumps(data, default=_stat_json), column)),
+                             encode(("stats", table.name, _stats_json(data), column)),
                              replace=True)
 
     # ---- rows: chains of versions (see mvcc.py) ------------------------------------------------
@@ -874,8 +875,6 @@ def _table_from_ast(stmt, root, sql):
     for c in stmt.columns:
         if any(existing.name == c.name for existing in columns):
             raise SqlError(f"column {c.name} is defined twice in table {stmt.name}")
-        if c.type == INTERVAL:
-            raise SqlError(f"column {c.name}: Arcanum can't store INTERVAL columns yet; INTERVAL works in expressions")
         default, default_expr = None, None
         if isinstance(c.default, n.Literal):
             default = c.default.value
@@ -928,6 +927,24 @@ def _check_size(size, what):
 
 def _show(value):
     return "NULL" if value is None else to_text(value)
+
+
+def _stats_json(data):
+    return json.dumps(data, default=_stat_json)
+
+
+def _fit_stats(stats):
+    """Shrink a column's statistics until they fit one catalog entry: fewer common values first, then a
+    coarser histogram."""
+    while len(_stats_json(vars(stats))) > STATS_BYTES:
+        if stats.common:
+            stats.common.pop()
+        elif len(stats.bounds) > 2:
+            stats.bounds = stats.bounds[::2] if len(stats.bounds) % 2 else [*stats.bounds[:-1:2], stats.bounds[-1]]
+        else:
+            stats.bounds = []
+            break
+    return stats
 
 
 def _stat_json(value):

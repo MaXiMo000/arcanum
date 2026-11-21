@@ -24,7 +24,19 @@ from dataclasses import fields, is_dataclass, replace
 from ..sql import nodes as n
 from . import plan as p
 from .catalog import IndexSchema
-from .expr import AGGREGATES, Col, Const, Op, SubqueryExpr, column_indexes, conjuncts, format_expr, walk
+from .expr import (
+    Col,
+    Const,
+    Op,
+    SubqueryExpr,
+    column_indexes,
+    conjuncts,
+    format_expr,
+    walk,
+)
+from .functions import (
+    AGGREGATES,
+)
 from .optimizer import Optimizer
 
 MIN_SCAN_PAGES = 8  # a full scan of fewer leaf pages than this is cheap; not worth a hint

@@ -287,8 +287,6 @@ class Alter:
                 fk.parent == table.name and pos in self.catalog.referenced(fk)
                 for child in self.children(table) for fk in child.foreign_keys):
             raise SqlError(f"cannot change the type of column {column.name}: a foreign key uses it")
-        if action.type == "INTERVAL":
-            raise SqlError("Arcanum can't store INTERVAL columns yet")
         precision, scale = action.modifiers if action.modifiers else (None, None)
 
         def convert(key, row):

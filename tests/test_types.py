@@ -137,5 +137,7 @@ def test_types_survive_reopen_and_analyze(tmp_path):
             (datetime.date(2023, 1, 1), Decimal("-2.000"), None),
             (datetime.date(2024, 5, 1), Decimal("1.500"), datetime.datetime(2024, 5, 1, 12, 0, 0, 500000))]
         assert db.catalog.tables["t"].stats.columns[0].bounds[0] == datetime.date(2023, 1, 1)
-        with pytest.raises(SqlError, match="INTERVAL columns"):
-            db.execute("CREATE TABLE bad (i INTERVAL)")
+        db.execute("CREATE TABLE spans (i INTERVAL PRIMARY KEY)")
+        db.execute("INSERT INTO spans VALUES ('1 day'), ('2 hours'), ('1 month')")
+        assert [str(v) for (v,) in db.execute("SELECT i FROM spans ORDER BY i DESC").rows] == [
+            "1 mon", "1 day", "02:00:00"]

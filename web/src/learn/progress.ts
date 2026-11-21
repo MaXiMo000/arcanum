@@ -1,5 +1,6 @@
 // Course and challenge progress, remembered in this browser (and only here).
 import { useCallback, useEffect, useState } from "react";
+import { local, readJson, writeStorage } from "../storage";
 
 const KEY = "arcanum.progress.v1";
 
@@ -15,31 +16,20 @@ export interface Progress {
 const EMPTY: Progress = { done: [], challenges: {}, lesson: null, step: 0 };
 
 function load(): Progress {
-  try {
-    const raw = window.localStorage.getItem(KEY);
-    if (!raw) return EMPTY;
-    const data = JSON.parse(raw) as Partial<Progress>;
-    return {
-      done: Array.isArray(data.done) ? data.done.filter((x) => typeof x === "string") : [],
-      challenges: data.challenges && typeof data.challenges === "object" ? data.challenges : {},
-      lesson: typeof data.lesson === "string" ? data.lesson : null,
-      step: typeof data.step === "number" ? data.step : 0,
-    };
-  } catch {
-    return EMPTY; // unavailable or corrupt storage: start fresh
-  }
+  const data = readJson(local, KEY) as Partial<Progress> | null;
+  if (!data || typeof data !== "object") return EMPTY; // nothing saved, or damaged: start fresh
+  return {
+    done: Array.isArray(data.done) ? data.done.filter((x) => typeof x === "string") : [],
+    challenges: data.challenges && typeof data.challenges === "object" ? data.challenges : {},
+    lesson: typeof data.lesson === "string" ? data.lesson : null,
+    step: typeof data.step === "number" ? data.step : 0,
+  };
 }
 
 export function useProgress() {
   const [progress, setProgress] = useState<Progress>(load);
 
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(KEY, JSON.stringify(progress));
-    } catch {
-      // Progress is a convenience; the course works without saving it.
-    }
-  }, [progress]);
+  useEffect(() => writeStorage(local, KEY, JSON.stringify(progress)), [progress]);
 
   const markStep = useCallback((lessonId: string, stepId: string) => {
     const key = `${lessonId}/${stepId}`;

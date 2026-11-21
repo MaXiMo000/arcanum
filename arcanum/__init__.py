@@ -10,9 +10,11 @@ from .errors import (
     LockWaitError,
     SerializationError,
     SqlError,
+    StatementTimeoutError,
 )
 
 __version__ = "0.1.0"
 
 __all__ = ["ArcanumError", "ConstraintError", "Database", "DeadlockError", "ExecutionError", "LockTimeoutError",
-           "LockWaitError", "QueryLimits", "Result", "SerializationError", "SqlError"]
+           "LockWaitError", "QueryLimits", "Result", "SerializationError", "SqlError",
+           "StatementTimeoutError"]

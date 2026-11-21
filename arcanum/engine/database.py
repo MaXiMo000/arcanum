@@ -2,18 +2,20 @@
 
 import time
 from dataclasses import dataclass, field, replace
+from decimal import DecimalException
 
-from ..errors import ArcanumError, LockWaitError, SqlError
+from ..errors import ArcanumError, ExecutionError, LockWaitError, SqlError
 from ..sql import nodes as n
 from ..sql.parser import parse_statements
 from ..storage import Pager
+from ..values import Jsonb
 from .advisor import advise
 from .binder import Binder
 from .catalog import Catalog
 from .ddl import Alter
 from .dml import Writer
 from .executor import Context, QueryLimits, index_scan_pairs, run
-from .expr import conjuncts
+from .expr import conjuncts, to_text
 from .mvcc import READ_COMMITTED, REPEATABLE_READ, XID_BATCH, TransactionManager
 from .optimizer import Optimizer, mark_index_only
 from .plan import IndexScan, TableScan, explain, plan_tree
@@ -31,6 +33,7 @@ class Result:
     status: str = ""  # e.g. "INSERT 3", "CREATE TABLE"
     plan: dict | None = None  # the query plan as a tree (see plan.plan_tree), when traced
     row_total: int = 0  # rows the query produced; more than len(rows) when max_rows cut them off
+    clipped: int = 0  # values shortened to Database.max_value_chars
     advice: list = field(default_factory=list)  # the advisor's hints (see advisor.py), when traced
     statement: str = ""  # the statement's own text, when traced
     planner: list = field(default_factory=list)  # the optimizer's decisions (see optimizer.py), when traced
@@ -75,6 +78,10 @@ class Database:
         self.connections = {}
         self.exclusive = None  # the session whose open transaction changed the schema; others wait for it
         self._snapshot = None  # what the running statement sees
+        self._deadline = None  # when the running statement times out (time.monotonic()), if it can
+        # Longest value kept in a result, as text (None: whole values). A server sets it, so a query can
+        # never make it hold or send gigabytes; the database itself stores and computes with whole values.
+        self.max_value_chars = None
         self._txn = None  # the transaction the running statement writes in
         self._main = self.connect("main")
         if self.catalog.meta.get("unsettled"):
@@ -166,6 +173,8 @@ class Database:
         if txn is None and isinstance(statement, _WRITES):
             txn, autocommit = self._begin(conn, READ_COMMITTED), True
         self._txn, self._snapshot = txn, self._take_snapshot(txn)
+        timeout = self.limits.timeout
+        self._deadline = time.monotonic() + timeout if timeout is not None else None
         self.pager.savepoint()
         try:
             result = self._run(statement, text, sql, trace, max_rows)
@@ -174,6 +183,9 @@ class Database:
             self.catalog.reload()
             if autocommit or (txn is not None and getattr(e, "rolled_back", None) is txn):
                 self._end(conn, txn, commit=False)  # an SSI failure ends the whole transaction
+            mapped = _as_sql_error(e)
+            if mapped is not e:
+                raise mapped from e
             raise
         finally:
             self._txn = self._snapshot = None
@@ -181,6 +193,20 @@ class Database:
         if autocommit:
             self._end(conn, txn, commit=True)
         return result
+
+    def clip(self, row):
+        """(row with every value longer than max_value_chars shortened, as text, number of values shortened)."""
+        limit = self.max_value_chars
+        if limit is None:
+            return row, 0
+        out, clipped = [], 0
+        for v in row:
+            if isinstance(v, (str, tuple, Jsonb)):
+                text = v if isinstance(v, str) else to_text(v)
+                if len(text) > limit:
+                    v, clipped = f"{text[:limit]}… ({len(text):,} characters in all)", clipped + 1
+            out.append(v)
+        return tuple(out), clipped
 
     def _reserve_xid(self):
         if self.mvcc.next_xid >= self.catalog.meta.get("xid_limit", 0):
@@ -268,12 +294,15 @@ class Database:
             plan = self._plan(binder.bind_query(statement), decisions)
             planned = time.perf_counter()
             ctx = self._context(analyze=trace)
-            rows, total = [], 0
+            rows, total, clipped = [], 0, 0
             for row in run(plan, ctx):
                 total += 1
                 if max_rows is None or total <= max_rows:
+                    row, shortened = self.clip(row)
+                    clipped += shortened
                     rows.append(row)
-            result = Result([c.name for c in plan.columns], rows, status=f"SELECT {total}", row_total=total)
+            result = Result([c.name for c in plan.columns], rows, status=f"SELECT {total}", row_total=total,
+                            clipped=clipped)
             if not trace:
                 return result
             result.planning_ms = (planned - started) * 1000
@@ -388,7 +417,7 @@ class Database:
         return result
 
     def _context(self, analyze=False):
-        return Context(self.catalog, analyze, self.limits, self._snapshot)
+        return Context(self.catalog, analyze, self.limits, self._snapshot, self._deadline)
 
     def _plan(self, plan, decisions=None):
         """Optimize a bound plan; decisions, if a list, receives the optimizer's reasoning."""
@@ -421,6 +450,17 @@ class Database:
             if hit is not None:
                 locked.append((key, row, *hit))
         return locked
+
+
+def _as_sql_error(e):
+    """The SQL error for a Python error a statement can provoke with legal SQL; other errors unchanged."""
+    if isinstance(e, RecursionError):
+        return ExecutionError("the statement, or a value in it, is nested too deeply")
+    if isinstance(e, MemoryError):
+        return ExecutionError("out of memory: the statement needs more memory than this server allows")
+    if isinstance(e, (OverflowError, DecimalException)):
+        return ExecutionError("value out of range")
+    return e
 
 
 class Connection:

@@ -362,9 +362,9 @@ def _keys(j):
 
 
 def _split(text, pattern):
-    from .expr import _regex  # noqa: PLC0415
+    from .functions import compile_regex  # noqa: PLC0415 (functions imports this module)
 
-    yield from ((part,) for part in _regex(pattern, 0).split(text))
+    yield from ((part,) for part in compile_regex(pattern, 0).split(text))
 
 
 # name -> (rows function, column names, column types given the argument types)

@@ -130,7 +130,7 @@ with Database("company.db") as db:
 ### Semantics
 
 - Types are `INTEGER`, `REAL`, `NUMERIC(p, s)`, `TEXT`, `BOOLEAN`, `DATE`, `TIMESTAMP`, `JSONB` and
-  one-dimensional arrays of the scalar types, with `INTERVAL` in expressions. They are checked before a query runs: comparing a number with text, or storing text
+  `INTERVAL` and one-dimensional arrays of the scalar types. They are checked before a query runs: comparing a number with text, or storing text
   in an `INTEGER` column, is an error rather than a silent conversion.
 - As in PostgreSQL, a text literal takes the type it is compared with or stored into
   (`WHERE day > '2024-01-01'`). `NUMERIC` is exact decimal arithmetic. Timestamps have no time zone and
@@ -491,11 +491,20 @@ python -m arcanum.server
 Errors are JSON: `{"error": {"type": "SqlError", "message": "column nope does not exist", "line": 1, "column": 8}}`.
 
 Each session's database runs in its own worker process. That is what lets the crash demo kill the
-engine for real, and what keeps one visitor's runaway query from affecting anyone else: a statement that
-outlives the time limit has its worker stopped and restarted, and the database recovers from its log
-like after any crash. Every resource a visitor can consume is bounded: request and session rates,
-sessions and WebSockets per client, statement time and concurrency, rows held in memory, sort space,
-database size, returned rows and request size. See [`.env.example`](.env.example) for the settings and
+engine for real, and what keeps one visitor's runaway query from affecting anyone else.
+
+A slow statement cancels itself at its statement timeout, as PostgreSQL's does, with
+`StatementTimeoutError`; its session and open transaction carry on. The rare one that cannot stop part
+way (a single regular-expression match) outlives the time limit, so its worker is stopped and restarted,
+and the database recovers from its log like after any crash.
+
+Every resource a visitor can consume is bounded:
+- request and session rates
+- sessions and WebSockets per client
+- statement time and concurrency
+- rows held in memory and sort space
+- the size of a single value (50 million characters or array elements)
+- database size, returned rows and request size See [`.env.example`](.env.example) for the settings and
 [SECURITY.md](SECURITY.md) for the protections, including why a public deployment still belongs behind
 a reverse proxy or CDN.
 
@@ -585,12 +594,14 @@ SQL text -> lexer -> parser -> syntax tree -> binder -> optimizer -> plan -> exe
 arcanum/
   events.py        event bus the engine reports its internal steps to
   errors.py        error types
+  values.py        values that are not Python scalars: intervals, JSONB, overflow pointers, array text
   storage/
     pager.py       pages, buffer pool, free list, savepoints, commit and checkpoint
     wal.py         write-ahead log: frames, checksums, recovery
     files.py       file access (swappable for crash tests)
     codec.py       order-preserving encoding of value tuples
-    btree.py       B+tree
+    btree.py       B+tree (forward and backward scans)
+    toast.py       overflow pages for large values (TOAST)
     lsm.py         LSM tree: memtable, SSTables, Bloom filters, leveled compaction
   sql/
     lexer.py       tokenizer
@@ -600,9 +611,15 @@ arcanum/
     database.py    Database: statements, transactions
     catalog.py     schemas, row storage and ANALYZE statistics
     binder.py      name resolution and type checking
-    expr.py        typed expressions, operators and functions
+    expr.py        the type system, expression nodes, conversions and value-size limits
+    functions.py   built-in operators and functions, and the registries calls are checked against
+    datetimes.py   dates, timestamps and intervals: parsing, arithmetic, date_trunc, to_char
+    containers.py  arrays and JSONB at run time, and the functions that return rows (unnest, ...)
+    dml.py         INSERT, UPDATE and DELETE with constraints, ON CONFLICT and RETURNING
+    ddl.py         ALTER TABLE
     plan.py        plan nodes and EXPLAIN output
-    optimizer.py   decorrelation, pushdown, access paths, join ordering, index-only scans, estimates
+    optimizer.py   decorrelation, pushdown, access paths, join ordering, sort order, merge joins,
+                   index-only scans, estimates
     advisor.py     findings and fixes from a finished plan
     doctor.py      diagnoses and corrections for failed statements
     executor.py    iterator-model operators, external sort
@@ -615,7 +632,10 @@ arcanum/
     worker.py      the engine process behind each session
 web/
   src/
-    App.tsx        session, layout, crash demo
+    App.tsx        layout, running statements, crash demo
+    useSession.ts  the database session: create, resume, replace, and the log share links replay
+    storage.ts     browser storage that never throws
+    stage.ts       what the 2D map and the 3D view are given
     feed.ts        WebSocket event stream and playback
     layout.ts      B+tree layout
     components/    shell, inspector, tree, pages, log, events, results, crash dialog

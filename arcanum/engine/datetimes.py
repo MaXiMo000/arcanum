@@ -9,11 +9,12 @@ microseconds apart, as PostgreSQL does, because a month has no fixed length:
 import calendar
 import datetime
 import re
-from dataclasses import dataclass
 
 from ..errors import ExecutionError
+from ..values import Interval
 
 _MICROS_PER_DAY = 86_400_000_000
+__all__ = ["Interval"]  # re-exported: the value type lives in values.py with the other non-scalar values
 _UNITS = {  # interval units: (months, days, microseconds) per unit
     "millennium": (12000, 0, 0), "century": (1200, 0, 0), "decade": (120, 0, 0), "year": (12, 0, 0),
     "month": (1, 0, 0), "week": (0, 7, 0), "day": (0, 1, 0), "hour": (0, 0, 3_600_000_000),
@@ -28,67 +29,6 @@ _ALIASES = {
     "milliseconds": "millisecond", "us": "microsecond", "usec": "microsecond", "microseconds": "microsecond",
     "decades": "decade", "centuries": "century", "millennia": "millennium",
 }
-
-
-@dataclass(frozen=True, slots=True)
-class Interval:
-    months: int = 0
-    days: int = 0
-    micros: int = 0
-
-    def _key(self):
-        # How PostgreSQL compares intervals: a month counts as 30 days.
-        return (self.months * 30 + self.days) * _MICROS_PER_DAY + self.micros
-
-    def __lt__(self, other):
-        return self._key() < other._key()
-
-    def __le__(self, other):
-        return self._key() <= other._key()
-
-    def __gt__(self, other):
-        return self._key() > other._key()
-
-    def __ge__(self, other):
-        return self._key() >= other._key()
-
-    def __add__(self, other):
-        return Interval(self.months + other.months, self.days + other.days, self.micros + other.micros)
-
-    def __sub__(self, other):
-        return Interval(self.months - other.months, self.days - other.days, self.micros - other.micros)
-
-    def __neg__(self):
-        return Interval(-self.months, -self.days, -self.micros)
-
-    def scale(self, factor):
-        """Multiplied by a number; fractions of months and days carry down, as in PostgreSQL."""
-        months = self.months * factor
-        whole_months = int(months)
-        days = self.days * factor + (months - whole_months) * 30
-        whole_days = int(days)
-        micros = round(self.micros * factor + (days - whole_days) * _MICROS_PER_DAY)
-        return Interval(whole_months, whole_days, micros)
-
-    def __str__(self):
-        parts = []
-        years, months = divmod(abs(self.months), 12)
-        sign = "-" if self.months < 0 else ""
-        if years:
-            parts.append(f"{sign}{years} year{'s' if years != 1 else ''}")
-        if months:
-            parts.append(f"{sign}{months} mon{'s' if months != 1 else ''}")
-        if self.days:
-            parts.append(f"{self.days} day{'s' if abs(self.days) != 1 else ''}")
-        if self.micros or not parts:
-            micros = abs(self.micros)
-            hours, rest = divmod(micros, 3_600_000_000)
-            minutes, rest = divmod(rest, 60_000_000)
-            seconds, fraction = divmod(rest, 1_000_000)
-            clock = f"{'-' if self.micros < 0 else ''}{hours:02d}:{minutes:02d}:{seconds:02d}"
-            parts.append(clock + (f".{fraction:06d}".rstrip("0") if fraction else ""))
-        return " ".join(parts)
-
 
 def _bad(text, kind):
     return ExecutionError(f"invalid input syntax for type {kind}: {text!r}")

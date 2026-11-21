@@ -1,4 +1,4 @@
-import type { ApiError, QueryResult } from "../api";
+import type { ApiError, QueryResult, Value } from "../api";
 import { SqlDiff } from "../advisor/Advisor";
 import { formatValue } from "../format";
 import { Dependencies } from "./Versions";
@@ -66,6 +66,17 @@ export function ErrorBox({ error, sql, onFix }: ErrorProps) {
   );
 }
 
+const LONG = 60; // characters after which a cell gets a tooltip with the whole value
+
+function Cell({ value }: { value: Value }) {
+  const text = formatValue(value);
+  return (
+    <td className={value === null ? "null" : typeof value === "number" ? "num" : ""} title={text.length > LONG ? text : undefined}>
+      {text}
+    </td>
+  );
+}
+
 export function Results({ results }: { results: QueryResult[] }) {
   return (
     <div className="results">
@@ -80,6 +91,7 @@ export function Results({ results }: { results: QueryResult[] }) {
                   {result.truncated || result.rows.length > SHOWN_ROWS
                     ? `showing ${rows.length} of ${result.row_total.toLocaleString()} rows`
                     : `${result.row_total.toLocaleString()} ${result.row_total === 1 ? "row" : "rows"}`}
+                  {result.clipped ? ` · ${result.clipped.toLocaleString()} long ${result.clipped === 1 ? "value" : "values"} shortened` : ""}
                 </span>
               )}
             </div>
@@ -99,9 +111,7 @@ export function Results({ results }: { results: QueryResult[] }) {
                     {rows.map((row, r) => (
                       <tr key={r}>
                         {row.map((v, c) => (
-                          <td key={c} className={v === null ? "null" : typeof v === "number" ? "num" : ""}>
-                            {formatValue(v)}
-                          </td>
+                          <Cell key={c} value={v} />
                         ))}
                       </tr>
                     ))}

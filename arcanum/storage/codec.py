@@ -16,6 +16,8 @@ Each value is a tag byte followed by its payload:
                                        prefix sorts first ({1,2} < {1,2,3}), as PostgreSQL orders arrays
     JSONB    0x09 + text as TEXT       the canonical text (see values.py)
     TOAST    0x0A + 25 bytes           a pointer to a value in overflow pages (stored rows only, never keys)
+    INTERVAL 0x0B + 4 x 8 bytes        its length in microseconds (a month counted as 30 days, as PostgreSQL
+                                       compares intervals), then months, days and microseconds, like INTEGER
 
 A shorter tuple sorts before any longer tuple it is a prefix of. A column holds
 one type, so INTEGER and REAL values never meet at the same position.
@@ -25,10 +27,11 @@ import datetime
 import struct
 from decimal import Decimal
 
-from ..values import Jsonb, Toast
+from ..values import Interval, Jsonb, Toast
 
-NULL, INTEGER, REAL, TEXT, DATE, TIMESTAMP, NUMERIC, ARRAY, JSONB, TOAST = (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                                                                         0x08, 0x09, 0x0A)
+NULL, INTEGER, REAL, TEXT, DATE, TIMESTAMP, NUMERIC, ARRAY, JSONB, TOAST, INTERVAL = (
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B)
+_INTERVAL = struct.Struct(">QQQQ")
 _TOAST = struct.Struct(">III?8s")
 EPOCH = datetime.datetime(1970, 1, 1)
 _EPOCH_DAY = EPOCH.date().toordinal()
@@ -69,6 +72,9 @@ def _encode_into(out, values):
         elif isinstance(v, Jsonb):
             out.append(JSONB)
             _text_into(out, v.text)
+        elif isinstance(v, Interval):
+            out.append(INTERVAL)
+            out += _INTERVAL.pack(*(_biased(x) for x in (v.sort_key(), v.months, v.days, v.micros)))
         elif isinstance(v, Toast):
             out.append(TOAST)
             out += _TOAST.pack(v.page, v.size, v.raw, v.compressed, v.digest)
@@ -83,6 +89,12 @@ def _encode_into(out, values):
             out += _encode_decimal(v)
         else:
             raise TypeError(f"cannot store a value of type {type(v).__name__}")
+
+
+def _biased(n):
+    if not -_SIGN <= n < _SIGN:
+        raise OverflowError(f"integer out of 64-bit range: {n}")
+    return n + _SIGN
 
 
 def _text_into(out, text):
@@ -136,6 +148,9 @@ def _decode_one(data, i):
     if tag == JSONB:
         text, i = _decode_text(data, i)
         return Jsonb.parse(text), i
+    if tag == INTERVAL:
+        _, months, days, micros = (x - _SIGN for x in _INTERVAL.unpack_from(data, i))
+        return Interval(months, days, micros), i + _INTERVAL.size
     if tag == TOAST:
         return Toast(*_TOAST.unpack_from(data, i)), i + _TOAST.size
     raise ValueError(f"corrupt value: unknown tag {tag:#04x} at byte {i - 1}")

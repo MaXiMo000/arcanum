@@ -24,24 +24,18 @@ from . import plan as p
 from .containers import TABLE_FUNCTIONS
 from .executor import evaluate_constant
 from .expr import (
-    AGGREGATES,
     BOOLEAN,
     DATE,
     DECIMAL,
-    FUNCTIONS,
     INTEGER,
     INTERVAL,
     JSONB,
     NULL,
     NUMERIC,
-    RANKING,
     REAL,
-    STABLE,
     TEMPORAL,
     TEXT,
     TIMESTAMP,
-    VARIADIC,
-    WINDOW_ONLY,
     AggCall,
     Col,
     Const,
@@ -65,6 +59,14 @@ from .expr import (
     to_outer,
     unify,
     walk,
+)
+from .functions import (
+    AGGREGATES,
+    FUNCTIONS,
+    RANKING,
+    STABLE,
+    VARIADIC,
+    WINDOW_ONLY,
 )
 
 _COMPARISONS = {"=", "!=", "<", "<=", ">", ">="}
@@ -822,6 +824,11 @@ class Binder:
         temporal = self.temporal_arithmetic(op, left, right, node)
         if temporal is not None:
             return temporal
+        if op == "^":
+            self.require(left, NUMERIC, node.left, "operator ^")
+            self.require(right, NUMERIC, node.right, "operator ^")
+            exact = DECIMAL in (left.type, right.type)
+            return Op("^", (left, right), DECIMAL if exact else REAL)
         allowed = (INTEGER, DECIMAL) if op == "%" else NUMERIC
         self.require(left, allowed, node, f"operator {op}")
         self.require(right, allowed, node, f"operator {op}")

@@ -85,7 +85,10 @@ class Session:
         options = {"max_keys": s.max_keys, "max_pages": s.max_pages, "pool_size": s.pool_size,
                    "event_limit": s.event_limit, "memory_rows": s.memory_rows, "spill_bytes": s.spill_bytes,
                    "sort_memory_rows": s.sort_memory_rows, "recursive_rows": s.recursive_rows,
-                   "memory_mb": s.worker_memory_mb, "lock_timeout": s.lock_timeout}
+                   "memory_mb": s.worker_memory_mb, "lock_timeout": s.lock_timeout,
+                   # Statements cancel themselves a little before the worker would be killed, so a slow
+                   # query fails with a clean error and the worker (with its open transactions) survives.
+                   "statement_timeout": max(s.query_timeout * 0.75, s.query_timeout - 1.5)}
         self.process = context.Process(target=worker_main, args=(str(self.path), child_conn, event_writer, options),
                                        daemon=True)
         self.process.start()

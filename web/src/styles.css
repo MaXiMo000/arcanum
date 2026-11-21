@@ -1269,6 +1269,12 @@ td {
   white-space: nowrap;
 }
 
+td {
+  max-width: 32rem; /* a long value is cut with an ellipsis; its title shows all of it */
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 th {
   position: sticky;
   top: 0;

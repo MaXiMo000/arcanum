@@ -947,10 +947,17 @@ class _Parser:
         return left
 
     def multiplicative(self):
-        left = self.unary()
+        left = self.exponent()
         while op := self.accept_op("*", "/", "%"):
             pos = self.prev_pos
-            left = n.Binary(op, left, self.unary(), pos)
+            left = n.Binary(op, left, self.exponent(), pos)
+        return left
+
+    def exponent(self):
+        left = self.unary()
+        while self.accept_op("^"):  # left-associative, as in PostgreSQL: 2 ^ 3 ^ 2 = 64
+            pos = self.prev_pos
+            left = n.Binary("^", left, self.unary(), pos)
         return left
 
     def unary(self):

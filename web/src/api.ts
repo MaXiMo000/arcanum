@@ -51,6 +51,8 @@ export interface QueryResult {
   rows: Value[][];
   truncated: boolean;
   row_total: number;
+  /** Values the server shortened because they were too long to send whole. */
+  clipped?: number;
   rowcount: number;
   status: string;
   plan: PlanNode | null;

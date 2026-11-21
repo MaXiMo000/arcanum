@@ -13,7 +13,11 @@ from difflib import get_close_matches
 from ..errors import ConstraintError, SqlError
 from ..sql.lexer import EOF, OP, QUOTED, STRING, WORD, tokenize
 from ..sql.parser import RESERVED, TYPES
-from .expr import AGGREGATES, FUNCTIONS, WINDOW_ONLY
+from .functions import (
+    AGGREGATES,
+    FUNCTIONS,
+    WINDOW_ONLY,
+)
 
 KEYWORDS = RESERVED | {
     "ANALYZE", "BEGIN", "BOOLEAN", "COMMIT", "CREATE", "DEFAULT", "DELETE", "DROP", "EXPLAIN", "IF", "INDEX",

@@ -2,24 +2,18 @@
 // query walks sits on top; below it the buffer pool, the fixed set of page slots in memory, in the
 // engine's own least-recently-used order; at the bottom the disk: the data file, page by page, and the
 // write-ahead log. Every page a query touches lights up in each layer it passes through.
-import { type PageOwner, ownerLabel } from "../format";
 import { useEffect, useRef } from "react";
 import type { EngineState, Tree } from "../api";
 import type { FeedState, Flash } from "../feed";
+import { ownerLabel, type PageOwner } from "../format";
+import type { StageProps } from "../stage";
 import type { ReplayMarker } from "./Timeline";
 import { TreeView } from "./TreeView";
 import { Versions } from "./Versions";
 
 export type MapFocus = "pool" | "disk" | "log" | null;
 
-interface Props {
-  trees: Tree[];
-  selected: string | null;
-  onSelect: (name: string) => void;
-  feed: FeedState;
-  flashMs: number;
-  state: EngineState;
-  owners: Map<number, PageOwner>;
+interface Props extends StageProps {
   focus: MapFocus;
   marker: ReplayMarker | null;
 }

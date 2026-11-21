@@ -20,34 +20,39 @@ from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
 
-from ..errors import ExecutionError
+from ..errors import ExecutionError, StatementTimeoutError
 from ..storage import decode, encode
 from . import containers as ct
 from . import plan as p
 from .expr import (
     BOOLEAN,
     DECIMAL,
-    FUNCTIONS,
     REAL,
-    STABLE,
-    VARIADIC,
     Col,
     Const,
     Op,
     Outer,
     SubqueryExpr,
+    bounded,
     cast,
     check_int,
+    check_size,
     divide,
+    modulo,
+    to_decimal,
+    to_text,
+)
+from .functions import (
+    FUNCTIONS,
+    STABLE,
+    VARIADIC,
     interval_divide,
     interval_times,
     like,
-    modulo,
+    power,
     regex_match,
     temporal_minus,
     temporal_plus,
-    to_decimal,
-    to_text,
 )
 
 
@@ -58,13 +63,15 @@ class QueryLimits:
     memory_rows: int | None = None  # rows held at once in hash tables, groups and materialised inputs
     spill_bytes: int | None = None  # bytes a statement may write to temporary sort files
     recursive_rows: int = 1_000_000  # rows a recursive CTE may produce
+    timeout: float | None = None  # seconds a statement may run (PostgreSQL's statement_timeout)
 
 
 class Context:
     """State for running one statement."""
 
-    def __init__(self, catalog, analyze=False, limits=None, snapshot=None):
+    def __init__(self, catalog, analyze=False, limits=None, snapshot=None, deadline=None):
         self.catalog = catalog
+        self.deadline = deadline  # time.monotonic() after which the statement is cancelled, or None
         self.snapshot = snapshot  # which row versions the statement sees (see mvcc.py)
         self.events = catalog.pager.events if catalog is not None else None
         self.limits = limits or QueryLimits()
@@ -102,7 +109,21 @@ def run(plan, ctx, outer=()):
     rows = _RUNNERS[type(plan)](plan, ctx, outer)
     if ctx.stats is not None:
         rows = _measured(rows, ctx.stats.setdefault(id(plan), [0, 0.0]))
+    if ctx.deadline is not None:
+        rows = _timed(rows, ctx.deadline)
     return rows
+
+
+_TIMEOUT_EVERY = 256  # rows between clock checks
+
+
+def _timed(rows, deadline):
+    """Pass rows through, cancelling the statement once it is past its deadline. Every operator's rows
+    flow through here, so even a statement that returns one row (count(*) over millions) is cancelled."""
+    for n, row in enumerate(rows):
+        if n % _TIMEOUT_EVERY == 0 and time.monotonic() > deadline:
+            raise StatementTimeoutError("canceling statement due to statement timeout")
+        yield row
 
 
 def evaluate_constant(e):
@@ -154,21 +175,21 @@ def _strict(f, fns):
 _BINARY = {
     "=": operator.eq, "!=": operator.ne, "<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge,
     "+": lambda a, b: check_int(a + b), "-": lambda a, b: check_int(a - b), "*": lambda a, b: check_int(a * b),
-    "/": divide, "%": modulo, "||": lambda a, b: to_text(a) + to_text(b), "LIKE": like,
+    "/": divide, "%": modulo, "^": power, "||": lambda a, b: bounded(to_text(a) + to_text(b)), "LIKE": like,
     "ILIKE": lambda a, b: like(a.lower(), b.lower()),
     "~": regex_match, "~*": lambda a, b: regex_match(a, b, True),
     "!~": lambda a, b: not regex_match(a, b), "!~*": lambda a, b: not regex_match(a, b, True),
     "DT+": temporal_plus, "DT-": temporal_minus, "IV*": interval_times, "IV/": interval_divide,
     "->": ct.json_get, "->>": ct.json_get_text, "#>": ct.json_path, "#>>": ct.json_path_text,
     "@>": ct.contains, "<@": lambda a, b: ct.contains(b, a), "&&": ct.overlaps, "?": ct.json_has,
-    "?|": ct.json_has_any, "?&": ct.json_has_all, "ARR||": ct.concat, "J-": ct.json_delete, "[]": ct.subscript,
+    "?|": ct.json_has_any, "?&": ct.json_has_all, "ARR||": lambda a, b: bounded(ct.concat(a, b)), "J-": ct.json_delete, "[]": ct.subscript,
 }
 
 
 def _variadic(op, fns):
     """CONCAT, CONCAT_WS, GREATEST and LEAST, which skip NULL arguments instead of returning NULL."""
     if op == "CONCAT":
-        return lambda row, outer: "".join(to_text(v) for f in fns if (v := f(row, outer)) is not None)
+        return lambda row, outer: bounded("".join(to_text(v) for f in fns if (v := f(row, outer)) is not None))
     if op == "CONCAT_WS":
         first, rest = fns[0], fns[1:]
 
@@ -176,7 +197,7 @@ def _variadic(op, fns):
             sep = first(row, outer)
             if sep is None:
                 return None
-            return to_text(sep).join(to_text(v) for f in rest if (v := f(row, outer)) is not None)
+            return bounded(to_text(sep).join(to_text(v) for f in rest if (v := f(row, outer)) is not None))
         return concat_ws
     pick = max if op == "GREATEST" else min
 
@@ -1033,13 +1054,15 @@ class _StringAgg(_Accumulator):
     """string_agg(value, delimiter): the values joined, each after the first preceded by its delimiter."""
 
     def reset(self):
-        self.parts = []
+        self.parts, self.length = [], 0
 
     def step(self, v):
         value, delimiter = v
         if self.parts:
             self.parts.append(delimiter or "")
         self.parts.append(value)
+        self.length += len(value) + len(delimiter or "")
+        check_size(self.length, "string_agg's result")
 
     def result(self):
         return "".join(self.parts) if self.parts else None
@@ -1088,6 +1111,7 @@ class _ArrayAgg(_Accumulator):
                 return
             self.seen.add(v)
         self.items.append(v)
+        check_size(len(self.items), "the aggregated array")
 
     def reset(self):
         self.items = []

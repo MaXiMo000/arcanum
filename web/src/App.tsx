@@ -1,4 +1,3 @@
-import { type PageOwner } from "./format";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Comparison } from "./advisor/Advisor";
 import {
@@ -30,38 +29,20 @@ import { plural, type CheckContext, type Outcome, type Waiting } from "./learn/o
 import { PlayPanel, SECOND_SESSION_SQL } from "./learn/PlayPanel";
 import { MAX_LINK, clearShared, readShared, shareLink, type SharedState } from "./share";
 import { useProgress } from "./learn/progress";
+import type { PageOwner } from "./format";
+import type { StageProps } from "./stage";
+import { local, readStorage, writeStorage } from "./storage";
+import { CHANGES, useSession } from "./useSession";
 
-const SESSION_KEY = "arcanum.session";
 const THEME_KEY = "arcanum.theme";
 const VIEW_KEY = "arcanum.view.v2"; // v2: the engine map became the default view
 const MODE_KEY = "arcanum.mode";
 const INTRO_KEY = "arcanum.intro-seen";
-const SETUP_KEY = "arcanum.setup"; // statements that changed this session's database, for share links
-const MAX_SETUP = 200;
-// Statuses of statements that change the database (or a transaction), which a shared link replays.
-const CHANGES = /^(INSERT|UPDATE|DELETE|CREATE|DROP|ANALYZE|BEGIN|COMMIT|ROLLBACK)/;
 const EXPLAIN_PREFIX = /^\s*EXPLAIN\s+(ANALYZE\s+)?/i;
 const WAIT_POLL_MS = 400; // how often a waiting statement's ticket is checked
 
 // The 3D view (three.js) is a separate download, fetched the first time someone opens it.
 const Vault = lazy(() => import("./vault/Vault"));
-
-function readStorage(storage: () => Storage, key: string): string | null {
-  try {
-    return storage().getItem(key);
-  } catch {
-    return null; // storage can be unavailable (private windows, blocked site data)
-  }
-}
-
-function writeStorage(storage: () => Storage, key: string, value: string | null) {
-  try {
-    if (value === null) storage().removeItem(key);
-    else storage().setItem(key, value);
-  } catch {
-    // Not essential: the page works without it.
-  }
-}
 
 /** The tree a query read first (an index scan reads the index's own tree), so the map can follow it. */
 function treeRead(results: QueryResult[]): string | null {
@@ -83,13 +64,9 @@ function firstTable(state: EngineState): string | null {
   return state.trees.find((t) => t.kind === "table")?.name ?? null;
 }
 
-const session = () => window.sessionStorage;
-const local = () => window.localStorage;
-
 export default function App() {
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [state, setState] = useState<EngineState | null>(null);
-  const [startError, setStartError] = useState<string | null>(null);
+  const { sessionId, idRef, state, setState, startError, start: startSession, lost: onSessionGone, refresh, remember, replay: replaySetup, setup } =
+    useSession();
   const [selectedTree, setSelectedTree] = useState<string | null>(null); // set to the first table on load
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [runError, setRunError] = useState<RunError | null>(null);
@@ -99,11 +76,6 @@ export default function App() {
   const [playSql, setPlaySql] = useState(EXAMPLES[0]!.sql);
   const [playSqlB, setPlaySqlB] = useState(SECOND_SESSION_SQL);
   const [twoSessions, setTwoSessions] = useState(false);
-  const setup = useRef<{ session: string | null; statements: [SessionName, string][]; full: boolean }>({
-    session: null,
-    statements: [],
-    full: false,
-  });
   const [crashOpen, setCrashOpen] = useState(false);
   const [crashSummary, setCrashSummary] = useState<CrashSummary | null>(null);
   const [crashError, setCrashError] = useState<string | null>(null);
@@ -118,114 +90,20 @@ export default function App() {
   const [theme, setTheme] = useState<"light" | "dark">(() => (readStorage(local, THEME_KEY) === "light" ? "light" : "dark"));
   const { progress, markStep, unlock, open } = useProgress();
 
-  const idRef = useRef<string | null>(null);
-  const refreshing = useRef<Promise<void> | null>(null);
-  const refreshAgain = useRef(false);
-  const starting = useRef<Promise<void> | null>(null);
+  // Show the first table once the database is there; later tables do not steal the view.
+  useEffect(() => {
+    if (state) setSelectedTree((name) => name ?? firstTable(state));
+  }, [state]);
+
   const outcomeIds = useRef(0);
   const toastIds = useRef(0);
   const completedRef = useRef(progress.challenges);
   completedRef.current = progress.challenges;
 
-  const refresh = useCallback(async () => {
-    const id = idRef.current;
-    if (!id) return;
-    if (refreshing.current) {
-      refreshAgain.current = true; // coalesce bursts into one follow-up request
-      return;
-    }
-    refreshing.current = (async () => {
-      try {
-        setState(await api.state(id));
-      } catch {
-        // A failed refresh keeps the last picture; the next action refreshes again.
-      } finally {
-        refreshing.current = null;
-        if (refreshAgain.current) {
-          refreshAgain.current = false;
-          void refresh();
-        }
-      }
-    })();
-  }, []);
-
-  const startSession = useCallback((forceNew: boolean) => {
-    // One start at a time: a second call (a remount, a lost session reported twice) joins the first.
-    starting.current ??= openSession(forceNew).finally(() => {
-      starting.current = null;
-    });
-    return starting.current;
-  }, []);
-
-  async function openSession(forceNew: boolean) {
-    setStartError(null);
-    const previous = readStorage(session, SESSION_KEY);
-    if (forceNew && previous) {
-      // The tab is starting over: free its old database now (visitors may only hold a few at once).
-      writeStorage(session, SESSION_KEY, null);
-      await api.deleteSession(previous).catch(() => undefined);
-    }
-    const saved = forceNew ? null : previous;
-    if (saved) {
-      try {
-        const current = await api.state(saved);
-        idRef.current = saved;
-        try {
-          const stored = JSON.parse(readStorage(session, SETUP_KEY) ?? "null");
-          if (stored?.session === saved && Array.isArray(stored.statements)) setup.current = stored;
-        } catch {
-          // A damaged log only means a share link without setup.
-        }
-        setSessionId(saved);
-        setState(current);
-        setSelectedTree((name) => name ?? firstTable(current));
-        return;
-      } catch (e) {
-        if (!(e instanceof ApiError) || e.status !== 404) {
-          setStartError(e instanceof ApiError ? e.message : "the server cannot be reached");
-          return;
-        }
-      }
-    }
-    try {
-      const created = await api.createSession();
-      writeStorage(session, SESSION_KEY, created.id);
-      setup.current = { session: created.id, statements: [], full: false };
-      writeStorage(session, SETUP_KEY, JSON.stringify(setup.current));
-      idRef.current = created.id;
-      setSessionId(created.id);
-      const fresh = await api.state(created.id);
-      setState(fresh);
-      setSelectedTree((name) => name ?? firstTable(fresh));
-    } catch (e) {
-      setStartError(e instanceof ApiError ? e.message : "the server cannot be reached");
-    }
-  }
-
-  const remember = useCallback((statements: [SessionName, string][]) => {
-    const log = setup.current;
-    for (const statement of statements) {
-      if (log.statements.length >= MAX_SETUP) log.full = true;
-      else log.statements.push(statement);
-    }
-    writeStorage(session, SETUP_KEY, JSON.stringify(log));
-  }, []);
-
   /** Open a shared link: replay its statements on this fresh database, then fill in the playground. */
   const openShared = useCallback(
     async (shared: SharedState) => {
-      const id = idRef.current;
-      if (!id) return;
-      let failed = 0;
-      for (const [who, sql] of shared.setup) {
-        try {
-          await api.query(id, sql, who);
-        } catch {
-          failed++;
-        }
-      }
-      remember(shared.setup);
-      void refresh();
+      const failed = await replaySetup(shared.setup);
       setPlaySql(shared.sql);
       setPlaySqlB(shared.sqlB);
       setTwoSessions(shared.two);
@@ -241,7 +119,7 @@ export default function App() {
         },
       ]);
     },
-    [refresh, remember],
+    [replaySetup],
   );
 
   useEffect(() => {
@@ -283,11 +161,6 @@ export default function App() {
   useEffect(() => writeStorage(local, VIEW_KEY, view), [view]);
   useEffect(() => writeStorage(local, MODE_KEY, mode), [mode]);
   const use2d = useCallback(() => setView("2d"), []);
-
-  const onSessionGone = useCallback(() => {
-    writeStorage(session, SESSION_KEY, null);
-    void startSession(true);
-  }, [startSession]);
 
   const { feed, pending, speed, setSpeed, skip, connection, clearCrash, startCrash, syncPool } = useEngineFeed(
     sessionId,
@@ -390,7 +263,8 @@ export default function App() {
               await new Promise((resolve) => window.setTimeout(resolve, WAIT_POLL_MS));
               if (idRef.current !== id) return null;
               const ticket = reply.waiting.ticket;
-              reply = cancelled.current.has(ticket) ? await api.cancel(id, ticket) : await api.ticket(id, ticket);
+              if (cancelled.current.delete(ticket)) reply = await api.cancel(id, ticket);
+              else reply = await api.ticket(id, ticket);
             }
             return await finish(reply);
           } catch (e) {
@@ -516,34 +390,24 @@ export default function App() {
     );
   }
 
+  const stageProps: StageProps | null = state && {
+    trees: state.trees,
+    selected: selectedTree,
+    onSelect: setSelectedTree,
+    feed: shown,
+    flashMs,
+    state,
+    owners,
+  };
   const stage =
     view === "lab" ? (
       <EngineLab sessionId={sessionId} />
-    ) : state && view === "3d" ? (
+    ) : stageProps && view === "3d" ? (
       <Suspense fallback={<div className="stage-loading">Loading the 3D view…</div>}>
-        <Vault
-          trees={state.trees}
-          selected={selectedTree}
-          onSelect={setSelectedTree}
-          feed={shown}
-          flashMs={flashMs}
-          state={state}
-          owners={owners}
-          onUnavailable={use2d}
-        />
+        <Vault {...stageProps} onUnavailable={use2d} />
       </Suspense>
-    ) : state ? (
-      <EngineMap
-        trees={state.trees}
-        selected={selectedTree}
-        onSelect={setSelectedTree}
-        feed={shown}
-        flashMs={flashMs}
-        state={state}
-        owners={owners}
-        focus={mapFocus}
-        marker={replay?.marker ?? null}
-      />
+    ) : stageProps ? (
+      <EngineMap {...stageProps} focus={mapFocus} marker={replay?.marker ?? null} />
     ) : (
       <div className="stage-loading" aria-busy="true">
         Opening your database…

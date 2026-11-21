@@ -222,8 +222,13 @@ class Writer:
         count = len(rows)
         if returning is None:
             return result_type(rowcount=count, status=status)
-        out = [tuple(f(tuple(row), ()) for _, f in returning) for row in rows]
-        return result_type([name for name, _ in returning], out, rowcount=count, status=status, row_total=len(out))
+        out, clipped = [], 0
+        for row in rows:
+            values, n = self.db.clip(tuple(f(tuple(row), ()) for _, f in returning))
+            out.append(values)
+            clipped += n
+        return result_type([name for name, _ in returning], out, rowcount=count, status=status, row_total=len(out),
+                           clipped=clipped)
 
     def bind_conflict(self, table, clause):
         if clause is None:

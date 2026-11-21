@@ -157,12 +157,26 @@ def test_state_describes_trees_cache_and_log(client):
 # ---- resource limits ----------------------------------------------------------------------------
 
 
-def test_runaway_statement_is_stopped_without_losing_data(client):
+def test_runaway_statement_cancels_itself_and_keeps_the_session(client):
     session = new_session(client)
-    sql(client, session, "INSERT INTO customers VALUES (77, 'Kept', 'Lima')")
+    sql(client, session, "BEGIN; INSERT INTO customers VALUES (77, 'Kept', 'Lima')")
     response = sql(client, session, "SELECT count(*) FROM orders a, orders b, orders c, orders d")
-    assert response.status_code == 408 and response.json()["error"]["type"] == "QueryTimeout"
+    error = response.json()["error"]
+    assert response.status_code == 400 and error["type"] == "StatementTimeoutError"
+    assert "statement timeout" in error["message"]
+    # The worker was not restarted: the open transaction (and its row) are still there.
     assert sql(client, session, "SELECT name FROM customers WHERE id = 77").json()["results"][0]["rows"] == [["Kept"]]
+    sql(client, session, "COMMIT")
+
+
+def test_a_statement_that_cannot_be_interrupted_is_killed_without_losing_data(client):
+    session = new_session(client)
+    sql(client, session, "INSERT INTO customers VALUES (78, 'Kept', 'Lima')")
+    # One regular expression match runs inside Python's re module and cannot stop halfway: the server
+    # kills the worker at the query timeout and starts a new one from the committed data.
+    response = sql(client, session, "SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!' ~ '(a+)+$'")
+    assert response.status_code == 408 and response.json()["error"]["type"] == "QueryTimeout"
+    assert sql(client, session, "SELECT name FROM customers WHERE id = 78").json()["results"][0]["rows"] == [["Kept"]]
 
 
 def test_statements_that_need_too_much_memory_are_refused(make_client):
@@ -452,3 +466,11 @@ def test_rolling_back_to_a_savepoint_wakes_waiting_statements(client):
     run("COMMIT", "A")
     rows = run("SELECT id, city FROM customers WHERE id <= 2 ORDER BY id", "A").json()["results"][0]["rows"]
     assert rows == [[1, "x"], [2, "b"]]
+
+
+def test_long_values_are_shortened_in_responses(client):
+    session = new_session(client)
+    result = sql(client, session, "SELECT repeat('x', 5000) AS long, 'short' AS short").json()["results"][0]
+    long, short = result["rows"][0]
+    assert result["clipped"] == 1 and short == "short"
+    assert long.startswith("x" * 2000) and long.endswith("(5,000 characters in all)")

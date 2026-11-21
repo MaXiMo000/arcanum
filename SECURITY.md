@@ -27,7 +27,10 @@ Arcanum is an educational database engine. It is not meant to store sensitive da
 
 - Per-client request rate, session creation rate and number of sessions; per-client and global
   WebSocket connections; total connections.
-- Statement run time (an over-running engine process is stopped and restarted, and its database recovers
+- The size of any single value (text, array, JSON), checked before it is built, so `repeat`, padding,
+  `||` and aggregates cannot exhaust memory
+- Statement run time: a statement cancels itself at its timeout and its session carries on (an
+  over-running engine process is stopped and restarted, and its database recovers
   from the log), statements running at once, rows a statement may hold in memory, temporary sort space,
   recursive query size, returned rows, SQL length, request body size, and database size.
 - The parser refuses statements nested beyond a fixed depth, and `LIKE` runs in polynomial time whatever

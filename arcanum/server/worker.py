@@ -189,10 +189,12 @@ def worker_main(path, conn, event_conn, options):
     bus = EventBus()
     bus.subscribe(pump.on_event)
     limits = QueryLimits(sort_memory_rows=options["sort_memory_rows"], memory_rows=options["memory_rows"],
-                         spill_bytes=options["spill_bytes"], recursive_rows=options["recursive_rows"])
+                         spill_bytes=options["spill_bytes"], recursive_rows=options["recursive_rows"],
+                         timeout=options["statement_timeout"])
     try:
         db = Database(path, events=bus, max_keys=options["max_keys"], max_pages=options["max_pages"],
                       pool_size=options["pool_size"], limits=limits)
+        db.max_value_chars = MAX_VALUE_CHARS
         if not db.catalog.tables:
             db.execute_script(SEED_SQL)
         for name in SESSIONS:
@@ -239,6 +241,7 @@ def worker_main(path, conn, event_conn, options):
 
 SESSIONS = ("A", "B")  # the database sessions each visitor can type into, side by side
 NOTES = 50  # constraint notes kept per request
+MAX_VALUE_CHARS = 2000  # longer values in results are shortened: a response stays small whatever the query
 VERSION_ROWS = 40  # rows with versions the state shows at most
 
 
@@ -423,7 +426,7 @@ class Jobs:
 def _result_json(r):
     return {"columns": r.columns, "rows": [[_cell(v) for v in row] for row in r.rows],
             "truncated": r.row_total > len(r.rows),
-            "row_total": r.row_total, "rowcount": r.rowcount, "status": r.status, "plan": r.plan,
+            "row_total": r.row_total, "rowcount": r.rowcount, "status": r.status, "plan": r.plan, "clipped": r.clipped,
             "advice": r.advice, "statement": r.statement, "planner": r.planner,
             "planning_ms": r.planning_ms, "execution_ms": r.execution_ms}
 

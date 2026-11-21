@@ -57,6 +57,11 @@ class DeadlockError(ExecutionError):
     """Two transactions wait for each other. As in PostgreSQL, one of them is rolled back."""
 
 
+class StatementTimeoutError(ExecutionError):
+    """A statement ran longer than its time limit and was cancelled ("canceling statement due to statement
+    timeout", as PostgreSQL says)."""
+
+
 class LockTimeoutError(ExecutionError):
     """A statement waited for a lock longer than the lock timeout and was cancelled."""
 

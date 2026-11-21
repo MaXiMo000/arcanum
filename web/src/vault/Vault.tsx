@@ -1,11 +1,11 @@
 // The 3D crystal vault: the selected B+tree as glowing crystals above a floor of pages, with the
 // write-ahead log spiralling beside them. Loaded on demand; the 2D panels stay alongside it.
-import { type PageOwner, ownerLabel } from "../format";
 import { Canvas, useFrame, type ThreeEvent } from "@react-three/fiber";
 import { useCallback, useMemo, useRef, useState, type RefObject } from "react";
-import type { EngineState, Tree } from "../api";
 import { TreeCaption, TreeTabs, pickTree, visibleKeyColumns } from "../components/TreeTabs";
 import type { FeedState } from "../feed";
+import { ownerLabel } from "../format";
+import type { StageProps } from "../stage";
 import { layoutTree } from "../layout";
 import { CrystalTree } from "./CrystalTree";
 import { LogRiver } from "./LogRiver";
@@ -14,14 +14,7 @@ import { Scenery } from "./Scenery";
 import { Bloom, Rig, type Bounds } from "./Stage";
 import { COLORS, FLOOR_Y, RIVER_RADIUS, TREE_TOP, placeTree, type Motion } from "./world";
 
-interface Props {
-  trees: Tree[];
-  selected: string | null;
-  onSelect: (name: string) => void;
-  feed: FeedState;
-  flashMs: number;
-  state: EngineState;
-  owners: Map<number, PageOwner>;
+interface Props extends StageProps {
   onUnavailable: () => void;
 }
 

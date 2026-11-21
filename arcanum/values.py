@@ -1,4 +1,5 @@
-"""SQL values that are not plain Python scalars: JSONB documents, and the text form of arrays.
+"""SQL values that are not plain Python scalars: intervals, JSONB documents, overflow pointers, and the text
+form of arrays.
 
 A JSONB value keeps the parsed document and its canonical text: keys ordered
 the way PostgreSQL's jsonb orders them (shorter keys first, then by bytes),
@@ -16,6 +17,8 @@ from decimal import Decimal, InvalidOperation
 
 from .errors import ExecutionError
 
+_MICROS_PER_DAY = 86_400_000_000
+
 
 class Jsonb:
     __slots__ = ("text", "value")
@@ -30,6 +33,8 @@ class Jsonb:
             return cls(json.loads(text, parse_float=Decimal, parse_constant=_no_constant))
         except (ValueError, InvalidOperation):
             raise ExecutionError(f"invalid input syntax for type jsonb: {text[:60]!r}") from None
+        except RecursionError:
+            raise ExecutionError("invalid input for type jsonb: nested too deeply") from None
 
     def __eq__(self, other):
         return isinstance(other, Jsonb) and self.text == other.text
@@ -54,6 +59,67 @@ class Jsonb:
 
     def __repr__(self):
         return f"Jsonb({self.text})"
+
+
+@dataclass(frozen=True, slots=True)
+class Interval:
+    months: int = 0
+    days: int = 0
+    micros: int = 0
+
+    def sort_key(self):
+        # How PostgreSQL compares intervals: a month counts as 30 days.
+        return (self.months * 30 + self.days) * _MICROS_PER_DAY + self.micros
+
+    def __lt__(self, other):
+        return self.sort_key() < other.sort_key()
+
+    def __le__(self, other):
+        return self.sort_key() <= other.sort_key()
+
+    def __gt__(self, other):
+        return self.sort_key() > other.sort_key()
+
+    def __ge__(self, other):
+        return self.sort_key() >= other.sort_key()
+
+    def __add__(self, other):
+        return Interval(self.months + other.months, self.days + other.days, self.micros + other.micros)
+
+    def __sub__(self, other):
+        return Interval(self.months - other.months, self.days - other.days, self.micros - other.micros)
+
+    def __neg__(self):
+        return Interval(-self.months, -self.days, -self.micros)
+
+    def scale(self, factor):
+        """Multiplied by a number; fractions of months and days carry down, as in PostgreSQL."""
+        months = self.months * factor
+        whole_months = int(months)
+        days = self.days * factor + (months - whole_months) * 30
+        whole_days = int(days)
+        micros = round(self.micros * factor + (days - whole_days) * _MICROS_PER_DAY)
+        return Interval(whole_months, whole_days, micros)
+
+    def __str__(self):
+        parts = []
+        years, months = divmod(abs(self.months), 12)
+        sign = "-" if self.months < 0 else ""
+        if years:
+            parts.append(f"{sign}{years} year{'s' if years != 1 else ''}")
+        if months:
+            parts.append(f"{sign}{months} mon{'s' if months != 1 else ''}")
+        if self.days:
+            parts.append(f"{self.days} day{'s' if abs(self.days) != 1 else ''}")
+        if self.micros or not parts:
+            micros = abs(self.micros)
+            hours, rest = divmod(micros, 3_600_000_000)
+            minutes, rest = divmod(rest, 60_000_000)
+            seconds, fraction = divmod(rest, 1_000_000)
+            clock = f"{'-' if self.micros < 0 else ''}{hours:02d}:{minutes:02d}:{seconds:02d}"
+            parts.append(clock + (f".{fraction:06d}".rstrip("0") if fraction else ""))
+        return " ".join(parts)
+
 
 
 @dataclass(frozen=True, slots=True)
