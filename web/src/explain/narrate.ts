@@ -11,8 +11,11 @@ export interface Line {
 }
 
 function accessPath(nodes: PlanNode[]): Line | null {
-  const scan = nodes.find((n) => ["IndexScan", "IndexOnlyScan", "TableScan"].includes(n.operator));
-  if (!scan) return null;
+  const found = nodes.find((n) => ["IndexScan", "IndexOnlyScan", "TableScan"].includes(n.operator.replace(/Backward$/, "")));
+  if (!found) return null;
+  const backward = found.operator.endsWith("Backward");
+  // A backward scan reads the same way, from the last key down; describe it like the forward one.
+  const scan = backward ? { ...found, operator: found.operator.replace(/Backward$/, ""), label: found.label.replace(/^(\w+)Backward /, "$1 ") } : found;
   const actual = scan.rows ?? 0;
   const estimate = scan.est_rows;
   const guess =
@@ -48,6 +51,20 @@ function rewrites(nodes: PlanNode[]): Line[] {
       tone: "plan",
       text: `A subquery was rewritten into a ${semi.label.includes("ANTI") ? "anti" : "semi"} join.`,
       why: "The inner table is read once and hashed, instead of the subquery running again for every outer row.",
+    });
+  }
+  const merges = nodes.filter((n) => n.operator === "MergeJoin").length;
+  if (merges) {
+    lines.push({
+      tone: "plan",
+      text: `${plural(merges, "merge join")} walked two already-sorted inputs side by side.`,
+      why: "When both sides arrive in join-key order, matching needs no hash table: only the rows of the current key are held.",
+    });
+  }
+  if (nodes.some((n) => n.operator.endsWith("Backward"))) {
+    lines.push({
+      tone: "plan",
+      text: "A scan walked its B+tree backwards, so rows came out in descending order without a Sort.",
     });
   }
   const hashJoins = nodes.filter((n) => n.label.startsWith("HashJoin INNER") || n.label.startsWith("HashJoin LEFT")).length;

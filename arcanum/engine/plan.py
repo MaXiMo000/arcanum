@@ -27,6 +27,7 @@ class TableScan:
     table: object  # catalog.TableSchema
     columns: list
     reads: tuple | None = None  # columns read above the scan, once mark_index_only has run
+    reverse: bool = False  # in descending key order (rows come out in primary key order either way)
 
 
 @dataclass(eq=False)
@@ -50,6 +51,7 @@ class IndexScan:
     points: list | None = None
     index_only: bool = False
     uncovered: tuple = ()  # columns read above the scan that the index entries lack
+    reverse: bool = False  # walk the index backwards: descending key order
 
     @property
     def key_columns(self):
@@ -100,6 +102,7 @@ class Join:
     right_keys: list
     residual: object
     columns: list
+    method: str = "hash"  # or "merge": both inputs arrive sorted on the keys (chosen by the optimizer)
 
 
 @dataclass(eq=False)
@@ -215,7 +218,7 @@ def describe(node):
     if isinstance(node, OneRow):
         return "OneRow"
     if isinstance(node, TableScan):
-        return f"TableScan {node.table.name}"
+        return f"{operator(node)} {node.table.name}"
     if isinstance(node, IndexScan):
         names = [node.table.columns[i].name for i in node.key_columns]
         conditions = [f"{names[i]} = {format_expr(v)}" for i, v in enumerate(node.eq)]
@@ -241,7 +244,7 @@ def describe(node):
     if isinstance(node, Join):
         if node.left_keys:
             on = ", ".join(f"{format_expr(a)} = {format_expr(b)}" for a, b in zip(node.left_keys, node.right_keys, strict=True))
-            text = f"HashJoin {node.kind} on {on}"
+            text = f"{'MergeJoin' if node.method == 'merge' else 'HashJoin'} {node.kind} on {on}"
         else:
             text = f"NestedLoopJoin {node.kind}"
         return text + (f" filter {format_expr(node.residual)}" if node.residual is not None else "")
@@ -273,9 +276,10 @@ def describe(node):
 
 def operator(node):
     """The operator's name; an IndexScan that never reads the table is an IndexOnlyScan."""
-    if isinstance(node, IndexScan) and node.index_only:
-        return "IndexOnlyScan"
-    return type(node).__name__
+    name = "IndexOnlyScan" if isinstance(node, IndexScan) and node.index_only else type(node).__name__
+    if isinstance(node, Join) and node.method == "merge":
+        return "MergeJoin"
+    return name + ("Backward" if getattr(node, "reverse", False) else "")
 
 
 def plan_tree(plan, stats=None, ids=None):

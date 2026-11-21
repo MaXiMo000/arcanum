@@ -38,7 +38,7 @@ export interface Advice {
 
 /** One decision the optimizer recorded while planning (arcanum/engine/optimizer.py). */
 export interface PlannerDecision {
-  phase: "rewrite" | "pushdown" | "access" | "join" | "index-only";
+  phase: "rewrite" | "pushdown" | "access" | "join" | "order" | "index-only";
   title: string;
   detail: string;
   /** The plan node it produced, if it survived into the final plan. */

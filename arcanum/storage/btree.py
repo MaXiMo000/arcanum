@@ -132,6 +132,27 @@ class BTree:
                 return
             node, i = self._load(node.next_leaf), 0
 
+    def scan_reverse(self, lo=None, hi=None, hi_inclusive=False):
+        """Yield (key, value) pairs in descending key order between the optional bounds (lo inclusive).
+
+        Leaves are only linked forwards, so this walks the tree depth first,
+        visiting the children that can hold keys in range from the last to the first.
+        """
+        stack = [self.root]
+        while stack:
+            node = self._load(stack.pop())
+            if node.leaf:
+                for key, value in zip(reversed(node.keys), reversed(node.values), strict=True):
+                    if hi is not None and (key > hi or (key == hi and not hi_inclusive)):
+                        continue
+                    if lo is not None and key < lo:
+                        return
+                    yield key, value
+                continue
+            first = 0 if lo is None else bisect_right(node.keys, lo)
+            last = len(node.children) - 1 if hi is None else bisect_right(node.keys, hi)
+            stack.extend(node.children[first:last + 1])  # popped from the end: the highest child first
+
     def last_key(self):
         """The largest key, or None if the tree is empty."""
         node = self._load(self.root)

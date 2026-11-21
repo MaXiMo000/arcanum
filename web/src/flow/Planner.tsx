@@ -40,6 +40,12 @@ const PHASES: Phase[] = [
     empty: "Fewer than two tables in an inner join: nothing to order.",
   },
   {
+    id: "order",
+    title: "Use sort order",
+    postgres: "pathkeys: a path already sorted the way ORDER BY or a merge join needs makes the Sort unnecessary",
+    empty: "No Sort to save and no join whose inputs were both already sorted.",
+  },
+  {
     id: "index-only",
     title: "Check for index-only scans",
     postgres: "Index Only Scan when the index covers every column read",

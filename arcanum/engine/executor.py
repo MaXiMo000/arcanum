@@ -399,7 +399,7 @@ def _one_row(plan, ctx, outer):
 
 
 def _table_scan(plan, ctx, outer):
-    for _, row in ctx.catalog.scan(plan.table, ctx.snapshot):
+    for _, row in ctx.catalog.scan(plan.table, ctx.snapshot, plan.reverse):
         yield row
 
 
@@ -409,7 +409,7 @@ def _index_scan(plan, ctx, outer):
 
 
 # Byte strings that sort just after a prefix's matches: every encoded value starts with a tag
-# byte from 0x01 to 0x04, so no key continues a prefix with 0xFF, and a NULL is exactly 0x01.
+# byte far below 0xFF (see codec.py), so no key continues a prefix with 0xFF, and a NULL is exactly 0x01.
 _AFTER_ALL = b"\xff"
 _AFTER_NULL = b"\x01\xff"
 
@@ -432,9 +432,9 @@ def index_scan_pairs(plan, ctx, outer=()):
     if plan.points is not None:
         # One point lookup per distinct non-NULL value, in key order so the rows come out sorted.
         keys = {encode([*eq, v]) for v in (value(e, position) for e in plan.points) if v is not None}
-        for key in sorted(keys):
+        for key in sorted(keys, reverse=plan.reverse):
             yield from ctx.catalog.scan_range(plan.table, plan.index, ctx.snapshot, key, key + _AFTER_ALL,
-                                              index_only=plan.index_only)
+                                              index_only=plan.index_only, reverse=plan.reverse)
         return
     lo, hi, hi_inclusive = prefix or None, (prefix + _AFTER_ALL) if prefix else None, False
     if plan.lo is not None:
@@ -449,7 +449,8 @@ def index_scan_pairs(plan, ctx, outer=()):
         if v is None:
             return
         hi = encode([*eq, v]) + (_AFTER_ALL if plan.hi[1] else b"")
-    yield from ctx.catalog.scan_range(plan.table, plan.index, ctx.snapshot, lo, hi, hi_inclusive, plan.index_only)
+    yield from ctx.catalog.scan_range(plan.table, plan.index, ctx.snapshot, lo, hi, hi_inclusive, plan.index_only,
+                                      plan.reverse)
 
 
 def _work_table_scan(plan, ctx, outer):
@@ -482,6 +483,9 @@ def _join(plan, ctx, outer):
     streams. RIGHT and FULL joins remember which right rows found a partner.
     SEMI and ANTI joins emit each left row at most once, without right columns.
     """
+    if plan.method == "merge":
+        yield from _merge_join(plan, ctx, outer)
+        return
     right_rows = []
     for row in run(plan.right, ctx, outer):
         ctx.hold()
@@ -591,6 +595,41 @@ def _accumulate(accs, specs, row, outer, ctx):
             acc.add(value, [f(row, outer) for f in order])
         else:
             acc.add(value)
+
+
+def _merge_join(plan, ctx, outer):
+    """Both inputs arrive sorted on the join keys (the optimizer checked): walk them side by side,
+    keeping only the right rows of the current key in memory. INNER and LEFT joins."""
+    left_keys = [ctx.compile(k) for k in plan.left_keys]
+    right_keys = [ctx.compile(k) for k in plan.right_keys]
+    residual = ctx.compile(plan.residual) if plan.residual is not None else None
+    missing = (None,) * len(plan.right.columns)
+    right = run(plan.right, ctx, outer)
+    pending = next(right, None)
+    group_key, group = None, []
+    for left in run(plan.left, ctx, outer):
+        key = tuple(f(left, outer) for f in left_keys)
+        if None not in key and key != group_key:
+            group_key, group = key, []
+            while pending is not None:
+                other = tuple(f(pending, outer) for f in right_keys)
+                if None in other or other < key:
+                    pending = next(right, None)
+                elif other == key:
+                    ctx.hold()
+                    group.append(pending)
+                    pending = next(right, None)
+                else:
+                    break
+        matched = False
+        if None not in key:
+            for r in group:
+                row = left + r
+                if residual is None or residual(row, outer) is True:
+                    matched = True
+                    yield row
+        if not matched and plan.kind == "LEFT":
+            yield left + missing
 
 
 def _lateral_join(plan, ctx, outer):

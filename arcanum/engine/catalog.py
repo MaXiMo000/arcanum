@@ -526,13 +526,14 @@ class Catalog:
             self.ssi.saw(sx, versions, -1, table.name, key)
         return None
 
-    def scan(self, table, snapshot):
-        """Yield (key, row) for every row the snapshot sees, in primary key order."""
+    def scan(self, table, snapshot, reverse=False):
+        """Yield (key, row) for every row the snapshot sees, in primary key order (descending if reverse)."""
         len(table.columns)
         sx = self.ssi.reader(snapshot)
         if sx is not None:
             self.ssi.read(sx, table.name)
-        for key, value in self.btree(table.root).scan():
+        tree = self.btree(table.root)
+        for key, value in tree.scan_reverse() if reverse else tree.scan():
             row = self._visible(table, self._versions(table, value), snapshot, sx, key)
             if row is not None:
                 yield key, self._typed(table, row)
@@ -544,7 +545,8 @@ class Catalog:
             for _, _, row in self._versions(table, value):
                 yield key, row
 
-    def scan_range(self, table, index, snapshot, lo=None, hi=None, hi_inclusive=False, index_only=False):
+    def scan_range(self, table, index, snapshot, lo=None, hi=None, hi_inclusive=False, index_only=False,
+                   reverse=False):
         """Yield (table key, row) for rows whose key in `index` (None = primary key) is in [lo, hi).
 
         An index entry may belong to any version of its row, so each match is
@@ -559,8 +561,13 @@ class Catalog:
         if sx is not None:
             # A key range is remembered as read; a secondary index range, more coarsely, as the whole table.
             self.ssi.read(sx, table.name, *((lo, hi, hi_inclusive) if index is None else ()))
+        def walk(tree):
+            if reverse:
+                return tree.scan_reverse(lo, hi, hi_inclusive)
+            return tree.scan(lo, hi, hi_inclusive=hi_inclusive)
+
         if index is None:
-            for key, value in self.btree(table.root).scan(lo, hi, hi_inclusive=hi_inclusive):
+            for key, value in walk(self.btree(table.root)):
                 row = self._visible(table, self._versions(table, value), snapshot, sx, key)
                 if row is not None:
                     yield key, self._typed(table, row)
@@ -568,7 +575,7 @@ class Catalog:
         tree, size = self.btree(table.root), len(index.columns)
         positions = [*index.columns, *table.primary_key]
         all_visible = not self.unsettled.get(table.name)
-        for entry, _ in self.btree(index.root).scan(lo, hi, hi_inclusive=hi_inclusive):
+        for entry, _ in walk(self.btree(index.root)):
             values = decode(entry)
             key = encode(values[size:])  # an index entry ends with the row's table key
             if index_only and all_visible:

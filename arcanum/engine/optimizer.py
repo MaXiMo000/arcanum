@@ -20,7 +20,14 @@ Passes, in order:
    programming over subsets of tables (the System R approach), choosing the
    order and the hash-build side with the lowest estimated cost. A projection
    restores the original column order.
-5. Index-only scans. A scan through a secondary index whose entries already
+5. Sort order. Every node knows the order its rows come out in: a table or
+   index scan in key order (forwards or backwards), a hash or merge join in its
+   left input's order. A Sort whose input already arrives in the order asked
+   for is dropped; under a LIMIT, reading an index in order can beat sorting
+   every row, because it stops after the first rows. An inner or left join
+   whose inputs both arrive sorted on the join keys becomes a merge join,
+   which keeps no hash table.
+6. Index-only scans. A scan through a secondary index whose entries already
    hold every column the query reads skips the table lookup per row
    (mark_index_only, run on the final plan).
 
@@ -96,6 +103,8 @@ class Optimizer:
                 if isinstance(scan, p.TableScan):
                     scan.reads = tuple(sorted(columns))
         result = self.reorder(self.push(plan, []))
+        self._shared = _shared_nodes(result)
+        result = self.use_order(result)
         self.annotate(result)
         self._done[id(plan)] = (plan, result)
         self.optimize_subqueries(result)
@@ -359,6 +368,111 @@ class Optimizer:
             if not preds:
                 return node
         return p.Filter(node, and_all(preds), node.columns)
+
+    # ---- 5. sort order ---------------------------------------------------------------
+
+    def use_order(self, node):
+        # In place, so the decisions noted earlier still point at nodes of the final plan.
+        _set_inputs(node, [self.use_order(child) for child in p.inputs(node)])
+        if (isinstance(node, p.Join) and node.kind in ("INNER", "LEFT") and node.left_keys and _mergeable(node)
+                and _orders_by(ordering(node.left), node.left_keys)
+                and _orders_by(ordering(node.right), node.right_keys)):
+            on = ", ".join(f"{format_expr(a)} = {format_expr(b)}" for a, b in zip(node.left_keys, node.right_keys,
+                                                                                  strict=True))
+            node.method = "merge"
+            self.note("order", f"merge join on {on}",
+                      "Both inputs already arrive sorted on the join keys, so they are walked side by side: no hash "
+                      "table, and the output keeps the left input's order.", node)
+        if isinstance(node, p.Sort) and not _satisfies(ordering(node.input), node.keys):
+            self.flip_scan(node)
+        if isinstance(node, p.Sort) and _satisfies(ordering(node.input), node.keys):
+            self.note("order", "Sort removed: " + ", ".join(format_expr(k) + (" DESC" if d else "")
+                                                             for k, d, _ in node.keys),
+                      "Its input already arrives in that order (" + _order_source(node.input) + "), so sorting "
+                      "would change nothing.", node.input)
+            return node.input
+        if isinstance(node, p.Limit) and isinstance(node.input, p.Sort) and node.limit is not None:
+            ordered = self.ordered_path(node.input, node.limit + node.offset)
+            if ordered is not None:
+                node.input = ordered
+        return node
+
+    def flip_scan(self, sort):
+        """Scan the other way when that gives the Sort's order (ORDER BY id DESC over a range of ids)."""
+        chain, scan = [sort.input], sort.input
+        while isinstance(scan, (p.Project, p.Filter)):
+            scan = scan.input
+            chain.append(scan)
+        if not isinstance(scan, (p.TableScan, p.IndexScan)) or any(id(n) in self._shared for n in chain):
+            return
+        scan.reverse = not scan.reverse
+        if not _satisfies(ordering(sort.input), sort.keys):
+            scan.reverse = not scan.reverse
+
+    def ordered_path(self, sort, needed):
+        """Under LIMIT: the Sort's input rebuilt over an index read in the sort order, if stopping after
+        `needed` rows that way is estimated to cost less than reading and sorting everything."""
+        chain, scan = [], sort.input
+        while isinstance(scan, (p.Project, p.Filter)):
+            chain.append(scan)
+            scan = scan.input
+        if not isinstance(scan, (p.TableScan, p.IndexScan)):
+            return None
+        table, wanted = scan.table, []
+        for key, desc, nulls_first in sort.keys:
+            if not isinstance(key, Col):
+                return None
+            position = key.index
+            for node in chain:
+                if isinstance(node, p.Project):
+                    e = node.exprs[position]
+                    if not isinstance(e, Col):
+                        return None
+                    position = e.index
+            wanted.append((position, desc, desc if nulls_first is None else nulls_first))
+        desc = wanted[0][1]
+        if any(d != desc for _, d, _ in wanted):
+            return None
+        conditions = [n.predicate for n in chain if isinstance(n, p.Filter)] + _bound_conditions(scan)
+        selectivity = 1.0
+        for c in conditions:
+            for part in conjuncts(c):
+                selectivity *= self.selectivity(part, scan)
+        rows = self.table_rows(table)
+        current = self.cost(sort)
+        to_read = min(rows, needed / max(selectivity, 1e-9))
+        candidates = [{"path": "keep the plan and sort", "rows": None, "cost": current,
+                       "why": f"reads what the plan reads, then sorts every row before the first {needed:,} come out"}]
+        best = None
+        options = [(None, list(table.primary_key))]
+        options += [(i, list(i.columns) + [c for c in table.primary_key if c not in i.columns]) for i in table.indexes]
+        for index, keys in options:
+            if [c for c, _, _ in wanted] != keys[:len(wanted)]:
+                continue
+            nullable = [c for c, _, _ in wanted if not (table.columns[c].not_null or c in table.primary_key)]
+            if any(first != (not desc) for c, _, first in wanted if c in nullable):
+                continue  # the index has NULLs at the other end
+            per_match = 1 if index is None else SECONDARY_LOOKUP_COST
+            cost = math.log2(rows + 2) + to_read * per_match
+            name = f"Index Scan{' Backward' if desc else ''} using {index.name if index else table.name + '_pkey'}"
+            candidates.append({"path": name, "rows": to_read, "cost": cost,
+                               "why": f"reads in order and stops after ~{to_read:,.0f} rows (LIMIT {needed:,})"})
+            if cost < current and (best is None or cost < best[0]):
+                best = (cost, index, name)
+        if best is None:
+            return None
+        for candidate in candidates:
+            candidate["chosen"] = candidate["path"] == best[2]
+        node = p.IndexScan(table, best[1], [], None, None, scan.columns, reverse=desc)
+        if conditions:
+            node = p.Filter(node, and_all(conditions), node.columns)
+        for wrapper in reversed(chain):
+            if isinstance(wrapper, p.Project):
+                node = replace(wrapper, input=node)
+        self.note("order", f"LIMIT {needed:,}: read {best[2].split(' using ')[1]} in order instead of sorting",
+                  "The first rows in index order are the first rows the query wants, so the scan can stop early "
+                  "instead of reading and sorting every row.", node, candidates)
+        return node
 
     # ---- 3. access paths -------------------------------------------------------------
 
@@ -1025,3 +1139,134 @@ def _function_rows(node):
         start, stop, step = args[0].value, args[1].value, args[2].value if len(args) > 2 else 1
         return float(max((stop - start) // step + 1, 1)) if step else 1.0
     return 10.0  # a guess, as the planner cannot see inside an array or a document before running
+
+
+# ---- sort order ---------------------------------------------------------------------------------
+
+_MERGEABLE = {"INTEGER", "REAL", "NUMERIC", "TEXT", "DATE", "TIMESTAMP", "BOOLEAN"}
+
+
+def ordering(node):
+    """The order a node's rows come out in: ([(column, descending, where NULLs are)], constant columns).
+    NULLs are "first", "last", or "none" when the column cannot be NULL."""
+    if isinstance(node, p.TableScan):
+        return [(i, node.reverse, "none") for i in node.table.primary_key], set()
+    if isinstance(node, p.IndexScan):
+        table = node.table
+        keys = list(node.key_columns)
+        if node.index is not None:
+            keys += [c for c in table.primary_key if c not in keys]  # entries end with the row's key
+        entries = []
+        for position, column in enumerate(keys[len(node.eq):], len(node.eq)):
+            bounded = position == len(node.eq) and (node.lo or node.hi or node.points is not None)
+            not_null = bounded or table.columns[column].not_null or column in table.primary_key
+            entries.append((column, node.reverse, "none" if not_null else "last" if node.reverse else "first"))
+        return entries, set(keys[:len(node.eq)])
+    if isinstance(node, (p.Filter, p.Limit)):
+        return ordering(node.input)
+    if isinstance(node, p.Project):
+        entries, constants = ordering(node.input)
+        where = {}
+        for j, e in enumerate(node.exprs):
+            if isinstance(e, Col):
+                where.setdefault(e.index, j)
+        out = []
+        for column, desc, nulls in entries:
+            if column not in where:
+                break
+            out.append((where[column], desc, nulls))
+        return out, {where[c] for c in constants if c in where}
+    if isinstance(node, p.Sort):
+        out = []
+        for key, desc, nulls_first in node.keys:
+            if not isinstance(key, Col):
+                break
+            out.append((key.index, desc, "first" if (desc if nulls_first is None else nulls_first) else "last"))
+        return out, set()
+    if isinstance(node, (p.Join, p.LateralJoin)) and node.kind in ("INNER", "LEFT", "SEMI", "ANTI"):
+        return ordering(node.left)  # the left input streams; matches come out in its order
+    return [], set()
+
+
+def _satisfies(order, keys):
+    """Whether rows in `order` are already sorted as the Sort keys ask."""
+    entries, constants = order
+    i = 0
+    for key, desc, nulls_first in keys:
+        if not isinstance(key, Col):
+            return False
+        if key.index in constants:
+            continue  # one value throughout
+        if i >= len(entries):
+            return False
+        column, entry_desc, nulls = entries[i]
+        want_first = desc if nulls_first is None else nulls_first
+        if column != key.index or entry_desc != desc or (nulls != "none" and (nulls == "first") != want_first):
+            return False
+        i += 1
+    return True
+
+
+def _orders_by(order, keys):
+    entries, _ = order
+    return (len(entries) >= len(keys) and all(isinstance(k, Col) for k in keys)
+            and all(e[0] == k.index and not e[1] for e, k in zip(entries, keys, strict=False)))
+
+
+def _mergeable(node):
+    return all(a.type == b.type and a.type in _MERGEABLE for a, b in zip(node.left_keys, node.right_keys, strict=True))
+
+
+def _order_source(node):
+    while isinstance(node, (p.Filter, p.Project, p.Limit)):
+        node = node.input
+    if isinstance(node, (p.TableScan, p.IndexScan)):
+        using = node.index.name if getattr(node, "index", None) is not None else f"{node.table.name}'s primary key"
+        return f"{'backwards ' if node.reverse else ''}through {using}"
+    if isinstance(node, p.Join):
+        return "a join that keeps its left input's order"
+    return "an earlier sort"
+
+
+def _shared_nodes(plan):
+    """ids of plan nodes reachable along more than one path (a CTE read twice): not to be changed in place."""
+    seen, shared, stack = set(), set(), [plan]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            shared.add(id(node))
+            continue
+        seen.add(id(node))
+        stack.extend(p.inputs(node))
+    return shared
+
+
+def _set_inputs(node, children):
+    if isinstance(node, (p.Join, p.SetOp, p.LateralJoin)):
+        node.left, node.right = children
+    elif isinstance(node, p.RecursiveCTE):
+        node.anchor, node.recursive = children
+    elif children:
+        node.input = children[0]
+
+
+def _bound_conditions(scan):
+    """An IndexScan's bounds as conditions again (for rebuilding the scan another way)."""
+    if not isinstance(scan, p.IndexScan):
+        return []
+    table, keys, out = scan.table, scan.key_columns, []
+
+    def col(position):
+        c = table.columns[keys[position]]
+        return Col(keys[position], c.type, c.name)
+
+    for position, value in enumerate(scan.eq):
+        out.append(Op("=", (col(position), value), BOOLEAN))
+    position = len(scan.eq)
+    if scan.lo is not None:
+        out.append(Op(">=" if scan.lo[1] else ">", (col(position), scan.lo[0]), BOOLEAN))
+    if scan.hi is not None:
+        out.append(Op("<=" if scan.hi[1] else "<", (col(position), scan.hi[0]), BOOLEAN))
+    if scan.points is not None:
+        out.append(Op("IN", (col(position), *scan.points), BOOLEAN))
+    return out

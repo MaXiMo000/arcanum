@@ -179,7 +179,21 @@ The binder's plan is correct but naive; the optimizer rewrites it into a cheaper
    `UPDATE` and `DELETE` find their rows the same way.
 4. **Join ordering.** A cluster of inner joins is re-planned by dynamic programming over subsets of
    tables (the System R approach), choosing the order and each hash join's build side by estimated cost.
-5. **Index-only scans.** Before choosing access paths the optimizer works out which columns each
+5. **Sort order.** Every node knows the order its rows come out in:
+   - A table or index scan comes out in key order, forwards or backwards. The B+tree can be walked from
+     its last key down.
+   - A hash or merge join keeps its left input's order.
+
+   What this gives:
+   - A `Sort` whose input already arrives in the requested order is removed, and a scan is turned
+     around when that gives the order (`ORDER BY id DESC`).
+   - NULL placement is respected. An index keeps NULLs first, so `ORDER BY x` still sorts unless `x`
+     cannot be NULL or the query says `NULLS FIRST`.
+   - Under `LIMIT`, reading an index in order and stopping after the first rows can beat reading and
+     sorting every row. The choice is costed.
+   - An inner or left join whose inputs both arrive sorted on the join keys becomes a merge join: no hash
+     table, only the rows of the current key held.
+6. **Index-only scans.** Before choosing access paths the optimizer works out which columns each
    table must produce. An index whose entries hold all of them (an entry is the index columns plus the
    primary key) is costed without the table lookup per match, and the scan builds its rows from the
    index alone: `IndexOnlyScan` in `EXPLAIN`.
@@ -194,7 +208,8 @@ pairs them all. Every plan node carries its estimated rows and cost.
 with planning and execution time. Subquery rewrites (and why a subquery stayed a per-row SubPlan),
 conditions pushed below joins and aggregates, equalities turned into hash keys, every access path costed
 for each table (a sequential scan, each usable index with its estimated rows and cost, and each index that
-could not be used and why), the join orders considered with their costs, and the index-only check. Each
+could not be used and why), the join orders considered with their costs, sorts removed and merge joins chosen, and the index-only
+check. Each
 decision points at the plan node it produced.
 
 ## Query advisor and error doctor
@@ -619,8 +634,6 @@ Arcanum aims to be the clearest way to see how a database works from the inside.
 - **Replication**: a Raft-replicated log across three engines, with leader election, network partitions
   and catch-up you can trigger.
 - **Buffer pool policies**: LRU, Clock and 2Q on the same workload, with their hit rates over time.
-- **Merge join and sort-order awareness**: indexes that satisfy `ORDER BY`, and startup costs so
-  `LIMIT` can prefer plans that produce their first rows early.
 - **More advisor rules**: unused and duplicate indexes, an index advisor over a whole workload, and
   rewrites for `OR` across indexed columns.
 - **Classroom mode**: a teacher's statements appear live on every student's screen, and CSV import.

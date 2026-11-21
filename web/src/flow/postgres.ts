@@ -33,6 +33,8 @@ const ABOUT = {
   index: "Descends the index B+tree to the first matching key and walks its leaves. Each match then costs a second descent into the table to fetch the row.",
   pkey: "Descends the table's own B+tree (keyed by the primary key) to the first match and walks the leaf chain while keys match.",
   indexOnly: "Every column the query needs is in the index entries (index columns plus the primary key), so rows are built from the index alone: the table is never read.",
+  mergeJoin: "Both inputs already arrive sorted on the join key, so it walks them side by side: no hash table, and only the rows of the current key are held.",
+  backward: "Walks the B+tree from its last key to its first, so rows come out in descending order and no Sort is needed.",
   hashJoin: "Builds a hash table from its second input (the Hash node), then probes it once per row of the first: linear in both inputs.",
   semi: "Hashes the second input once, then keeps each row of the first that has a match (Anti: that has none). A rewritten EXISTS / IN subquery runs as this.",
   lateral: "Runs its right side once per row of its left side, which that side may read (LATERAL): a correlated subquery or a function over each row.",
@@ -56,21 +58,28 @@ const strip = (text: string) => (text.startsWith("(") && text.endsWith(")") ? te
 
 function scan(node: PlanNode): Omit<PgNode, "key" | "ids" | "rows" | "est" | "cost" | "ms" | "children" | "subplan"> | null {
   const label = node.label;
-  if (node.operator === "TableScan") {
-    const table = label.replace(/^TableScan /, "");
-    return { name: `Seq Scan on ${table}`, family: "scan", relation: table, details: [], about: ABOUT.seq };
+  if (node.operator === "TableScan" || node.operator === "TableScanBackward") {
+    const backward = node.operator === "TableScanBackward";
+    const table = label.replace(/^TableScan(Backward)? /, "");
+    return {
+      name: backward ? `Seq Scan Backward on ${table}` : `Seq Scan on ${table}`,
+      family: "scan",
+      relation: table,
+      details: backward ? [["Order", "descending primary key"]] : [],
+      about: backward ? ABOUT.backward : ABOUT.seq,
+    };
   }
-  const m = /^(IndexScan|IndexOnlyScan) (\S+) using (.+?) \((.*)\)$/.exec(label);
+  const m = /^(IndexScan|IndexOnlyScan)(Backward)? (\S+) using (.+?) \((.*)\)$/.exec(label);
   if (m) {
-    const [, op, table, using, cond] = m;
+    const [, op, backward, table, using, cond] = m;
     const index = using === "primary key" ? `${table}_pkey` : using!;
     const only = op === "IndexOnlyScan";
     return {
-      name: `${only ? "Index Only Scan" : "Index Scan"} using ${index} on ${table}`,
+      name: `${only ? "Index Only Scan" : "Index Scan"}${backward ? " Backward" : ""} using ${index} on ${table}`,
       family: "index",
       relation: table!,
-      details: [["Index Cond", strip(cond!)]],
-      about: only ? ABOUT.indexOnly : using === "primary key" ? ABOUT.pkey : ABOUT.index,
+      details: cond ? [["Index Cond", strip(cond)]] : [["Order", "every entry, in index order"]],
+      about: backward ? ABOUT.backward : only ? ABOUT.indexOnly : using === "primary key" ? ABOUT.pkey : ABOUT.index,
     };
   }
   if (node.operator === "WorkTableScan") {
@@ -135,6 +144,13 @@ export function toPostgres(root: PlanNode, spilled = false): PgNode {
         const inner = convert(child);
         inner.ids.push(node.id);
         return withSubplans(inner, node);
+      }
+      case "MergeJoin": {
+        const [, kind = "INNER", ...rest] = node.label.split(" ");
+        const [cond, filter] = rest.join(" ").replace(/^on /, "").split(" filter ");
+        const details: [string, string][] = [["Merge Cond", strip(cond!)]];
+        if (filter) details.push(["Join Filter", strip(filter)]);
+        return withSubplans(make(node, { name: `Merge ${JOIN_WORD[kind] ?? ""}Join`, family: "join", relation: null, details, about: ABOUT.mergeJoin, children: kids() }), node);
       }
       case "Join": {
         const [word = "", kind = "INNER", ...rest] = node.label.split(" ");

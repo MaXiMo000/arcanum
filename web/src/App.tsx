@@ -69,8 +69,8 @@ function treeRead(results: QueryResult[]): string | null {
     const stack = result.plan ? [result.plan] : [];
     while (stack.length) {
       const node = stack.shift()!;
-      if (node.operator === "TableScan") return node.label.replace(/^TableScan /, "");
-      const m = /^(?:IndexScan|IndexOnlyScan) (\S+) using (.+?) \(/.exec(node.label);
+      if (node.operator.startsWith("TableScan")) return node.label.replace(/^TableScan(Backward)? /, "");
+      const m = /^(?:IndexScan|IndexOnlyScan)(?:Backward)? (\S+) using (.+?) \(/.exec(node.label);
       if (m) return m[2] === "primary key" ? m[1]! : m[2]!;
       stack.push(...node.children);
     }
