@@ -136,6 +136,10 @@ CORPUS = [
     ("SELECT id, CAST(salary AS INTEGER), CAST(hired AS TEXT), CAST('42' AS INTEGER) + 1 FROM emp", False),
     ("SELECT id FROM emp WHERE active", False),
     ("SELECT id, active, active IS NULL, NOT active FROM emp WHERE active = FALSE OR active IS NULL", False),
+    ("SELECT id, active IS TRUE, active IS NOT TRUE, active IS FALSE, active IS NOT FALSE FROM emp", False),
+    ("SELECT id FROM emp WHERE (salary > 100) IS NOT TRUE", False),
+    ("SELECT id, dept IS DISTINCT FROM 'eng', manager_id IS NOT DISTINCT FROM NULL FROM emp", False),
+    ("SELECT e.id, m.id FROM emp e JOIN emp m ON e.dept IS NOT DISTINCT FROM m.dept WHERE e.id < m.id", False),
     ("SELECT 1 + 2 * 3, 7 / 2, -7 / 2, 7 % -3, -7 % 3, 'a' || 'b', NULL + 1, 2.5 * 2", True),
     # sorting and limits
     ("SELECT id, name FROM emp ORDER BY id DESC LIMIT 5", True),

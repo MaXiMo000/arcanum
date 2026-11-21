@@ -230,6 +230,13 @@ export interface EngineState {
   /** SERIALIZABLE transactions the engine still tracks: running, or committed but overlapping one that is. */
   serializable: { xid: number; session: string; committed: boolean; reads: string[] }[];
   dependencies: Dependency[];
+  indexes: IndexReport;
+}
+
+/** The advisor across statements (Database.index_report). */
+export interface IndexReport {
+  indexes: { name: string; table: string; columns: string; unique: boolean; scans: number; redundant: string | null }[];
+  suggestions: { sql: string; label: string; statements: number; examples: string[] }[];
 }
 
 export interface EngineEvent {

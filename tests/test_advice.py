@@ -94,6 +94,47 @@ def test_hints_point_at_plan_nodes_and_unanalyzed_tables_get_analyze(tmp_path):
         assert found["analyze"]["node"] in ids
 
 
+def test_a_redundant_index_is_pointed_out_and_unique_ones_are_left_alone(db):
+    assert hints(db, "CREATE INDEX t_ab ON t (a, b)")["redundant-index"]["fix"]["sql"] == "DROP INDEX t_a"
+    assert hints(db, "CREATE INDEX t_a2 ON t (a)")["redundant-index"]["title"].startswith("t_a2 repeats what index t_ab")
+    assert hints(db, "CREATE INDEX t_id ON t (id)")["redundant-index"]["fix"]["sql"] == "DROP INDEX t_id"
+    assert "redundant-index" not in hints(db, "CREATE UNIQUE INDEX t_b ON t (b)")
+    assert "redundant-index" not in hints(db, "CREATE INDEX u_note ON u (note)")
+
+
+def test_or_across_two_indexes_is_rewritten_as_union_all(db):
+    db.execute("CREATE INDEX t_c ON t (c)")
+    db.execute("INSERT INTO t VALUES (5000, NULL, 'n', 3.0)")  # a NULL on one side must not hide or repeat the row
+    sql = "SELECT id, b FROM t WHERE a = 7 OR c = 3.0;"
+    hint = hints(db, sql)["or-indexes"]
+    rewritten = hint["fix"]["sql"]
+    assert rewritten.count("UNION ALL") == 1 and "(a = 7) IS NOT TRUE" in rewritten
+    assert sorted(db.execute(rewritten).rows) == sorted(db.execute(sql).rows)
+    plan = "\n".join(r[0] for r in db.execute("EXPLAIN " + rewritten).rows)
+    assert "using t_a" in plan and "using t_c" in plan and "TableScan" not in plan
+    three = "SELECT id FROM t WHERE a = 7 OR c = 3.0 OR id = 4"
+    assert sorted(db.execute(hints(db, three)["or-indexes"]["fix"]["sql"]).rows) == sorted(db.execute(three).rows)
+    # Explained, but not rewritten, where splitting the text would change the meaning or is not simple.
+    assert hints(db, "SELECT id FROM t WHERE a = 7 OR c = 3.0 ORDER BY id")["or-indexes"]["fix"] is None
+    assert "or-indexes" not in hints(db, "SELECT id FROM t WHERE a = 7 OR a = 9")  # one column: an IN list
+    assert "or-indexes" not in hints(db, "SELECT id FROM t WHERE a = 7 OR b = 'x9'")  # b has no index
+
+
+def test_the_index_report_follows_the_workload(db):
+    for i in range(3):
+        db.execute(f"SELECT id, b FROM t WHERE b = 'x{i}'", trace=True)
+    db.execute("SELECT id FROM t WHERE a = 3", trace=True)
+    report = db.index_report()
+    (suggestion,) = report["suggestions"]
+    assert suggestion["sql"] == "CREATE INDEX t_b ON t (b)" and suggestion["statements"] == 3
+    assert len(suggestion["examples"]) == 3
+    assert {i["name"]: i["scans"] for i in report["indexes"]} == {"t_a": 1}
+    db.execute(suggestion["sql"])
+    assert db.index_report()["suggestions"] == []  # it exists now
+    db.execute("CREATE INDEX t_a_b ON t (a, b)")
+    assert {i["name"]: i["redundant"] for i in db.index_report()["indexes"]}["t_a"] == "index t_a_b (a, b)"
+
+
 def test_untraced_statements_carry_no_advice(db):
     assert db.execute("SELECT * FROM t WHERE b = NULL").advice == []
 

@@ -39,6 +39,7 @@ const VIEW_KEY = "arcanum.view.v2"; // v2: the engine map became the default vie
 const MODE_KEY = "arcanum.mode";
 const INTRO_KEY = "arcanum.intro-seen";
 const EXPLAIN_PREFIX = /^\s*EXPLAIN\s+(ANALYZE\s+)?/i;
+const SCHEMA_CHANGE = /^\s*(CREATE|DROP|ALTER)\b/i; // a fix for one of these runs once, with no before/after
 const WAIT_POLL_MS = 400; // how often a waiting statement's ticket is checked
 
 // The 3D view (three.js) is a separate download, fetched the first time someone opens it.
@@ -294,6 +295,10 @@ export default function App() {
       const statement = result.statement.replace(EXPLAIN_PREFIX, "");
       setMeasuring(true);
       try {
+        if (SCHEMA_CHANGE.test(statement)) {
+          await runQuery(fix.sql, "advisor"); // a fix for a schema change (DROP INDEX): nothing to re-run and compare
+          return;
+        }
         const before = await runQuery(statement, "advisor");
         if (!before) return;
         let after: Outcome | null;
@@ -315,6 +320,8 @@ export default function App() {
     },
     [runQuery, judge],
   );
+
+  const runReported = useCallback((sql: string) => void runQuery(sql, "advisor"), [runQuery]);
 
   /** Apply the doctor's fix: correct the editor, then run what is left of the script. */
   const fixError = useCallback(
@@ -487,6 +494,8 @@ export default function App() {
           onSkip={skip}
           comparison={comparison}
           onApply={applyFix}
+          onRun={runReported}
+          report={state?.indexes ?? null}
           onFix={fixError}
           busy={!state || measuring || crashOpen}
         />

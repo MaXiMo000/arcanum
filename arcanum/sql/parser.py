@@ -888,8 +888,15 @@ class _Parser:
                     left = n.Binary(op, left, self.concat(), pos)
             elif self.accept_kw("IS"):
                 negated = bool(self.accept_kw("NOT"))
-                self.expect_kw("NULL")
-                left = n.IsNull(left, negated)
+                if word := self.accept_kw("TRUE", "FALSE"):
+                    left = n.IsDistinct(left, n.Literal(word == "TRUE"), not negated)
+                elif self.accept_kw("DISTINCT"):
+                    self.expect_kw("FROM")
+                    left = n.IsDistinct(left, self.concat(), negated)
+                else:
+                    if not self.accept_kw("UNKNOWN"):  # IS UNKNOWN: the boolean spelling of IS NULL
+                        self.expect_kw("NULL")
+                    left = n.IsNull(left, negated)
             else:
                 negated = self.is_kw("NOT") and self.is_kw("IN", "BETWEEN", "LIKE", "ILIKE", tok=self.peek())
                 if negated:

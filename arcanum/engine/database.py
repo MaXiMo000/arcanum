@@ -9,7 +9,7 @@ from ..sql import nodes as n
 from ..sql.parser import parse_statements
 from ..storage import Pager
 from ..values import Jsonb
-from .advisor import advise
+from .advisor import Workload, advise
 from .binder import Binder
 from .catalog import Catalog
 from .ddl import Alter
@@ -76,6 +76,7 @@ class Database:
         self.ssi = self.catalog.ssi = SSI(
             self.mvcc, lambda table, key: self.catalog._describe(self.catalog.tables[table], key), self.events.emit)
         self.connections = {}
+        self.workload = Workload()  # what the advisor saw across statements, for index_report()
         self.exclusive = None  # the session whose open transaction changed the schema; others wait for it
         self._snapshot = None  # what the running statement sees
         self._deadline = None  # when the running statement times out (time.monotonic()), if it can
@@ -99,6 +100,11 @@ class Database:
     def in_transaction(self):
         """Whether the default session has a transaction open."""
         return self._main.in_transaction
+
+    def index_report(self):
+        """Every index with its scans since the database was opened and whether another index makes it
+        redundant, and the indexes the advisor suggested across traced statements (advisor.Workload)."""
+        return self.workload.report(self.catalog)
 
     def connect(self, name=None):
         """A new session on this database, with its own transactions."""
@@ -343,7 +349,8 @@ class Database:
             if statement.name in self.catalog.indexes and statement.if_not_exists:
                 return Result(status="CREATE INDEX")
             self.catalog.create_index(statement, text)
-            return Result(status="CREATE INDEX")
+            result = Result(status="CREATE INDEX")
+            return self._traced(result, statement, text) if trace else result
         if isinstance(statement, n.CreateView):
             return self._create_view(binder, statement, text)
         if isinstance(statement, n.AlterTable):
@@ -414,6 +421,7 @@ class Database:
             result.planner = [{**d, "node": ids.get(id(d["node"])) if d["node"] is not None else None}
                               for d in decisions or []]
         result.advice = advise(statement, text, self.catalog, plan, stats, ids, self.limits)
+        self.workload.record(result.advice, text)
         return result
 
     def _context(self, analyze=False):

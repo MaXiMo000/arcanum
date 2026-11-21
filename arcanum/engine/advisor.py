@@ -22,6 +22,8 @@ import re
 from dataclasses import fields, is_dataclass, replace
 
 from ..sql import nodes as n
+from ..sql.lexer import tokenize
+from ..sql.parser import parse_statements
 from . import plan as p
 from .catalog import IndexSchema
 from .expr import (
@@ -49,6 +51,7 @@ MIN_LOOKUPS = 10  # rows fetched through an index before a covering index pays o
 MAX_COVERING_EXTRA = 2  # columns a covering index may add to an existing one
 LARGE_OFFSET = 1000
 STALE_STATS = 2  # table rows changed by this factor since ANALYZE
+WORKLOAD_EXAMPLES = 3  # statements kept per suggested index, to show what it would help
 
 _LEVELS = ("warn", "tip", "good")
 _TESTS = {"=", "<", "<=", ">", ">=", "IN"}
@@ -59,8 +62,8 @@ _BARE_UNION = re.compile(r"(?i)\bUNION\b(?!\s+ALL\b)")
 def advise(statement, text, catalog, plan=None, stats=None, ids=None, limits=None):
     """Hints for one statement. plan is the optimized plan (if any), stats the
     executor's {id(node): [rows, seconds]} trace, ids maps id(node) to plan_tree ids."""
-    advisor = _Advisor(catalog, stats, ids or {}, text, limits)
     query = statement.statement if isinstance(statement, n.Explain) else statement
+    advisor = _Advisor(catalog, stats, ids or {}, text, limits, query)
     advisor.statement(query)
     if plan is not None:
         advisor.plan(plan, _selects_star(query))
@@ -68,8 +71,9 @@ def advise(statement, text, catalog, plan=None, stats=None, ids=None, limits=Non
 
 
 class _Advisor:
-    def __init__(self, catalog, stats, ids, text, limits):
+    def __init__(self, catalog, stats, ids, text, limits, query):
         self.catalog, self.stats, self.ids, self.text, self.limits = catalog, stats, ids, text, limits
+        self.query = query
         self.hints, self.seen = [], set()
 
     def add(self, level, code, title, detail, node=None, fix=None, estimate=None):
@@ -91,6 +95,8 @@ class _Advisor:
     # ---- the statement as written ------------------------------------------------------
 
     def statement(self, statement):
+        if isinstance(statement, n.CreateIndex):
+            self.created_index(statement.name)
         if isinstance(statement, (n.Update, n.Delete)) and statement.where is None:
             verb = "UPDATE" if isinstance(statement, n.Update) else "DELETE"
             self.add("warn", "no-where", f"{verb} without WHERE changes every row of {statement.table}",
@@ -121,6 +127,20 @@ class _Advisor:
                 self.add("tip", "union-distinct", "UNION removes duplicates, which costs a pass over every row",
                          "If the two sides cannot overlap, or duplicates are fine, UNION ALL returns the same rows "
                          "without hashing them all.", fix=self.rewrite(fixed, "Use UNION ALL") if fixed != self.text else None)
+
+    def created_index(self, name):
+        for index, covered_by in redundant_indexes(self.catalog):
+            columns = _index_columns(self.catalog, index)
+            if index.name == name:
+                self.add("tip", "redundant-index", f"{name} repeats what {covered_by} already does",
+                         f"Every lookup on ({columns}) can use {covered_by}, which starts with the same columns. "
+                         "A second index only adds work to every INSERT, UPDATE and DELETE, and pages to the pool.",
+                         fix={"kind": "run", "sql": f"DROP INDEX {name}", "label": f"Drop {name}"})
+            elif covered_by.startswith(f"index {name} "):
+                self.add("tip", "redundant-index", f"{index.name} is now redundant",
+                         f"{name} starts with the same columns ({columns}), so it serves every lookup "
+                         f"{index.name} did. Dropping {index.name} saves maintaining two trees on every write.",
+                         fix={"kind": "run", "sql": f"DROP INDEX {index.name}", "label": f"Drop {index.name}"})
 
     # ---- the plan ------------------------------------------------------------------------
 
@@ -164,14 +184,16 @@ class _Advisor:
                 self.add("tip", "hidden-column", f"{format_expr(c)} hides {name} inside an expression",
                          f"An index on {name} stores {name} itself, not an expression of it. Keep the column bare "
                          f"on one side (move the arithmetic to the constant) so an index can match.", node)
+        share = f"{kept:,} of {total:,} rows ({kept / total:.1%})" if total else f"{kept:,} rows"
         if kept > total * SELECTIVE:
             return
+        for c in conjuncts(node.predicate):
+            if isinstance(c, Op) and c.op == "OR":
+                self.or_across_indexes(node, table, c, share)
         wanted = list(dict.fromkeys(equal)) + [c for c in dict.fromkeys(ranged) if c not in equal][:1]
         if not wanted:
             return
-        leading = {index.columns[0] for index in table.indexes} | set(table.primary_key[:1])
-        share = f"{kept:,} of {total:,} rows ({kept / total:.1%})" if total else f"{kept:,} rows"
-        if any(c in leading for c in wanted):
+        if any(c in _leading_columns(table) for c in wanted):
             if table.stats is None:
                 self.add("tip", "analyze", f"{table.name} has an index the optimizer did not trust",
                          f"The scan kept {share}, but without statistics the optimizer guessed far more and "
@@ -197,6 +219,19 @@ class _Advisor:
                  f"({', '.join(names)}) lets the engine descend the B+tree straight to the matching rows.{how}", node,
                  {"kind": "run", "sql": f"CREATE INDEX {index} ON {table.name} ({', '.join(names)})",
                   "label": f"Create index on {table.name} ({', '.join(names)})"}, estimate)
+
+    def or_across_indexes(self, node, table, condition, share):
+        branches = _disjuncts(condition)
+        columns = [_column_test(b)[0] for b in branches]
+        if None in columns or len(set(columns)) < 2 or not set(columns) <= _leading_columns(table):
+            return
+        names = [table.columns[c].name for c in dict.fromkeys(columns)]
+        sql = _union_rewrite(self.query, self.text, len(branches))
+        self.add("tip", "or-indexes", f"OR across {' and '.join(names)} read all of {table.name} to keep {share}",
+                 "Each side of the OR has an index, but one index scan cannot serve both, so every row was read. "
+                 "Written as one SELECT per side joined by UNION ALL, each part descends its own index. Later "
+                 "parts add (earlier conditions) IS NOT TRUE, so no row comes back twice, NULLs included.",
+                 node, self.rewrite(sql, "Split into UNION ALL") if sql else None)
 
     def stale_stats(self, scan):
         stats = scan.table.stats
@@ -291,7 +326,122 @@ class _Advisor:
         return name
 
 
+# ---- across statements ---------------------------------------------------------------------------
+
+
+class Workload:
+    """What the advisor saw across many statements: which indexes would have helped, and how often."""
+
+    def __init__(self):
+        self.suggestions = {}  # CREATE INDEX statement -> {"sql", "label", "statements", "examples"}
+
+    def record(self, hints, text):
+        for hint in hints:
+            if hint["code"] == "missing-index" and hint["fix"]:
+                entry = self.suggestions.setdefault(hint["fix"]["sql"], {
+                    "sql": hint["fix"]["sql"], "label": hint["fix"]["label"], "statements": 0, "examples": []})
+                entry["statements"] += 1
+                example = " ".join(text.split())
+                if len(entry["examples"]) < WORKLOAD_EXAMPLES and example not in entry["examples"]:
+                    entry["examples"].append(example)
+
+    def report(self, catalog):
+        """Every index with its scans since the database was opened and what makes it redundant, if
+        anything; and the suggested indexes that do not exist yet, the most useful first."""
+        redundant = {index.name: covered_by for index, covered_by in redundant_indexes(catalog)}
+        indexes = [{"name": index.name, "table": index.table, "columns": _index_columns(catalog, index),
+                    "unique": index.unique, "scans": catalog.index_scans[index.name],
+                    "redundant": redundant.get(index.name)}
+                   for table in catalog.tables.values() for index in table.indexes]
+        existing = {(index.table, tuple(index.columns)) for index in catalog.indexes.values()}
+        suggestions = []
+        for entry in self.suggestions.values():
+            create = parse_statements(entry["sql"])[0][0]
+            table = catalog.tables.get(create.table)
+            if table is None or any(table.column(c) is None for c in create.columns):
+                continue  # the table or a column has gone since
+            if (table.name, tuple(table.column(c) for c in create.columns)) not in existing:
+                suggestions.append(entry)
+        suggestions.sort(key=lambda e: -e["statements"])
+        return {"indexes": indexes, "suggestions": suggestions}
+
+
+def redundant_indexes(catalog):
+    """[(index, what covers it)]: non-unique indexes whose columns begin the primary key or another index,
+    which serves every lookup they could. Of two identical indexes, the later by name is reported."""
+    out = []
+    for table in catalog.tables.values():
+        for index in table.indexes:
+            if index.unique:
+                continue  # it enforces a constraint, not only speeds up lookups
+            k = len(index.columns)
+            if table.primary_key[:k] == index.columns:
+                names = ", ".join(table.columns[c].name for c in table.primary_key)
+                out.append((index, f"the primary key ({names})"))
+                continue
+            for other in sorted(table.indexes, key=lambda o: -len(o.columns)):  # the widest cover first
+                if other is not index and other.columns[:k] == index.columns and (
+                        len(other.columns) > k or other.unique or other.name < index.name):
+                    out.append((index, f"index {other.name} ({_index_columns(catalog, other)})"))
+                    break
+    return out
+
+
 # ---- helpers ---------------------------------------------------------------------------------
+
+
+def _index_columns(catalog, index):
+    table = catalog.tables[index.table]
+    return ", ".join(table.columns[c].name for c in index.columns)
+
+
+def _leading_columns(table):
+    """Columns an index (or the primary key) can find rows by on its own."""
+    return {index.columns[0] for index in table.indexes} | set(table.primary_key[:1])
+
+
+def _disjuncts(e):
+    if isinstance(e, Op) and e.op == "OR":
+        return [x for arg in e.args for x in _disjuncts(arg)]
+    return [e]
+
+
+_STOPS = {"group", "order", "limit", "offset", "having", "window", "union", "intersect", "except", "fetch", "and",
+          "join", "returning"}
+
+
+def _union_rewrite(query, text, branches):
+    """A single-table SELECT whose whole WHERE is `a OR b ...`, as one SELECT per branch joined by UNION ALL,
+    or None when the statement is anything more complicated."""
+    if not (isinstance(query, n.Query) and isinstance(query.body, n.Select) and query.with_ is None
+            and not query.order_by and query.limit is None and query.offset is None):
+        return None
+    select = query.body
+    if select.group_by or select.having is not None or select.distinct or not isinstance(select.from_, n.TableRef):
+        return None
+    text = text.strip().rstrip(";").rstrip()
+    depth, where, cuts = 0, None, []
+    for token in tokenize(text):
+        if token.kind == "op" and token.value in ("(", ")"):
+            depth += 1 if token.value == "(" else -1
+        elif token.kind == "word" and depth == 0:
+            word = token.value.lower()
+            if word in _STOPS and where is not None:
+                return None
+            if word == "where":
+                where = token
+            elif word == "or" and where is not None:
+                cuts.append(token)
+    if where is None or len(cuts) + 1 != branches:
+        return None
+    head = text[:where.pos].rstrip()
+    starts = [where.pos + len("where"), *(cut.pos + len("or") for cut in cuts)]
+    ends = [cut.pos for cut in cuts] + [len(text)]
+    parts = [text[a:b].strip() for a, b in zip(starts, ends, strict=True)]
+    selects = [f"{head} WHERE {part}" if i == 0 else f"{head} WHERE ({part}) AND ({' OR '.join(parts[:i])}) IS NOT TRUE"
+               for i, part in enumerate(parts)]
+    return "\nUNION ALL\n".join(selects)
+
 
 
 def _what_if(scan, preds, columns, name):

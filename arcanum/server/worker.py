@@ -503,7 +503,8 @@ def _state(db, message, jobs):
         "pool_size": pager.pool_size, "cached": [{"page": p, "dirty": d} for p, d in pager.cached_pages()],
         "free": pager.free_pages(), "stats": dict(pager.stats)},
         "wal": {"committed_frames": pager.wal.committed_frames, "uncommitted": pager.wal.has_uncommitted},
-        "in_transaction": db.connections[SESSIONS[0]].in_transaction, **_mvcc_state(db), "waits": jobs.waits()}
+        "in_transaction": db.connections[SESSIONS[0]].in_transaction, **_mvcc_state(db), "waits": jobs.waits(),
+        "indexes": db.index_report()}
 
 
 def _mvcc_state(db):

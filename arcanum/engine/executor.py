@@ -255,6 +255,14 @@ def _compile(e, ctx):
         (fa,) = fns
         want_null = op == "ISNULL"
         return lambda row, outer: (fa(row, outer) is None) == want_null
+    if op in ("DISTINCT", "NOTDISTINCT"):
+        fa, fb = fns
+        want = op == "DISTINCT"
+
+        def distinct(row, outer):
+            a, b = fa(row, outer), fb(row, outer)
+            return (a != b if a is not None and b is not None else (a is None) != (b is None)) == want
+        return distinct
     if op == "IN":
         return _compile_in(e, fns)
     if op == "CASE":
@@ -438,6 +446,8 @@ _AFTER_NULL = b"\x01\xff"
 def index_scan_pairs(plan, ctx, outer=()):
     """Yield (table key, row) for an IndexScan by turning its bounds into an encoded key range."""
     types = [plan.table.columns[i].type for i in plan.key_columns]
+    if plan.index is not None:
+        ctx.catalog.index_scans[plan.index.name] += 1
 
     def value(expr, position):
         v = ctx.compile(expr)((), outer)

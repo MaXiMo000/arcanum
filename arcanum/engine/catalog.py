@@ -169,6 +169,7 @@ class Catalog:
         self.tree = BTree(pager, CATALOG_ROOT)
         self.mvcc = None  # the TransactionManager, set by the Database
         self.unsettled = {}  # table name -> keys of rows that may hold versions other than one frozen one
+        self.index_scans = Counter()  # index name -> scans run through it since the database was opened
         self.reload()
 
     def reload(self):
@@ -346,6 +347,7 @@ class Catalog:
             if pos in positions:
                 raise SqlError(f"column {name} appears twice in index {stmt.name}")
             positions.append(pos)
+        self.index_scans.pop(stmt.name, None)  # a new index under an old name starts uncounted
         index = IndexSchema(stmt.name, table.name, positions, stmt.unique,
                             BTree.create(self.pager, self.max_keys).root, sql)
         for key, row in list(self.versions(table)):

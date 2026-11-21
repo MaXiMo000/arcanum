@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { Advisor, healthScore, type Comparison } from "../advisor/Advisor";
-import type { AdviceFix, QueryResult } from "../api";
+import { IndexReport } from "../advisor/IndexReport";
+import type { AdviceFix, IndexReport as Report, QueryResult } from "../api";
 import { Explain } from "../explain/Explain";
 import { QueryFlow } from "../flow/QueryFlow";
 import type { FeedState } from "../feed";
@@ -27,6 +28,9 @@ interface Props {
   onSkip: () => void;
   comparison: Comparison | null;
   onApply: (fix: AdviceFix, result: QueryResult) => Promise<void>;
+  /** Run one statement the index report suggests. */
+  onRun: (sql: string) => void;
+  report: Report | null;
   onFix: (fixed: string, rerun: string) => void;
   busy: boolean;
 }
@@ -61,7 +65,12 @@ export function Inspector(props: Props) {
       );
       break;
     case "advisor":
-      body = errorBox || <Advisor outcome={outcome} comparison={props.comparison} onApply={props.onApply} busy={props.busy} />;
+      body = errorBox || (
+        <>
+          <Advisor outcome={outcome} comparison={props.comparison} onApply={props.onApply} busy={props.busy} />
+          {props.report && <IndexReport report={props.report} onRun={props.onRun} busy={props.busy} />}
+        </>
+      );
       break;
     case "events":
       body = <EventLog log={feed.log} counters={feed.counters} pending={pending} onSkip={onSkip} />;

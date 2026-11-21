@@ -141,6 +141,7 @@ class Op:
 
     AND OR = != < <= > >= + - * / % ||   two arguments
     NOT NEG ISNULL NOTNULL CAST           one argument (CAST converts to `type`)
+    DISTINCT NOTDISTINCT                  IS [NOT] DISTINCT FROM: two arguments, NULL equal to NULL
     LIKE                                  value, pattern
     IN                                    value, then the list items
     CASE                                  cond1, result1, cond2, result2, ..., else
@@ -303,6 +304,11 @@ def format_expr(e):
         return f"-{args[0]}"
     if e.op in ("ISNULL", "NOTNULL"):
         return f"{args[0]} IS {'NOT ' if e.op == 'NOTNULL' else ''}NULL"
+    if e.op in ("DISTINCT", "NOTDISTINCT"):
+        right = e.args[1]
+        if isinstance(right, Const) and isinstance(right.value, bool):  # spelled IS [NOT] TRUE / FALSE
+            return f"{args[0]} IS {'NOT ' if e.op == 'DISTINCT' else ''}{'TRUE' if right.value else 'FALSE'}"
+        return f"{args[0]} IS {'NOT ' if e.op == 'NOTDISTINCT' else ''}DISTINCT FROM {args[1]}"
     if e.op == "IN":
         return f"{args[0]} IN ({', '.join(args[1:])})"
     if e.op == "CAST":

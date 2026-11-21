@@ -53,6 +53,15 @@ class IsNull:
 
 
 @dataclass(slots=True)
+class IsDistinct:
+    """left IS [NOT] DISTINCT FROM right: a comparison where NULL equals NULL (x IS TRUE is x IS NOT
+    DISTINCT FROM TRUE)."""
+    left: object
+    right: object
+    negated: bool = False  # IS NOT DISTINCT FROM
+
+
+@dataclass(slots=True)
 class Between:
     expr: object
     low: object

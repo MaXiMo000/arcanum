@@ -123,7 +123,7 @@ with Database("company.db") as db:
     `jsonb_array_length`, `jsonb_extract_path[_text]`, `jsonb_strip_nulls` and `jsonb_pretty`, with
     `json_*` spellings.
 - Other: `coalesce`, `ifnull`, `nullif`, `greatest` and `least`; `CASE`, `CAST`, `BETWEEN`, `IN`,
-  `IS [NOT] NULL` and `||`.
+  `IS [NOT] NULL`, `IS [NOT] TRUE / FALSE / UNKNOWN`, `IS [NOT] DISTINCT FROM` and `||`.
 - `SAVEPOINT`, `ROLLBACK TO SAVEPOINT` and `RELEASE SAVEPOINT`
 - `BEGIN [ISOLATION LEVEL READ COMMITTED | REPEATABLE READ | SERIALIZABLE]`, `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]`,
   `ANALYZE [table]`
@@ -228,6 +228,8 @@ remedy is clear, a fix: a statement to run first or the statement rewritten.
 | Estimates far from the actual rows, or statistics out of date | `ANALYZE` |
 | `= NULL` / `!= NULL` | rewritten to `IS [NOT] NULL` |
 | `UNION` where `UNION ALL` may do | rewritten |
+| `a = x OR b = y` where `a` and `b` each lead an index, read with a full scan | rewritten as one `SELECT` per branch joined by `UNION ALL`, each adding `(earlier branches) IS NOT TRUE` so no row repeats and NULLs are handled; each part then uses its own index |
+| `CREATE INDEX` whose columns begin another index or the primary key, or that makes an existing index redundant | `DROP INDEX` (unique indexes are never suggested: they enforce a constraint) |
 | Cartesian products, non-equality nested loops, correlated subqueries that still run per row, a column hidden inside an expression, leading-wildcard `LIKE`, `NOT IN (subquery)` and its NULL trap, `HAVING` without aggregates, large `OFFSET`, sorts that spill, `UPDATE` / `DELETE` without `WHERE` | explained |
 
 A failed statement gets a diagnosis from the error doctor (`engine/doctor.py`): misspelled tables,
@@ -236,6 +238,10 @@ trailing comma, `==`, unclosed quotes and parentheses, a missing `FROM`, curly q
 document, a column missing from `GROUP BY`. It returns a plain explanation, the characters at fault and,
 when the intent is clear, the corrected SQL. In a script, the statements before the failing one have
 already run, so the server also returns what to run now: the corrected script from the failing statement on.
+
+Across statements, `Database.index_report()` lists every index with the scans that used it since the
+database was opened and what makes it redundant, if anything, and the indexes the advisor suggested,
+ranked by how many statements each would have helped, with examples. Suggestions that now exist drop out.
 
 `ANALYZE` collects the statistics behind the estimates: row counts, distinct values, NULL counts,
 most common values and equi-depth histograms. `EXPLAIN` shows the estimated rows of every operator and
@@ -450,7 +456,8 @@ The inspector explains every statement:
     better), each with the PostgreSQL step it corresponds to.
   - **EXPLAIN**: the plan printed as `EXPLAIN ANALYZE` would print it, with planning and execution time.
 - **Advisor**: a health grade and the findings above. One click applies a fix and measures the statement
-  before and after: pages read, tree nodes visited, time and access path.
+  before and after: pages read, tree nodes visited, time and access path. Below, the index report for the
+  whole session: indexes the workload keeps asking for, and unused or redundant ones to drop.
 - **Doctor**: on an error, the explanation, the change as a diff, and a button that applies it and runs.
 - Results, the page map, the write-ahead log and the raw event stream.
 
@@ -702,7 +709,5 @@ tests/
 
 Arcanum aims to be the clearest way to see how a database works from the inside. Next:
 
-- **More advisor rules**: unused and duplicate indexes, an index advisor over a whole workload, and
-  rewrites for `OR` across indexed columns.
 - **Classroom mode**: a teacher's statements appear live on every student's screen, and CSV import.
 - **Benchmarks**: a TPC-H-style dataset generator and a mode that charts a query's cost as the data grows.

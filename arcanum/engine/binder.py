@@ -929,6 +929,10 @@ class Binder:
     def _bind_IsNull(self, level, node):
         return Op("NOTNULL" if node.negated else "ISNULL", (self.expr(level, node.expr),), BOOLEAN)
 
+    def _bind_IsDistinct(self, level, node):
+        left, right, _ = self.comparable(self.expr(level, node.left), self.expr(level, node.right), node)
+        return Op("NOTDISTINCT" if node.negated else "DISTINCT", (left, right), BOOLEAN)
+
     def _bind_Between(self, level, node):
         e, low, high = (self.expr(level, x) for x in (node.expr, node.low, node.high))
         e, low, _ = self.comparable(e, low, node.low)
