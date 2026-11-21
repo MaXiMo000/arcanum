@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { ApiError, type ImportRequest, type SessionName, type SessionTxn, type TableInfo } from "../api";
 import { formatValue } from "../format";
-import { EXAMPLES } from "../examples";
+import { EXAMPLE_GROUPS, EXAMPLES } from "../examples";
 import { CHALLENGES } from "./challenges";
 import { Editor } from "./Editor";
 import { ImportCsv } from "./ImportCsv";
@@ -128,13 +128,18 @@ export function PlayPanel(props: Props) {
         />
       )}
       <h3 className="section-title">Try one</h3>
-      <div className="examples" role="group" aria-label="Example queries">
-        {EXAMPLES.map((example) => (
-          <button key={example.label} className="chip" aria-label={example.label} title={example.hint} onClick={() => onSql(example.sql)}>
-            {example.label}
-          </button>
-        ))}
-      </div>
+      {EXAMPLE_GROUPS.map((group) => (
+        <div key={group} className="example-group" role="group" aria-label={`Example queries: ${group}`}>
+          <span className="example-group-name">{group}</span>
+          <div className="examples">
+            {EXAMPLES.filter((e) => e.group === group).map((example) => (
+              <button key={example.label} className="chip" title={example.hint} onClick={() => onSql(example.sql)}>
+                {example.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
       <div className="section-row">
         <h3 className="section-title">
           Challenges <span className="muted">{done}/{CHALLENGES.length}</span>

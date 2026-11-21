@@ -135,6 +135,13 @@ def test_the_index_report_follows_the_workload(db):
     assert {i["name"]: i["redundant"] for i in db.index_report()["indexes"]}["t_a"] == "index t_a_b (a, b)"
 
 
+def test_stale_statistics_come_from_growth_not_from_scans_that_stop_early(db):
+    assert "stale-stats" not in hints(db, "SELECT id FROM t ORDER BY id DESC LIMIT 5")  # read 5 of 2,000 rows
+    db.execute("INSERT INTO t SELECT n, n % 50, 'y' || n, n * 1.5 FROM generate_series(2001, 5000) AS n")
+    hint = hints(db, "SELECT count(*) FROM t WHERE c > 0")["stale-stats"]
+    assert hint["fix"]["sql"] == "ANALYZE t" and "2,000" in hint["detail"] and "5,000" in hint["detail"]
+
+
 def test_untraced_statements_carry_no_advice(db):
     assert db.execute("SELECT * FROM t WHERE b = NULL").advice == []
 

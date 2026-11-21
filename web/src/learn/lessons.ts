@@ -2,7 +2,7 @@
 // engine actually did (pages read, nodes visited, splits, log frames...) before moving on.
 // Text wrapped in `backticks` is shown as code.
 import type { SessionName } from "../api";
-import { advised, explainText, findTree, pagesRead, planHas, plural, treeLevels, type CheckContext } from "./outcome";
+import { advised, explainText, findTree, pagesRead, planHas, planNodes, plural, treeLevels, type CheckContext } from "./outcome";
 
 export type InspectorTab = "explain" | "results" | "flow" | "advisor" | "pages" | "log" | "events";
 
@@ -252,6 +252,201 @@ WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.status = '
     ],
   },
   {
+    id: "joins",
+    title: "How joins pair rows",
+    summary: "Hash join, merge join and nested loop: three ways to match rows, and when each wins.",
+    minutes: 5,
+    steps: [
+      {
+        id: "hash",
+        title: "Hash join",
+        body: [
+          "Match each expensive order with its customer. The engine builds a hash table from one side, keyed by the join column, then streams the other side through it: each row finds its partners with one lookup.",
+          "Open the Plan tab: the HashJoin has two inputs, and each table is read exactly once.",
+        ],
+        sql: `SELECT c.name, o.amount
+FROM customers c JOIN orders o ON o.customer_id = c.id
+WHERE o.amount > 400;`,
+        focus: "flow",
+        check: (ctx) => planHas(ctx.outcome, "HashJoin"),
+        success: (ctx) =>
+          `${plural(rows(ctx), "pair")} from one pass over each table. A nested loop would have compared every customer with every order.`,
+        hint: "The optimizer picked another join for your data. Look at the Plan tab to see which, and why: the planner explains each choice.",
+      },
+      {
+        id: "merge",
+        title: "Merge join",
+        body: [
+          "Now join on the two primary keys. Both tables are B+trees keyed by `id`, so both already come out sorted by the join column.",
+          "Two sorted inputs can be zipped together like two sorted lists: no hash table, no memory, one step forward at a time.",
+        ],
+        sql: "SELECT c.id, c.name, o.amount FROM customers c JOIN orders o ON o.id = c.id;",
+        focus: "flow",
+        check: (ctx) => planHas(ctx.outcome, "MergeJoin"),
+        success: () =>
+          "A MergeJoin: both scans already deliver rows in id order, so the engine walks them side by side. Sorted order is a resource the optimizer tracks; it also lets it drop a Sort for ORDER BY.",
+        hint: "No merge join this time; the Plan tab shows what the optimizer did instead and the planner says why.",
+      },
+      {
+        id: "loop",
+        title: "Nested loop",
+        body: [
+          "A join condition without equality cannot be hashed or merged: here an order matches a customer when its amount is more than twenty times the customer's id.",
+          "The only way is a nested loop: for each row of one side, test every row of the other.",
+        ],
+        sql: `SELECT c.name, o.amount
+FROM customers c JOIN orders o ON o.amount > c.id * 20
+WHERE c.id < 3;`,
+        focus: "flow",
+        check: (ctx) => planHas(ctx.outcome, "NestedLoopJoin"),
+        success: (ctx) =>
+          `A NestedLoopJoin produced ${plural(rows(ctx), "pair")}. It is cheap here because the outer side has only two customers (an index found them); on two large tables it compares every row with every row.`,
+      },
+      {
+        id: "anti",
+        title: "Anti join",
+        body: [
+          "Which customers have no order over 450? `NOT EXISTS` reads like a subquery per customer, but the optimizer turns it into a join that keeps only the rows with no partner.",
+        ],
+        sql: `SELECT name FROM customers c
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 450);`,
+        focus: "flow",
+        check: (ctx) => planHas(ctx.outcome, "ANTI"),
+        success: (ctx) =>
+          `A HashJoin ANTI returned ${plural(rows(ctx), "customer")}: the big orders are hashed once, and a customer passes only if it finds nothing in the hash table. EXISTS becomes a SEMI join the same way.`,
+      },
+    ],
+  },
+  {
+    id: "grouping",
+    title: "Grouping, sorting and windows",
+    summary: "Hash aggregation, sorts the optimizer can skip, and window functions that keep every row.",
+    minutes: 4,
+    steps: [
+      {
+        id: "aggregate",
+        title: "Group with a hash table",
+        body: [
+          "Total the orders per city. The engine keeps one running total per group in a hash table, so it reads the rows once in any order.",
+          "`HAVING` then filters whole groups, after they are built.",
+        ],
+        sql: `SELECT city, count(*) AS orders, round(sum(amount), 2) AS total
+FROM customers c JOIN orders o ON o.customer_id = c.id
+GROUP BY city HAVING count(*) > 10;`,
+        focus: "flow",
+        check: (ctx) => planHas(ctx.outcome, "HashAggregate"),
+        success: (ctx) =>
+          `A HashAggregate folded the orders into ${plural(rows(ctx), "group")}; the Filter above it is the HAVING clause, applied to groups, not rows.`,
+      },
+      {
+        id: "sort",
+        title: "A sort the engine must do",
+        body: [
+          "The five largest orders. Nothing stores orders by amount, so the engine reads them all and sorts.",
+          "With a LIMIT, the sort only has to keep the best five as it goes: a top-N sort.",
+        ],
+        sql: "SELECT id, amount FROM orders ORDER BY amount DESC LIMIT 5;",
+        focus: "flow",
+        check: (ctx) => planHas(ctx.outcome, "Sort"),
+        success: () => "A Sort over every order, cut to five by the Limit above it.",
+        hint: "Your database has an index on amount (from the indexes lesson), so the engine read it in order instead of sorting. That is the next step's point.",
+      },
+      {
+        id: "backward",
+        title: "A sort the engine can skip",
+        body: [
+          "The five newest orders by id. The table's B+tree is already sorted by id, and its leaves link both ways, so the engine can read it backwards from the end and stop after five rows.",
+        ],
+        sql: "SELECT id, amount FROM orders ORDER BY id DESC LIMIT 5;",
+        focus: "flow",
+        check: (ctx) => planHas(ctx.outcome, "Backward") && !planHas(ctx.outcome, "Sort"),
+        success: (ctx) =>
+          `No Sort at all: a backward scan read ${plural(pagesRead(stat(ctx)), "page")} and stopped. ORDER BY on an indexed column with a LIMIT costs almost nothing.`,
+      },
+      {
+        id: "window",
+        title: "Window functions keep every row",
+        body: [
+          "Rank customers within their city, newest first. Unlike GROUP BY, a window function adds a value to each row instead of folding rows together.",
+        ],
+        sql: `SELECT name, city, rank() OVER (PARTITION BY city ORDER BY id DESC) AS newest
+FROM customers ORDER BY city, newest;`,
+        focus: "results",
+        check: (ctx) => planHas(ctx.outcome, "Window") && rows(ctx) > 4,
+        success: (ctx) =>
+          `${plural(rows(ctx), "row")}, each with its rank inside its city. The Window operator sorts by city and id once, then numbers the rows of each partition as it passes.`,
+      },
+    ],
+  },
+  {
+    id: "statistics",
+    title: "Statistics and estimates",
+    summary: "What the optimizer guesses without ANALYZE, what it knows with it, and why plans change.",
+    minutes: 5,
+    steps: [
+      {
+        id: "skew",
+        title: "A lopsided table",
+        body: [
+          "Most visits come from Norway; one in twenty from Iceland. Create the table with an index on `country`, but do not ANALYZE it yet.",
+        ],
+        sql: `DROP TABLE IF EXISTS visits;
+CREATE TABLE visits (id INTEGER PRIMARY KEY, country TEXT, ms INTEGER);
+INSERT INTO visits SELECT n, CASE WHEN n % 20 = 0 THEN 'IS' ELSE 'NO' END, n * 7 % 900
+  FROM generate_series(1, 400) AS n;
+CREATE INDEX visits_country ON visits (country);`,
+        check: (ctx) => Boolean(findTree(ctx.state, "visits_country")),
+        success: () => "400 visits: 380 from NO, 20 from IS, and an index on country.",
+      },
+      {
+        id: "guess",
+        title: "Planning on a guess",
+        body: [
+          "Ask for the Norwegian visits. Without statistics the optimizer assumes an equality matches a small share of the table, so the index looks cheap.",
+          "Compare the estimated rows with the real ones in the Plan tab.",
+        ],
+        sql: "SELECT id, ms FROM visits WHERE country = 'NO';",
+        focus: "flow",
+        check: (ctx) => planHas(ctx.outcome, "visits_country"),
+        success: (ctx) => {
+          const scan = planNodes(ctx.outcome).find((n) => n.label.includes("visits_country"));
+          return `The optimizer expected ${Math.round(scan?.est_rows ?? 0)} rows and got ${scan?.rows ?? rows(ctx)}. Following the index for most of a table means a lookup in the table per row: more work than reading it straight through.`;
+        },
+        hint: "The table already has statistics, so the optimizer was not guessing. Run the first step again to rebuild it.",
+      },
+      {
+        id: "analyze",
+        title: "Measure the table",
+        body: [
+          "`ANALYZE` reads the table and records its row count, distinct values, NULLs, the most common values with their frequencies, and a histogram of the rest.",
+        ],
+        sql: "ANALYZE visits;",
+        check: (ctx) => ctx.outcome?.results.some((r) => r.status === "ANALYZE") ?? false,
+        success: () => "Measured. The statistics live in the catalog, inside the database file.",
+      },
+      {
+        id: "informed",
+        title: "The same query, informed",
+        body: ["Run the Norwegian query again. Nothing changed but what the optimizer knows."],
+        sql: "SELECT id, ms FROM visits WHERE country = 'NO';",
+        focus: "flow",
+        check: (ctx) => planHas(ctx.outcome, "TableScan visits"),
+        success: () =>
+          "Now it scans: the statistics say NO is 95% of the rows, so one pass over the table beats 380 index lookups. The estimate matches the real count.",
+      },
+      {
+        id: "rare",
+        title: "A rare value",
+        body: ["Same index, same query shape, a rare value."],
+        sql: "SELECT id, ms FROM visits WHERE country = 'IS';",
+        focus: "flow",
+        check: (ctx) => planHas(ctx.outcome, "visits_country"),
+        success: () =>
+          "Back to the index: IS is 5% of the rows, so jumping to them is cheaper than reading everything. The plan depends on the value, and the statistics are how the optimizer tells them apart.",
+      },
+    ],
+  },
+  {
     id: "advisor",
     title: "The query advisor",
     summary: "Let the engine critique a slow query, apply its fix, and measure the difference.",
@@ -326,6 +521,65 @@ SELECT id, ms FROM visits WHERE page = '/page-7';`,
           const first = ctx.earlier("slow");
           return `Index Only Scan: ${plural(pagesRead(stat(ctx)), "page")}, all from visits_page_ms${first ? `, down from ${pagesRead(first.stats)} for the full scan` : ""}. Next, make a typo in the playground: the doctor will spot it and offer the corrected SQL.`;
         },
+      },
+    ],
+  },
+  {
+    id: "index-design",
+    title: "Designing indexes",
+    summary: "Composite indexes, why column order matters, redundant indexes and OR across two indexes.",
+    minutes: 5,
+    steps: [
+      {
+        id: "composite",
+        title: "One index, two columns",
+        body: [
+          "An index on `(customer_id, amount)` sorts entries by customer, then by amount within each customer. It can find one customer's orders above an amount with one descent.",
+          "Watch the Advisor tab: it checks every new index against the ones you already have.",
+        ],
+        sql: "CREATE INDEX IF NOT EXISTS orders_customer_amount ON orders (customer_id, amount);",
+        focus: "advisor",
+        check: (ctx) => Boolean(findTree(ctx.state, "orders_customer_amount")),
+        success: (ctx) =>
+          advised(ctx, "redundant-index")
+            ? "Created, and the advisor noticed that orders_customer, on customer_id alone, is now redundant: the new index starts with the same column and serves every lookup the old one did. Each extra index costs work on every write."
+            : "Created. The advisor checks every new index against the existing ones; here it found nothing redundant.",
+      },
+      {
+        id: "use",
+        title: "Both columns at once",
+        body: ["One customer's orders over 100. Both conditions fit the index, and the query reads only `amount`, which is in the index too."],
+        sql: "SELECT amount FROM orders WHERE customer_id = 3 AND amount > 100;",
+        focus: "flow",
+        check: (ctx) => planHas(ctx.outcome, "orders_customer_amount"),
+        success: () =>
+          "One descent to customer 3's entries with amount over 100, and no table lookups at all: an Index Only Scan, since everything the query needs is in the index.",
+      },
+      {
+        id: "order",
+        title: "Column order matters",
+        body: [
+          "Now ask by amount alone. The index is sorted by customer first, so orders over 400 are scattered across every customer's section: the index cannot jump to them.",
+        ],
+        sql: "SELECT id, amount FROM orders WHERE amount > 400;",
+        focus: "flow",
+        check: (ctx) => !planHas(ctx.outcome, "orders_customer_amount"),
+        success: () =>
+          "The composite index is no help here. An index serves conditions on its leading columns: (customer_id, amount) answers questions about customer_id, or customer_id and amount, but not amount alone.",
+      },
+      {
+        id: "or",
+        title: "OR across two indexes",
+        body: [
+          "Orders of customer 3, or order 7. Each side has an index (customer_id leads ours, id is the primary key), but one index scan cannot serve both, so the engine reads everything.",
+          "The advisor suggests a rewrite: apply it from the Advisor tab and compare the pages read.",
+        ],
+        sql: "SELECT id, status FROM orders WHERE customer_id = 3 OR id = 7;",
+        focus: "advisor",
+        check: (ctx) => advised(ctx, "or-indexes"),
+        success: () =>
+          "The advisor offers UNION ALL: one SELECT per side, each using its own index, the second excluding rows the first already returned with IS NOT TRUE (which also handles NULLs).",
+        hint: "The table is small enough or the plan changed so the advisor stayed quiet. The idea still holds: each OR branch needs its own index scan.",
       },
     ],
   },

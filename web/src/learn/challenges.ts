@@ -106,6 +106,35 @@ export const CHALLENGES: Challenge[] = [
     check: (ctx) => ran(ctx) && ctx.outcome!.stats.rollbacks > 0 && /\bROLLBACK\b/i.test(ctx.outcome!.sql),
   },
   {
+    id: "zipper",
+    title: "Zipper",
+    goal: "Get a plan with a MergeJoin: two inputs already sorted by the join key.",
+    hint: "Join two tables on their primary keys.",
+    check: (ctx) => ran(ctx) && planHas(ctx.outcome, "MergeJoin"),
+  },
+  {
+    id: "nobody-home",
+    title: "Nobody home",
+    goal: "Find rows with no match in another table, planned as an ANTI join.",
+    hint: "WHERE NOT EXISTS (SELECT 1 FROM ... WHERE ... = outer.key).",
+    check: (ctx) => ran(ctx) && planHas(ctx.outcome, "ANTI"),
+  },
+  {
+    id: "no-sort",
+    title: "Sorted for free",
+    goal: "Return rows with ORDER BY ... DESC and LIMIT, with no Sort in the plan.",
+    hint: "Order by a column the table or an index is already sorted by.",
+    check: (ctx) =>
+      ran(ctx) && /ORDER\s+BY/i.test(ctx.outcome!.sql) && planHas(ctx.outcome, "Backward") && !planHas(ctx.outcome, "Sort"),
+  },
+  {
+    id: "split-or",
+    title: "Split the OR",
+    goal: "Apply the advisor's UNION ALL rewrite of an OR across two indexed columns.",
+    hint: "Try the \"OR → UNION ALL\" example, then apply the fix from the Advisor tab.",
+    check: (ctx) => (ctx.comparison?.after.sql.includes("UNION ALL") ?? false) && /\bOR\b/i.test(ctx.comparison?.before.sql ?? ""),
+  },
+  {
     id: "survivor",
     title: "Survivor",
     goal: "Pull the plug and lose no committed data.",

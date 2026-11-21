@@ -458,10 +458,14 @@ never a mix.
 
 Two modes share one screen: the database in the middle, an inspector on the right.
 
-- **Learn**: eleven short lessons (B+trees, growth and merges, indexes, the buffer pool, the optimizer, the
-  query advisor, two sessions at once, write skew and SERIALIZABLE, transactions, the log, crash recovery). Every step runs real SQL on your own database and
-  checks what the engine actually did (nodes visited, pages read, splits, log frames) before moving on.
-- **Play**: an editor with syntax highlighting, name completion and errors underlined, example queries,
+- **Learn**: fifteen short lessons: B+trees, growth and merges, indexes, the buffer pool, the optimizer,
+  hash, merge and nested-loop joins, grouping, sorting and windows, statistics and estimates, the query
+  advisor, designing indexes (composite, redundant, OR across two), two sessions at once, write skew and
+  SERIALIZABLE, transactions, the log and crash recovery. Every step runs real SQL on your own database
+  and checks what the engine actually did (the plan, nodes visited, pages read, splits, log frames) before
+  moving on.
+- **Play**: an editor with syntax highlighting, name completion and errors underlined, example queries
+  grouped by topic,
   and challenges judged from what the engine really did. Switch to two sessions to get a second editor on
   the same database, like two psql terminals, and watch transactions see (or not see) each other.
   **Import CSV** loads a file into a new or existing table after previewing the inferred columns.
@@ -751,5 +755,5 @@ tests/
 
 Arcanum aims to be the clearest way to see how a database works from the inside. Next:
 
-- **More lessons** on the newer parts of the engine: replacement policies, replication, the index report.
+- **Lessons for the labs**: guided tours of replacement policies, replication and scaling.
 - **Classroom extras**: a teacher's lesson steps followed in lockstep, and questions sent back to the teacher.

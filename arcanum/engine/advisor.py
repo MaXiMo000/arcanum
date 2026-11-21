@@ -238,7 +238,9 @@ class _Advisor:
         if stats is None or self.stats is None:
             return
         actual = self.rows(scan)
-        if max(actual, stats.rows) >= MIN_SCAN_PAGES * (self.catalog.max_keys or ROWS_PER_PAGE) and max(actual, stats.rows) > STALE_STATS * max(1, min(actual, stats.rows)):
+        # Only growth is evidence: a scan can stop early (LIMIT, a merge join, EXISTS), so reading fewer
+        # rows than ANALYZE counted says nothing about the table.
+        if actual >= MIN_SCAN_PAGES * (self.catalog.max_keys or ROWS_PER_PAGE) and actual > STALE_STATS * max(1, stats.rows):
             name = scan.table.name
             self.add("tip", "stale-stats", f"Statistics for {name} are out of date",
                      f"ANALYZE counted {stats.rows:,} rows; the table now has {actual:,}. The optimizer plans "
