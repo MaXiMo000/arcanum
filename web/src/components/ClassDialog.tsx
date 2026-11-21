@@ -55,7 +55,12 @@ export function ClassDialog({ room, error, onTeach, onFollow, onLeave, onClose }
   return (
     <div className="overlay" role="presentation" onClick={(e) => e.target === e.currentTarget && onClose()}>
       <div className="crash-dialog class-dialog" role="dialog" aria-modal="true" aria-labelledby="class-title" tabIndex={-1} ref={dialog}>
-        <h2 id="class-title">Classroom</h2>
+        <div className="class-dialog-head">
+          <h2 id="class-title">Classroom</h2>
+          <button className="icon-button" onClick={onClose} aria-label="Close">
+            ✕
+          </button>
+        </div>
         {error && (
           <p className="error-box small" role="alert">
             {error}
@@ -122,7 +127,7 @@ export function ClassDialog({ room, error, onTeach, onFollow, onLeave, onClose }
               <h3>Teach a class</h3>
               <p className="muted small">Get a code; what you run is shown live to everyone who joins.</p>
               <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title (optional)" maxLength={80}
-                aria-label="Class title" className="class-input" />
+                aria-label="Class title" className="class-input title" />
               <button className="button primary" disabled={busy}>
                 {busy ? "Opening…" : "Start teaching"}
               </button>

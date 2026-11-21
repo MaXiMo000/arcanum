@@ -673,6 +673,22 @@ h3 {
   letter-spacing: 0.04em;
 }
 
+.class-input.title {
+  font: 14px var(--sans);
+  letter-spacing: normal;
+}
+
+.class-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.class-dialog-head h2 {
+  margin: 0;
+}
+
 .class-code {
   margin: 14px 0 4px;
   font: 700 44px var(--mono);
