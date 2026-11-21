@@ -29,7 +29,8 @@ interface Props {
 
 const W = 640;
 const H = 220;
-const PAD = { l: 52, r: 76, t: 14, b: 30 };
+const PAD = { l: 52, r: 76, t: 14, b: 30 }; // r is the least room for the end labels
+const LABEL_CHAR = 6.6; // width of one end-label character (10.5px monospace), in viewBox units
 const LABEL_GAP = 12; // the least vertical space between two end labels
 const TICK_GAP = 28; // the least horizontal space between two x tick labels
 
@@ -63,7 +64,8 @@ export function LineChart({ title, series, xLabel, formatX, formatY, yMax, logX,
   const scale = (v: number) => (logX ? Math.log(Math.max(v, 1e-9)) : v);
   const [x0, x1] = [scale(xs[0]!), scale(xs[xs.length - 1]!)];
   const top = yMax ?? Math.max(...series.flatMap((s) => s.points.map((p) => p[1])), 1e-9);
-  const x = (v: number) => PAD.l + ((scale(v) - x0) / (x1 - x0 || 1)) * (W - PAD.l - PAD.r);
+  const right = Math.max(PAD.r, 10 + LABEL_CHAR * Math.max(...series.map((s) => s.label.length)));
+  const x = (v: number) => PAD.l + ((scale(v) - x0) / (x1 - x0 || 1)) * (W - PAD.l - right);
   const y = (v: number) => H - PAD.b - (v / top) * (H - PAD.t - PAD.b);
   const path = (s: Series) => s.points.map((p, k) => `${k ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join("");
   const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => f * top);
@@ -97,7 +99,7 @@ export function LineChart({ title, series, xLabel, formatX, formatY, yMax, logX,
           onPointerMove={onMove} onPointerLeave={() => setHover(null)}>
           {ticks.map((t) => (
             <g key={t} className="grid">
-              <line x1={PAD.l} x2={W - PAD.r} y1={y(t)} y2={y(t)} />
+              <line x1={PAD.l} x2={W - right} y1={y(t)} y2={y(t)} />
               <text x={PAD.l - 8} y={y(t) + 4} textAnchor="end">
                 {formatY(t)}
               </text>
@@ -109,14 +111,14 @@ export function LineChart({ title, series, xLabel, formatX, formatY, yMax, logX,
                 {xs[k]}
               </text>
             ))}
-          <text className="axis-label" x={(PAD.l + W - PAD.r) / 2} y={H - 4} textAnchor="middle">
+          <text className="axis-label" x={(PAD.l + W - right) / 2} y={H - 4} textAnchor="middle">
             {xLabel}
           </text>
           {mark !== undefined && <line className="mark" x1={x(mark)} x2={x(mark)} y1={PAD.t} y2={H - PAD.b} />}
           {series.map((s, i) => (
             <g key={s.key} className={s.className}>
               <path d={path(s)} className={`line${s.dashed ? " dashed" : ""}`} />
-              <text className="end-label" x={W - PAD.r + 6} y={ends[i]}>
+              <text className="end-label" x={W - right + 6} y={ends[i]}>
                 {s.label}
               </text>
             </g>

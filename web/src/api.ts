@@ -414,6 +414,21 @@ export interface ImportRequest {
   header: boolean;
 }
 
+export interface ScalingQuery {
+  title: string;
+  about: string;
+  sql: string;
+  /** One per size: line items, orders, pages asked for, rows returned, time. */
+  points: { rows: number; orders: number; pages: number; rows_out: number; ms: number }[];
+  slope: number;
+  growth: "logarithmic" | "sublinear" | "linear";
+}
+
+export interface ScalingResult {
+  sizes: number[];
+  queries: Record<string, ScalingQuery>;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -462,6 +477,7 @@ export const api = {
     call<QueryReply>("POST", `${sessionPath(id)}/tickets/${encodeURIComponent(ticket)}/cancel`),
   state: (id: string) => call<EngineState>("GET", `${sessionPath(id)}/state`),
   lab: (id: string, params: LabParams) => call<LabResult>("POST", `${sessionPath(id)}/labs/engines`, params),
+  scalingLab: (id: string) => call<ScalingResult>("POST", `${sessionPath(id)}/labs/scaling`, {}),
   poolLab: (id: string, params: PoolLabParams) => call<PoolLabResult>("POST", `${sessionPath(id)}/labs/buffer-pool`, params),
   cluster: (id: string, request: ClusterRequest) => call<ClusterReply>("POST", `${sessionPath(id)}/cluster`, request),
   previewImport: (id: string, request: ImportRequest) =>

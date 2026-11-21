@@ -532,3 +532,13 @@ def test_csv_import_previews_then_loads_a_table(client):
     assert client.post(path, json={"table": "Bad Name", "csv": "a\n1"}).status_code == 422
     huge = "a\n" + "1\n" * 300_000
     assert client.post(path, json={"table": "big", "csv": huge}).status_code == 413
+
+
+def test_the_scaling_lab_names_how_each_query_grows(client):
+    session = new_session(client)
+    reply = client.post(f"/sessions/{session}/labs/scaling", json={})
+    assert reply.status_code == 200
+    queries = reply.json()["queries"]
+    assert queries["point"]["growth"] == "logarithmic" and queries["q6"]["growth"] == "linear"
+    assert all(len(q["points"]) == len(reply.json()["sizes"]) for q in queries.values())
+    assert client.post(f"/sessions/{session}/labs/scaling", json={"sizes": [1]}).status_code == 422

@@ -29,7 +29,7 @@ from ..errors import (
     SqlError,
 )
 from ..events import EventBus
-from ..labs import buffer_pool, engines
+from ..labs import buffer_pool, engines, scaling
 from ..replication.raft import Cluster
 from ..sql.parser import parse_statements
 from ..storage import PAGE_SIZE, decode
@@ -246,7 +246,7 @@ def worker_main(path, conn, event_conn, options):
 
 SESSIONS = ("A", "B")  # the database sessions each visitor can type into, side by side
 NOTES = 50  # constraint notes kept per request
-LABS = {"engines": engines.compare, "buffer-pool": buffer_pool.compare}
+LABS = {"engines": engines.compare, "buffer-pool": buffer_pool.compare, "scaling": scaling.compare}
 MAX_VALUE_CHARS = 2000  # longer values in results are shortened: a response stays small whatever the query
 VERSION_ROWS = 40  # rows with versions the state shows at most
 

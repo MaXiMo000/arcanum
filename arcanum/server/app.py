@@ -6,7 +6,7 @@
     POST   /sessions/{id}/import     load CSV into a new or existing table (or preview it)
     GET    /sessions/{id}/state      B+trees, buffer pool and log, for drawing the database
     POST   /sessions/{id}/crash      kill the engine (optionally mid-write) and recover
-    POST   /sessions/{id}/labs/{lab} an experiment: "engines" (B+tree vs LSM tree), "buffer-pool" (policies)
+    POST   /sessions/{id}/labs/{lab} an experiment: "engines", "buffer-pool" or "scaling"
     POST   /sessions/{id}/cluster    the replication demo: a three-node Raft cluster, stepped and faulted
     WS     /sessions/{id}/events     live engine events: page reads, splits, log writes, recovery
     GET    /health
@@ -167,7 +167,12 @@ class BufferPoolLab(BaseModel):
     lookups: int = Field(1500, ge=100, le=5_000)
 
 
-LABS = {"engines": EnginesLab, "buffer-pool": BufferPoolLab}
+class ScalingLab(BaseModel):
+    """TPC-H-style queries at doubling data sizes (labs/scaling.py); nothing to choose."""
+    model_config = ConfigDict(extra="forbid")
+
+
+LABS = {"engines": EnginesLab, "buffer-pool": BufferPoolLab, "scaling": ScalingLab}
 
 NodeName = Literal["n1", "n2", "n3"]
 

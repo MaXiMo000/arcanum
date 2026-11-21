@@ -2,4 +2,5 @@
 
 engines.compare      a B+tree and an LSM tree on one write and read workload
 buffer_pool.compare  buffer pool replacement policies on one recorded page-access trace
+scaling.compare      TPC-H-style queries at doubling data sizes, and how each one's cost grows
 """
