@@ -4,6 +4,8 @@ import { IndexReport } from "../advisor/IndexReport";
 import type { AdviceFix, IndexReport as Report, QueryResult } from "../api";
 import { Explain } from "../explain/Explain";
 import { QueryFlow } from "../flow/QueryFlow";
+import { queryKey, type PlanHistory } from "../flow/planHistory";
+import { PlanHistoryView } from "../flow/PlanHistoryView";
 import type { FeedState } from "../feed";
 import type { InspectorTab } from "../learn/lessons";
 import type { Outcome } from "../learn/outcome";
@@ -31,6 +33,8 @@ interface Props {
   /** Run one statement the index report suggests. */
   onRun: (sql: string) => void;
   report: Report | null;
+  /** Earlier plans of each query, for the Plan tab's history. */
+  planHistory: PlanHistory;
   onFix: (fixed: string, rerun: string) => void;
   busy: boolean;
 }
@@ -59,7 +63,15 @@ export function Inspector(props: Props) {
       break;
     case "flow":
       body = outcome ? (
-        <QueryFlow key={outcome.id} results={outcome.results} spilled={outcome.stats.sort_spills > 0} />
+        <>
+          <QueryFlow key={outcome.id} results={outcome.results} spilled={outcome.stats.sort_spills > 0} />
+          {(() => {
+            const planned = outcome.results.filter((r) => r.plan);
+            const last = planned[planned.length - 1];
+            const runs = last && props.planHistory[queryKey(last.statement)];
+            return runs ? <PlanHistoryView key={`${queryKey(last.statement)}:${runs.length}`} runs={runs} /> : null;
+          })()}
+        </>
       ) : (
         <Empty what="the query plan" />
       );

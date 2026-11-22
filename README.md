@@ -497,6 +497,9 @@ The inspector explains every statement:
     filter pushdown, access paths, join order, the index-only check, execution, and what could be
     better), each with the PostgreSQL step it corresponds to.
   - **EXPLAIN**: the plan printed as `EXPLAIN ANALYZE` would print it, with planning and execution time.
+  - **Plan history**: every run of the same query in this tab, with its estimated cost, pages read and
+    time, marked where the plan changed, and any two runs compared line by line, so the effect of
+    `CREATE INDEX`, `ANALYZE` or more data on the optimizer's choice is visible.
 - **Advisor**: a health grade and the findings above. One click applies a fix and measures the statement
   before and after: pages read, tree nodes visited, time and access path. Below, the index report for the
   whole session: indexes the workload keeps asking for, and unused or redundant ones to drop.
@@ -764,4 +767,3 @@ tests/
 Arcanum aims to be the clearest way to see how a database works from the inside. Next:
 
 - **More storage engines in the labs**: a hash index and a column store beside the B+tree and LSM tree.
-- **Plan history**: every plan a query has had, compared side by side as indexes and statistics change.

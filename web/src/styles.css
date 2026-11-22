@@ -4454,6 +4454,76 @@ p.session-badge {
   }
 }
 
+.plan-history {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.plan-history h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.plan-history-table {
+  overflow-x: auto;
+}
+
+.plan-history table {
+  width: 100%;
+  border-collapse: collapse;
+  font: 12.5px var(--sans);
+}
+
+.plan-history th,
+.plan-history td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  background: none;
+  font-weight: 400;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.plan-history tr.picked td {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.plan-changed {
+  color: var(--warn);
+}
+
+.plan-pick {
+  display: flex;
+  gap: 4px;
+}
+
+.plan-diff {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  font: 12px/1.6 var(--mono);
+}
+
+.plan-diff .removed {
+  color: var(--danger);
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--danger) 50%, transparent);
+}
+
+.plan-diff .added {
+  color: var(--ok);
+}
+
+.plan-diff .same {
+  color: var(--ink-3);
+}
+
 .chip:disabled {
   opacity: 0.45;
   cursor: default;

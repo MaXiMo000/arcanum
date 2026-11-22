@@ -36,6 +36,7 @@ import type { StageProps } from "./stage";
 import { local, readStorage, writeStorage } from "./storage";
 import { CHANGES, useSession } from "./useSession";
 import { useClassroom } from "./useClassroom";
+import { usePlanHistory } from "./flow/planHistory";
 import { ClassDialog } from "./components/ClassDialog";
 import { ClassFeed } from "./components/ClassFeed";
 
@@ -96,6 +97,7 @@ export default function App() {
   const [theme, setTheme] = useState<"light" | "dark">(() => (readStorage(local, THEME_KEY) === "light" ? "light" : "dark"));
   const { progress, markStep, unlock, open } = useProgress();
   const classroom = useClassroom();
+  const plans = usePlanHistory();
   const [classOpen, setClassOpen] = useState(false);
   // On phones and portrait tablets one part of the shell shows at a time (CSS ignores this when wider).
   const [pane, setPane] = useState<"side" | "stage" | "inspector">("side");
@@ -289,6 +291,7 @@ export default function App() {
         }
         const next: Outcome = { id: ++outcomeIds.current, session, sql, results, stats, state: after };
         void publish.current(sql, results);
+        plans.record(next);
         if (results.some((r) => CHANGES.test(r.status))) {
           if (send) unreplayable();
           else remember([[session, sql]]);
@@ -329,7 +332,7 @@ export default function App() {
         return fail(e);
       }
     },
-    [mode, judge, onSessionGone, refresh, remember, unreplayable],
+    [mode, judge, onSessionGone, refresh, remember, unreplayable, plans.record],
   );
 
   const runQuery = useCallback(
@@ -610,6 +613,7 @@ export default function App() {
           onApply={applyFix}
           onRun={runReported}
           report={state?.indexes ?? null}
+          planHistory={plans.history}
           onFix={fixError}
           busy={!state || measuring || crashOpen}
         />
