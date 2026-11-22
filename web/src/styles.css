@@ -335,6 +335,7 @@ h3 {
 }
 
 .link {
+  min-height: 28px; /* a text link is still a control: room for a fingertip, not just the letters */
   padding: 0;
   border: 0;
   background: none;

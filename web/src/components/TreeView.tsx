@@ -18,6 +18,8 @@ interface Props {
 const ZOOMS = [0.5, 0.75, 1, 1.25];
 const MARGIN = 24;
 
+const PHONE_WIDTH = 500; // tree panels narrower than this get a larger smallest Fit zoom
+
 export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs, marker }: Props) {
   const [zoom, setZoom] = useState<number | "fit">("fit");
   const scroller = useRef<HTMLDivElement>(null);
@@ -57,7 +59,8 @@ export function TreeView({ trees, selected, onSelect, nodeFlash, flashMs, marker
   // Fit fills the panel both ways, but never shrinks below the size where keys stay readable; past
   // that it scrolls.
   const fit = Math.min((available.width - 4) / fullWidth, (available.height - 4) / fullHeight, 1.8);
-  const scale = zoom === "fit" ? Math.max(0.5, fit) : zoom;
+  const smallest = available.width < PHONE_WIDTH ? 0.75 : 0.5; // on a phone, readable keys beat seeing it all
+  const scale = zoom === "fit" ? Math.max(smallest, fit) : zoom;
   const root = layout.nodes.find((p) => p.node.page === tree.root);
   rootCentreRef.current = root ? (root.x + root.width / 2 + margin) * scale : 0;
 
