@@ -6,7 +6,7 @@
     POST   /sessions/{id}/import     load CSV into a new or existing table (or preview it)
     GET    /sessions/{id}/state      B+trees, buffer pool and log, for drawing the database
     POST   /sessions/{id}/crash      kill the engine (optionally mid-write) and recover
-    POST   /sessions/{id}/labs/{lab} an experiment: "engines", "buffer-pool", "scaling" or "access"
+    POST   /sessions/{id}/labs/{lab} an experiment: "engines", "buffer-pool", "scaling", "access" or "sharding"
     POST   /sessions/{id}/cluster    the replication demo: a three-node Raft cluster, stepped and faulted
     POST   /classrooms               open a classroom: a code for students, a token for the teacher
     GET    /classrooms/{code}        its title, student count and recent posts
@@ -226,12 +226,20 @@ class AccessLab(BaseModel):
     rows: int = Field(5000, ge=1000, le=20_000)
 
 
+class ShardingLab(BaseModel):
+    """One table split across shards by hash or by range (labs/sharding.py)."""
+    model_config = ConfigDict(extra="forbid")
+    shards: int = Field(4, ge=2, le=8)
+    rows: int = Field(4000, ge=1000, le=10_000)
+
+
 class ScalingLab(BaseModel):
     """TPC-H-style queries at doubling data sizes (labs/scaling.py); nothing to choose."""
     model_config = ConfigDict(extra="forbid")
 
 
-LABS = {"engines": EnginesLab, "buffer-pool": BufferPoolLab, "scaling": ScalingLab, "access": AccessLab}
+LABS = {"engines": EnginesLab, "buffer-pool": BufferPoolLab, "scaling": ScalingLab, "access": AccessLab,
+        "sharding": ShardingLab}
 
 NodeName = Literal["n1", "n2", "n3"]
 

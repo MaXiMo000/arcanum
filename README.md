@@ -368,7 +368,7 @@ table's colour, and **What happened** says when values moved out or were read ba
 
 ## B+tree versus LSM tree
 
-The **Labs** view holds five experiments. The first runs one workload on two storage engines and counts every byte each one reads,
+The **Labs** view holds six experiments. The first runs one workload on two storage engines and counts every byte each one reads,
 writes and syncs. One engine is Arcanum's own B+tree (pager, write-ahead log and checkpoints). The other
 is an LSM tree, the design behind RocksDB, LevelDB and Cassandra:
 
@@ -428,6 +428,15 @@ it reads (cache hits included):
 
 The questions are a point lookup, a range of 100 ids, a sum over one column, a count filtered on a column
 whose values come in runs, and 500 inserts (distinct pages written), plus each structure's size.
+
+## Sharding
+
+The sixth lab splits one table of orders across 2 to 8 Arcanum databases three ways: by a hash of the order
+id, by ranges of ids, and by a hash of the customer. A router sends each question only to the shards that
+can hold the answer and combines what comes back (each shard sums its part of a total). For a point lookup,
+a customer's orders, a range of ids and a total, the lab reports the shards asked, the pages read in all and
+on the busiest shard, and checks every strategy returns the same answer. It also shows the rows per shard
+and where a batch of new orders lands: ids keep growing, so with ranges every new order hits the last shard.
 
 ## Replication with Raft
 
@@ -511,7 +520,8 @@ Two modes share one screen: the database in the middle, an inspector on the righ
   `SERIALIZABLE`, the read/write dependencies between transactions appear as they form.
 - **Labs**: the B+tree versus LSM tree comparison, with a scrubber over the LSM tree's levels, and the
   buffer pool policies compared on one recorded trace, a three-node Raft cluster you can step, partition
-  and crash, a B+tree, a hash index and a column store asked the same questions, and TPC-H-style queries
+  and crash, a B+tree, a hash index and a column store asked the same questions, one table sharded three
+  ways behind a router, and TPC-H-style queries
   charted as the data grows (see above). The first three have a guided
   tour: a few experiments in order, each set up and run with one button, with what to look for.
 
@@ -612,6 +622,7 @@ python -m arcanum.server
 | `POST /sessions/{id}/labs/engines` | Run one workload (`keys`, `order`, `updates`, `value_bytes`, `memory_pages`) on a B+tree and an LSM tree; returns both engines' amplifications, the bytes-written curves and the LSM tree's shape after every flush and compaction. |
 | `POST /sessions/{id}/labs/buffer-pool` | Record one workload's page accesses (`workload`, `pool_pages`, `rows`, `lookups`) and replay them through every replacement policy; returns hits, misses and hit-rate curves over time and against pool size. |
 | `POST /sessions/{id}/labs/access` | Load `rows` orders into a B+tree, a hash index and a column store; returns the pages each reads per question, the pages written for a batch of inserts, and each structure's size. |
+| `POST /sessions/{id}/labs/sharding` | Split `rows` orders across `shards` databases by id hash, id range and customer hash; returns shards asked and pages read per question, rows per shard and where new orders land. |
 | `POST /sessions/{id}/labs/scaling` | Generate the TPC-H-style dataset at five sizes and run its queries at each; returns pages, rows and time per query and size, and each query's fitted growth. |
 | `POST /sessions/{id}/cluster` | Drive the session's Raft cluster: `action` is `state`, `tick` (`ticks`), `write` (`sql`), `read` (`node`, `sql`), `partition` (`groups`), `heal`, `crash` / `restart` (`node`) or `reset`. Returns every node's role, term and log, the messages in flight, the statements behind the log entries and what happened; `tick` also returns one frame per tick. |
 | `POST /sessions/{id}/import` | Load CSV text (`table`, `csv`, `header`) into a new table with inferred column types or into an existing one by column name; replies like `/query`. With `dry_run` it returns a preview instead: the columns and types, the row count and the first rows. |
@@ -774,6 +785,7 @@ arcanum/
     buffer_pool.py replacement policies replayed on a recorded page-access trace
     scaling.py     TPC-H-style queries at doubling data sizes
     access.py      a B+tree, a hash index and a column store answering the same questions
+    sharding.py    one table split across shards by hash or by range, behind a router
   replication/
     raft.py        Raft over three databases: elections, log replication, faults, simulated network
   server/
@@ -797,10 +809,3 @@ web/
     vault/         the 3D view: crystal tree, page floor, log river, camera and glow
 tests/
 ```
-
-## Roadmap
-
-Arcanum aims to be the clearest way to see how a database works from the inside. Next:
-
-- **Sharding lab**: one table split across nodes by hash or by range, and what queries that cross shards cost.
-

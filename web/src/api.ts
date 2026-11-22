@@ -425,6 +425,19 @@ export interface AccessResult {
   details: { hash_splits: number; hash_doublings: number; hash_depth: number; column_pages: Record<string, number> };
 }
 
+export interface ShardingResult {
+  shards: number;
+  rows: number;
+  customers: number;
+  strategies: { key: string; label: string; about: string }[];
+  questions: { key: string; title: string; sql: string; agree: boolean;
+    per: Record<string, { shards: number; pages: number; busiest: number }> }[];
+  /** Rows on each shard, per strategy. */
+  balance: Record<string, number[]>;
+  /** Where a batch of new orders lands, per strategy. */
+  inserts: Record<string, number[]>;
+}
+
 export interface ScalingQuery {
   title: string;
   about: string;
@@ -527,6 +540,8 @@ export const api = {
   lab: (id: string, params: LabParams) => call<LabResult>("POST", `${sessionPath(id)}/labs/engines`, params),
   accessLab: (id: string, params: { rows: number }) =>
     call<AccessResult>("POST", `${sessionPath(id)}/labs/access`, params),
+  shardingLab: (id: string, params: { shards: number; rows: number }) =>
+    call<ShardingResult>("POST", `${sessionPath(id)}/labs/sharding`, params),
   scalingLab: (id: string) => call<ScalingResult>("POST", `${sessionPath(id)}/labs/scaling`, {}),
   poolLab: (id: string, params: PoolLabParams) => call<PoolLabResult>("POST", `${sessionPath(id)}/labs/buffer-pool`, params),
   cluster: (id: string, request: ClusterRequest) => call<ClusterReply>("POST", `${sessionPath(id)}/cluster`, request),

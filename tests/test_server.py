@@ -605,3 +605,10 @@ def test_the_access_methods_lab_runs_through_the_server(client):
     reply = client.post(f"/sessions/{session}/labs/access", json={"rows": 1000})
     assert reply.status_code == 200 and {q["key"] for q in reply.json()["queries"]} >= {"point", "range", "sum"}
     assert client.post(f"/sessions/{session}/labs/access", json={"rows": 10**6}).status_code == 422
+
+
+def test_the_sharding_lab_runs_through_the_server(client):
+    session = new_session(client)
+    reply = client.post(f"/sessions/{session}/labs/sharding", json={"shards": 2, "rows": 1000})
+    assert reply.status_code == 200 and len(reply.json()["balance"]["hash-id"]) == 2
+    assert client.post(f"/sessions/{session}/labs/sharding", json={"shards": 50}).status_code == 422

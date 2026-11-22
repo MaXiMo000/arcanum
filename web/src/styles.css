@@ -4524,6 +4524,44 @@ p.session-badge {
   color: var(--ink-3);
 }
 
+.shard-table {
+  width: 100%;
+  margin-top: 8px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font: 12.5px var(--sans);
+}
+
+.shard-table th,
+.shard-table td {
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+  background: none;
+  font-family: var(--sans);
+  font-weight: 400;
+  text-align: left;
+  vertical-align: middle;
+  white-space: normal;
+}
+
+.shard-table thead th:first-child {
+  width: 40%;
+}
+
+.shard-bars {
+  display: flex;
+  gap: 3px;
+  align-items: flex-end;
+  height: 40px;
+}
+
+.shard-bars i {
+  flex: 1;
+  min-width: 4px;
+  border-radius: 3px 3px 0 0;
+  background: var(--eng);
+}
+
 .access-card {
   display: grid;
   align-content: start;
