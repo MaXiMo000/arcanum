@@ -439,11 +439,28 @@ export interface ClassPost {
   error: string | null;
 }
 
+/** The lesson step a teacher is on. */
+export interface ClassLesson {
+  id: string;
+  step: number;
+}
+
+/** A student's question, which only the teacher sees. */
+export interface ClassQuestion {
+  id: number;
+  at: number;
+  text: string;
+  name: string;
+}
+
 export interface ClassroomInfo {
   code: string;
   title: string;
   students: number;
   history: ClassPost[];
+  lesson: ClassLesson | null;
+  /** Only in the teacher's view. */
+  questions?: ClassQuestion[];
 }
 
 export class ApiError extends Error {
@@ -505,7 +522,15 @@ export const api = {
   importCsv: (id: string, request: ImportRequest, session: SessionName = "A") =>
     call<QueryReply>("POST", `${sessionPath(id)}/import`, { ...request, session }),
   openClass: (title: string) => call<{ code: string; token: string; title: string }>("POST", "/classrooms", { title }),
-  getClass: (code: string) => call<ClassroomInfo>("GET", `/classrooms/${encodeURIComponent(code)}`),
+  getClass: (code: string, token?: string) =>
+    call<ClassroomInfo>("GET", `/classrooms/${encodeURIComponent(code)}`, undefined, token),
+  classLesson: (code: string, token: string, lesson: ClassLesson | null) =>
+    call<{ students: number }>("POST", `/classrooms/${encodeURIComponent(code)}/lesson`,
+      { lesson: lesson?.id ?? null, step: lesson?.step ?? 0 }, token),
+  askClass: (code: string, text: string, name: string) =>
+    call<{ id: number }>("POST", `/classrooms/${encodeURIComponent(code)}/questions`, { text, name }),
+  dismissQuestion: (code: string, token: string, id: number) =>
+    call<void>("DELETE", `/classrooms/${encodeURIComponent(code)}/questions/${id}`, undefined, token),
   postClass: (code: string, token: string, post: Omit<ClassPost, "seq" | "at">) =>
     call<{ seq: number; students: number }>("POST", `/classrooms/${encodeURIComponent(code)}/posts`, post, token),
   endClass: (code: string, token: string) => call<void>("DELETE", `/classrooms/${encodeURIComponent(code)}`, undefined, token),

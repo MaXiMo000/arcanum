@@ -576,3 +576,25 @@ def test_classrooms_are_capped_per_client(make_client):
     client = make_client(max_classrooms_per_client=1, classrooms_per_minute=10)
     assert client.post("/classrooms", json={}).status_code == 201
     assert client.post("/classrooms", json={}).status_code == 503
+
+
+def test_students_follow_the_teachers_lesson_and_ask_questions_only_the_teacher_reads(client):
+    room = client.post("/classrooms", json={}).json()
+    code, teacher = room["code"], {"authorization": f"Bearer {room['token']}"}
+    with client.websocket_connect(f"/classrooms/{code}/live") as ws:
+        assert ws.receive_json()["lesson"] is None
+        assert client.post(f"/classrooms/{code}/lesson", json={"lesson": "joins", "step": 2}, headers=teacher).status_code == 200
+        assert ws.receive_json() == {"type": "lesson", "lesson": {"id": "joins", "step": 2}}
+    assert client.post(f"/classrooms/{code}/lesson", json={"lesson": "joins"}).status_code == 403
+    assert client.post(f"/classrooms/{code}/lesson", json={"lesson": "Bad Id!"}, headers=teacher).status_code == 422
+    asked = client.post(f"/classrooms/{code}/questions", json={"text": "Why a merge join here?", "name": "Sam"})
+    assert asked.status_code == 201
+    assert "questions" not in client.get(f"/classrooms/{code}").json()  # students cannot read them
+    questions = client.get(f"/classrooms/{code}", headers=teacher).json()["questions"]
+    assert [(q["text"], q["name"]) for q in questions] == [("Why a merge join here?", "Sam")]
+    assert client.post(f"/classrooms/{code}/questions", json={"text": "   "}).status_code == 422
+    assert client.post(f"/classrooms/{code}/questions", json={"text": "x" * 301}).status_code == 422
+    assert client.delete(f"/classrooms/{code}/questions/{asked.json()['id']}").status_code == 403
+    assert client.delete(f"/classrooms/{code}/questions/{asked.json()['id']}", headers=teacher).status_code == 204
+    assert client.get(f"/classrooms/{code}", headers=teacher).json()["questions"] == []
+    assert client.get(f"/classrooms/{code}").json()["lesson"] == {"id": "joins", "step": 2}

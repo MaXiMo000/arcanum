@@ -8,6 +8,7 @@ interface Props {
   onTeach: (title: string) => Promise<void>;
   onFollow: (code: string) => void;
   onLeave: () => Promise<void>;
+  onDismiss: (id: number) => Promise<void>;
   onClose: () => void;
 }
 
@@ -17,7 +18,7 @@ export function classLink(code: string) {
   return `${window.location.origin}${window.location.pathname}?class=${code}`;
 }
 
-export function ClassDialog({ room, error, onTeach, onFollow, onLeave, onClose }: Props) {
+export function ClassDialog({ room, error, onTeach, onFollow, onLeave, onDismiss, onClose }: Props) {
   const [title, setTitle] = useState("");
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
@@ -82,6 +83,24 @@ export function ClassDialog({ room, error, onTeach, onFollow, onLeave, onClose }
               {room.title && <b>{room.title} · </b>}
               {room.students} student{room.students === 1 ? "" : "s"} following
             </p>
+            <p className="muted small">Students follow the lesson step you are on, and can send you questions:</p>
+            {room.questions.length ? (
+              <ul className="class-questions">
+                {room.questions.map((q) => (
+                  <li key={q.id}>
+                    <p>
+                      {q.text}
+                      <span className="muted small"> · {q.name || "anonymous"}</span>
+                    </p>
+                    <button className="button ghost small" onClick={() => void onDismiss(q.id)}>
+                      Done
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="muted small">No questions yet.</p>
+            )}
             <div className="dialog-actions">
               <button className="button ghost" onClick={() => void copy(classLink(room.code))}>
                 {copied ? "Link copied" : "Copy the join link"}

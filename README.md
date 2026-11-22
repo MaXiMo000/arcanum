@@ -221,8 +221,13 @@ the playground, is posted with its status and first rows. Students who join see 
 with the earlier ones below, and can open it in their own playground or run it on their own database.
 A student who joins late gets the recent history; one who loses the connection reconnects.
 
-Students only watch: nothing they do reaches the teacher or each other. Only the teacher's token, sent
-as a Bearer header, can post or end the classroom. Classrooms live in memory and close after sitting idle.
+The lesson step the teacher is on is shared too: students' lesson panels follow it step by step, unless
+they turn **Follow along** off and move at their own pace. Students can send the teacher a short question
+(with a name, if they like); the teacher sees it in the Class dialog and marks it done.
+
+Questions are the only thing students send, and only the teacher can read them. Only the teacher's
+token, sent as a Bearer header, can post, change the lesson step or end the classroom. Classrooms live
+in memory and close after sitting idle.
 
 ## CSV import
 
@@ -577,6 +582,8 @@ python -m arcanum.server
 | `POST /classrooms` | Open a classroom (`title`); returns its `code` and the teacher's `token`. |
 | `GET /classrooms/{code}` | Its title, how many students are following and the recent posts. |
 | `POST /classrooms/{code}/posts` | The teacher (`Authorization: Bearer <token>`) posts a statement (`sql`), its results (`status`, `columns`, the first `rows`, `row_total`) or its `error`. |
+| `POST /classrooms/{code}/lesson` | The teacher's current lesson step (`lesson`, `step`), or `lesson: null`; followers receive it live. |
+| `POST /classrooms/{code}/questions` | A student's question (`text`, optional `name`); `GET /classrooms/{code}` with the teacher's token lists them and `DELETE /classrooms/{code}/questions/{id}` marks one done. |
 | `DELETE /classrooms/{code}` | The teacher ends the classroom; followers are told it ended. |
 | `WS /classrooms/{code}/live` | Students receive the recent posts on joining, then every new one. |
 | `GET /sessions/{id}/state` | Every B+tree (nodes, keys, children), the buffer pool (cached and dirty pages) and the log, for drawing the database. |
@@ -756,4 +763,5 @@ tests/
 
 Arcanum aims to be the clearest way to see how a database works from the inside. Next:
 
-- **Classroom extras**: a teacher's lesson steps followed in lockstep, and questions sent back to the teacher.
+- **More storage engines in the labs**: a hash index and a column store beside the B+tree and LSM tree.
+- **Plan history**: every plan a query has had, compared side by side as indexes and statistics change.

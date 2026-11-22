@@ -26,7 +26,7 @@ import { EXAMPLES } from "./examples";
 import { FLASH_MS, replayFrame, useEngineFeed } from "./feed";
 import { CHALLENGES } from "./learn/challenges";
 import { LessonPanel } from "./learn/LessonPanel";
-import type { InspectorTab, Step } from "./learn/lessons";
+import { LESSONS, type InspectorTab, type Step } from "./learn/lessons";
 import { plural, type CheckContext, type Outcome, type Waiting } from "./learn/outcome";
 import { PlayPanel, SECOND_SESSION_SQL } from "./learn/PlayPanel";
 import { MAX_LINK, clearShared, readShared, shareLink, type SharedState } from "./share";
@@ -101,6 +101,23 @@ export default function App() {
   const [pane, setPane] = useState<"side" | "stage" | "inspector">("side");
   const publish = useRef(classroom.publish);
   publish.current = classroom.publish;
+
+  // Teaching: students see which lesson step the teacher is on.
+  const { publishLesson } = classroom;
+  const teaching = classroom.room?.role === "teacher";
+  useEffect(() => {
+    if (teaching) void publishLesson(mode === "learn" && progress.lesson ? { id: progress.lesson, step: progress.step } : null);
+  }, [teaching, mode, progress.lesson, progress.step, publishLesson]);
+
+  // Following in lockstep: the lesson panel moves with the teacher's.
+  const following = classroom.room?.role === "student" ? classroom.room : null;
+  const teacherLesson = following?.lockstep && following.lesson ? following.lesson : null;
+  useEffect(() => {
+    if (!teacherLesson || !LESSONS.some((l) => l.id === teacherLesson.id)) return;
+    setMode("learn");
+    open(teacherLesson.id, teacherLesson.step);
+    setPane("side");
+  }, [teacherLesson?.id, teacherLesson?.step, open]); // eslint-disable-line react-hooks/exhaustive-deps -- the step, not the object
 
   // A join link (?class=CODE) follows that class, once; the parameter is then removed from the address.
   useEffect(() => {
@@ -481,7 +498,7 @@ export default function App() {
         onAbout={() => setIntroOpen(true)}
         classLabel={
           classroom.room?.role === "teacher"
-            ? `Teaching ${classroom.room.code} · ${classroom.room.students}`
+            ? `Teaching ${classroom.room.code} · ${classroom.room.students}${classroom.room.questions.length ? ` · ${classroom.room.questions.length} ?` : ""}`
             : classroom.room?.role === "student"
               ? `Class ${classroom.room.code}`
               : null
@@ -495,6 +512,7 @@ export default function App() {
           onTeach={classroom.teach}
           onFollow={classroom.follow}
           onLeave={classroom.leave}
+          onDismiss={classroom.dismiss}
           onClose={() => setClassOpen(false)}
         />
       )}
@@ -515,6 +533,12 @@ export default function App() {
               void runQuery(sql);
             }}
             onLeave={() => void classroom.leave()}
+            onAsk={classroom.ask}
+            onLockstep={classroom.setLockstep}
+            onGoTo={(lesson) => {
+              setMode("learn");
+              open(lesson.id, lesson.step);
+            }}
           />
         )}
         {mode === "learn" ? (

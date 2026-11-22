@@ -2,10 +2,11 @@
 
 A teacher opens a classroom and gets a short code to share and a secret token.
 Each statement the teacher runs is posted to the classroom with a summary of
-its results; students who joined with the code receive every post over a
-WebSocket as it happens (and the recent ones when they join), and can run the
-same statement on their own database. Students only read: nothing they do
-reaches the teacher or each other, so a code grants no more than watching.
+its results, and so is the lesson step the teacher is on; students who joined
+with the code receive both over a WebSocket as they happen (and the current
+state when they join), and can run the same statement on their own database
+or follow the lesson step by step. The one thing students send is a question,
+which only the teacher can read; nothing reaches the other students.
 
 Only the token posts or ends a classroom; it is stored hashed and compared in
 constant time. Classrooms live in memory, are capped in number, size and
@@ -23,6 +24,7 @@ from .sessions import SessionError
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I/L: codes are read aloud and typed
 CODE_LENGTH = 6
 HISTORY = 50  # posts a classroom keeps for students who join late
+QUESTIONS = 100  # questions a classroom keeps for its teacher
 
 
 def normalize(code):
@@ -40,6 +42,9 @@ class Classroom:
         self.history = deque(maxlen=HISTORY)
         self.seq = 0
         self.students = set()  # Subscribers
+        self.lesson = None  # {"id", "step"}: the lesson step the teacher is on, if any
+        self.questions = deque(maxlen=QUESTIONS)
+        self.asked = 0
         self.last_used = time.monotonic()
 
     def is_teacher(self, token):
@@ -49,13 +54,36 @@ class Classroom:
         self.seq += 1
         item = {"seq": self.seq, "at": time.time(), **item}
         self.history.append(item)
-        self.last_used = time.monotonic()
-        for student in list(self.students):
-            student.offer([item])
+        self._send({"type": "post", "post": item})
         return item
 
-    def summary(self):
-        return {"code": self.code, "title": self.title, "students": len(self.students), "history": list(self.history)}
+    def follow(self, lesson):
+        """The teacher moved to a lesson step (or left the lessons, with None)."""
+        self.lesson = lesson
+        self._send({"type": "lesson", "lesson": lesson})
+
+    def ask(self, text, name):
+        self.asked += 1
+        question = {"id": self.asked, "at": time.time(), "text": text, "name": name}
+        self.questions.append(question)
+        self.last_used = time.monotonic()
+        return question
+
+    def dismiss(self, question_id):
+        self.questions = deque((q for q in self.questions if q["id"] != question_id), maxlen=QUESTIONS)
+
+    def _send(self, message):
+        self.last_used = time.monotonic()
+        for student in list(self.students):
+            student.offer([message])
+
+    def summary(self, teacher=False):
+        """What anyone with the code sees; the teacher also gets the questions."""
+        out = {"code": self.code, "title": self.title, "students": len(self.students), "history": list(self.history),
+               "lesson": self.lesson}
+        if teacher:
+            out["questions"] = list(self.questions)
+        return out
 
     def close(self):
         for student in list(self.students):

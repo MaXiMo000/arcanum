@@ -721,6 +721,69 @@ h3 {
   border-top: 1px solid var(--line);
 }
 
+.class-lesson {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.class-lesson p {
+  margin: 0;
+}
+
+.class-ask form {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.class-ask textarea,
+.class-ask input {
+  padding: 8px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 9px;
+  background: var(--panel-2);
+  color: var(--ink);
+  font: 13px var(--sans);
+}
+
+.class-ask textarea {
+  resize: vertical;
+}
+
+.class-ask input {
+  flex: 1;
+  min-width: 0;
+}
+
+.class-questions {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  margin: 0 0 14px;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.class-questions li {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.class-questions p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .class-button.active {
   border-color: var(--accent);
   color: var(--ink);

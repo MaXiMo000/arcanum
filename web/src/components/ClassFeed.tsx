@@ -1,7 +1,10 @@
-// What a student sees of the class: the teacher's latest statement with its results, earlier ones below,
-// and buttons to open or run any of them on the student's own database.
-import type { ClassPost } from "../api";
+// What a student sees of the class: the lesson step the teacher is on (followed automatically unless turned
+// off), the teacher's latest statement with its results, earlier ones below, buttons to open or run any of
+// them on the student's own database, and a box to send the teacher a question.
+import { useState, type FormEvent } from "react";
+import type { ClassLesson, ClassPost } from "../api";
 import { formatValue } from "../format";
+import { LESSONS } from "../learn/lessons";
 import type { Following } from "../useClassroom";
 
 interface Props {
@@ -9,6 +12,10 @@ interface Props {
   onOpen: (sql: string) => void;
   onRun: (sql: string) => void;
   onLeave: () => void;
+  /** Sends a question to the teacher; resolves to an error message, or null when sent. */
+  onAsk: (text: string, name: string) => Promise<string | null>;
+  onLockstep: (lockstep: boolean) => void;
+  onGoTo: (lesson: ClassLesson) => void;
   busy: boolean;
 }
 
@@ -24,7 +31,7 @@ function time(at: number) {
   return new Date(at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function Post({ post, onOpen, onRun, busy }: { post: ClassPost } & Omit<Props, "room" | "onLeave">) {
+function Post({ post, onOpen, onRun, busy }: { post: ClassPost } & Pick<Props, "onOpen" | "onRun" | "busy">) {
   const result = post.results.find((r) => r.columns.length) ?? post.results[post.results.length - 1];
   return (
     <div className="class-post">
@@ -73,7 +80,63 @@ function Post({ post, onOpen, onRun, busy }: { post: ClassPost } & Omit<Props, "
   );
 }
 
-export function ClassFeed({ room, onOpen, onRun, onLeave, busy }: Props) {
+function TeacherLesson({ room, onLockstep, onGoTo }: Pick<Props, "room" | "onLockstep" | "onGoTo">) {
+  const lesson = room.lesson && LESSONS.find((l) => l.id === room.lesson!.id);
+  if (!room.lesson || !lesson) return null;
+  const step = lesson.steps[room.lesson.step];
+  return (
+    <div className="class-lesson">
+      <p className="small">
+        The teacher is on <b>{lesson.title}</b>
+        {step ? `, step ${room.lesson.step + 1}: ${step.title}` : ""}.
+      </p>
+      <div className="class-post-actions">
+        <label className="import-check small">
+          <input type="checkbox" checked={room.lockstep} onChange={(e) => onLockstep(e.target.checked)} /> Follow along
+        </label>
+        {!room.lockstep && (
+          <button className="button ghost small" onClick={() => onGoTo(room.lesson!)}>
+            Go there
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Ask({ onAsk }: Pick<Props, "onAsk">) {
+  const [text, setText] = useState("");
+  const [name, setName] = useState("");
+  const [note, setNote] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+  const send = async (e: FormEvent) => {
+    e.preventDefault();
+    setSending(true);
+    const failed = await onAsk(text.trim(), name.trim());
+    setSending(false);
+    setNote(failed ?? "Sent. Only the teacher sees it.");
+    if (!failed) setText("");
+  };
+  return (
+    <details className="class-ask">
+      <summary className="muted small">Ask the teacher a question</summary>
+      <form onSubmit={(e) => void send(e)}>
+        <textarea value={text} onChange={(e) => setText(e.target.value)} maxLength={300} rows={2}
+          placeholder="Why did this use a hash join?" aria-label="Your question" />
+        <div className="class-post-actions">
+          <input value={name} onChange={(e) => setName(e.target.value)} maxLength={40} placeholder="Your name (optional)"
+            aria-label="Your name" />
+          <button className="button primary small" disabled={sending || !text.trim()}>
+            {sending ? "Sending…" : "Send"}
+          </button>
+        </div>
+        {note && <p className="muted small" role="status">{note}</p>}
+      </form>
+    </details>
+  );
+}
+
+export function ClassFeed({ room, onOpen, onRun, onLeave, onAsk, onLockstep, onGoTo, busy }: Props) {
   const posts = [...room.posts].reverse();
   const [latest, ...earlier] = posts;
   return (
@@ -88,6 +151,7 @@ export function ClassFeed({ room, onOpen, onRun, onLeave, busy }: Props) {
           Leave
         </button>
       </header>
+      <TeacherLesson room={room} onLockstep={onLockstep} onGoTo={onGoTo} />
       {latest ? (
         <>
           <p className="eyebrow">The teacher ran, at {time(latest.at)}</p>
@@ -109,6 +173,7 @@ export function ClassFeed({ room, onOpen, onRun, onLeave, busy }: Props) {
           ))}
         </details>
       )}
+      {room.status === "live" && <Ask onAsk={onAsk} />}
     </section>
   );
 }

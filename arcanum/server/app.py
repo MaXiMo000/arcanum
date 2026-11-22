@@ -12,6 +12,8 @@
     GET    /classrooms/{code}        its title, student count and recent posts
     POST   /classrooms/{code}/posts  the teacher posts a statement and its results (Bearer token)
     DELETE /classrooms/{code}        the teacher ends it (Bearer token)
+    POST   /classrooms/{code}/lesson the teacher's lesson step, followed by students (Bearer token)
+    POST   /classrooms/{code}/questions  a student asks a question; only the teacher reads them
     WS     /classrooms/{code}/live   students receive every post as it happens
     WS     /sessions/{id}/events     live engine events: page reads, splits, log writes, recovery
     GET    /health
@@ -95,6 +97,7 @@ class Settings:
     max_classrooms_per_client: int = 2
     max_students_per_classroom: int = 60
     classrooms_per_minute: int = 2  # classrooms a client may open
+    questions_per_minute: int = 4  # questions a client may ask
     classroom_ttl: float = 7200  # seconds a classroom with nobody connected may sit unused
     allowed_origins: list = field(default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"])
     enable_docs: bool = False
@@ -108,7 +111,7 @@ class Settings:
                       "worker_memory_mb", "max_keys", "pool_size", "event_limit", "rate_burst", "sessions_per_minute",
                       "crashes_per_minute", "labs_per_minute", "max_websockets", "max_websockets_per_client", "max_websockets_per_session",
                       "max_classrooms", "max_classrooms_per_client", "max_students_per_classroom",
-                      "classrooms_per_minute"]
+                      "classrooms_per_minute", "questions_per_minute"]
         float_fields = ["session_ttl", "query_timeout", "lock_timeout", "queue_timeout", "rate_per_second",
                         "lab_timeout", "classroom_ttl"]
         values = {name: _env(f"ARCANUM_{name.upper()}", getattr(d, name), int) for name in int_fields}
@@ -180,6 +183,18 @@ class ClassroomPost(BaseModel):
     sql: str = Field(min_length=1, max_length=20_000)
     results: list[ResultSummary] = Field(default_factory=list, max_length=10)
     error: str | None = Field(None, max_length=500)
+
+
+class ClassroomLesson(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    lesson: str | None = Field(None, pattern=r"^[a-z0-9-]{1,40}$")
+    step: int = Field(0, ge=0, le=100)
+
+
+class ClassroomQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, max_length=300)
+    name: str = Field("", max_length=40)
 
 
 class CrashRequest(BaseModel):
@@ -445,8 +460,30 @@ def create_app(settings=None):
         return {"code": room.code, "token": token, "title": room.title}
 
     @app.get("/classrooms/{code}")
-    async def classroom(code: str):
-        return classrooms.get(code).summary()
+    async def classroom(code: str, request: Request):
+        room = classrooms.get(code)
+        return room.summary(teacher=room.is_teacher(_bearer(request)))
+
+    @app.post("/classrooms/{code}/lesson")
+    async def classroom_lesson(code: str, request: Request, body: ClassroomLesson):
+        room = classrooms.teacher(code, _bearer(request))
+        room.follow({"id": body.lesson, "step": body.step} if body.lesson else None)
+        return {"students": len(room.students)}
+
+    @app.post("/classrooms/{code}/questions", status_code=201)
+    async def ask_classroom(code: str, request: Request, body: ClassroomQuestion):
+        room = classrooms.get(code)
+        if not limiter.allow(_client(request), "question", settings.questions_per_minute / 60, settings.questions_per_minute):
+            return _error(429, "RateLimited", "questions are limited; wait a little", {"Retry-After": "15"})
+        if not body.text.strip():
+            return _error(422, "InvalidRequest", "invalid request: check text")
+        question = room.ask(body.text.strip(), body.name.strip())
+        return {"id": question["id"]}
+
+    @app.delete("/classrooms/{code}/questions/{question_id}", status_code=204)
+    async def dismiss_question(code: str, question_id: int, request: Request):
+        classrooms.teacher(code, _bearer(request)).dismiss(question_id)
+        return Response(status_code=204)
 
     @app.post("/classrooms/{code}/posts")
     async def post_to_classroom(code: str, request: Request, body: ClassroomPost):
@@ -491,8 +528,8 @@ def create_app(settings=None):
                 if batch is None:
                     await websocket.close(code=4410)  # the teacher ended the classroom
                     return
-                for item in batch:
-                    await websocket.send_json({"type": "post", "post": item})
+                for message in batch:
+                    await websocket.send_json(message)
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:

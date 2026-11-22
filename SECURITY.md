@@ -22,9 +22,11 @@ Arcanum is an educational database engine. It is not meant to store sensitive da
 - The server and its engine processes exchange JSON only, never pickled objects.
 - Session files are readable only by the server's user, are deleted when the session ends, and are
   cleared at startup.
-- Classrooms only broadcast: a classroom code lets someone watch what its teacher posts and nothing
-  more. Posting and ending need the teacher's token, which is stored hashed and compared in constant
-  time. Classrooms are capped in number, history and followers, and close when idle.
+- A classroom code lets someone watch what its teacher posts and send the teacher a short question,
+  and nothing more: questions are rate limited, capped in length and number, and readable only with the
+  teacher's token, never by other students. Posting, changing the lesson step and ending need that
+  token, which is stored hashed and compared in constant time. Classrooms are capped in number, history
+  and followers, and close when idle.
 
 **Resource limits** (all configurable, see `.env.example`)
 
