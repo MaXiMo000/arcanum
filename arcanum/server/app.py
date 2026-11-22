@@ -537,13 +537,7 @@ def create_app(settings=None):
         sockets["by_client"][client] = sockets["by_client"].get(client, 0) + 1
         try:
             await websocket.send_json({"type": "joined", **room.summary()})
-            while True:
-                batch = await student.queue.get()
-                if batch is None:
-                    await websocket.close(code=4410)  # the teacher ended the classroom
-                    return
-                for message in batch:
-                    await websocket.send_json(message)
+            await _forward(websocket, student, lambda batch: batch)  # 4410 when the teacher ends it
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
@@ -597,15 +591,14 @@ def create_app(settings=None):
         sockets["by_client"][client] = sockets["by_client"].get(client, 0) + 1
         try:
             await websocket.send_json({"type": "subscribed", "generation": session.generation})
-            while True:
-                batch = await subscriber.queue.get()
-                if batch is None:
-                    await websocket.close(code=4410)  # the session ended
-                    return
+
+            def events(batch):
                 message = {"type": "events", "events": batch}
                 if subscriber.dropped:
                     message["dropped"], subscriber.dropped = subscriber.dropped, 0
-                await websocket.send_json(message)
+                return [message]
+
+            await _forward(websocket, subscriber, events)  # 4410 when the session ends
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
@@ -619,6 +612,35 @@ def create_app(settings=None):
     if (web_dir / "index.html").is_file():
         app.mount("/", StaticFiles(directory=web_dir, html=True), name="web")
     return app
+
+
+async def _forward(websocket, subscriber, messages):
+    """Send what arrives in the subscriber's queue (messages(batch) gives the JSON messages for a batch)
+    until the queue is closed (None: the socket closes with 4410) or the client leaves.
+
+    The socket is read at the same time. That is how a client that left is noticed even while nothing is
+    being sent to it; otherwise its connection would hold a slot until its session or classroom ended.
+    Clients have nothing to say on these sockets, so anything they send is ignored."""
+    batch = asyncio.ensure_future(subscriber.queue.get())
+    inbound = asyncio.ensure_future(websocket.receive())
+    try:
+        while True:
+            done, _ = await asyncio.wait({batch, inbound}, return_when=asyncio.FIRST_COMPLETED)
+            if batch in done:  # first, so a batch that arrived with the goodbye is not lost
+                items = batch.result()
+                if items is None:
+                    await websocket.close(code=4410)
+                    return
+                for message in messages(items):
+                    await websocket.send_json(message)
+                batch = asyncio.ensure_future(subscriber.queue.get())
+            if inbound in done:
+                if inbound.result()["type"] == "websocket.disconnect":
+                    return
+                inbound = asyncio.ensure_future(websocket.receive())
+    finally:
+        batch.cancel()
+        inbound.cancel()
 
 
 def _same_origin(connection, origin):

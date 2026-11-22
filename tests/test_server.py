@@ -1,5 +1,6 @@
 """The HTTP/WebSocket API, with real worker processes behind it."""
 
+import asyncio
 import os
 import time
 
@@ -11,7 +12,8 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from arcanum.server.app import Settings, create_app
+from arcanum.server.app import Settings, _forward, create_app
+from arcanum.server.sessions import Subscriber
 from arcanum.server.worker import error_json
 from arcanum.storage import CorruptDatabaseError
 
@@ -612,3 +614,46 @@ def test_the_sharding_lab_runs_through_the_server(client):
     reply = client.post(f"/sessions/{session}/labs/sharding", json={"shards": 2, "rows": 1000})
     assert reply.status_code == 200 and len(reply.json()["balance"]["hash-id"]) == 2
     assert client.post(f"/sessions/{session}/labs/sharding", json={"shards": 50}).status_code == 422
+
+
+
+def test_forwarding_ends_when_the_client_leaves_even_with_nothing_to_send():
+    # The leak this guards against: waiting only on the queue, a socket whose client left while nothing was
+    # being sent was never noticed, and held its connection slot until the session ended.
+    class Gone:
+        async def receive(self):
+            return {"type": "websocket.disconnect"}
+
+        async def send_json(self, message):
+            raise AssertionError("nothing was queued")
+
+        async def close(self, code):
+            raise AssertionError("the queue was not closed")
+
+    async def run():
+        await asyncio.wait_for(_forward(Gone(), Subscriber("client"), lambda batch: batch), timeout=2)
+
+    asyncio.run(run())
+
+    class Listening(Gone):
+        def __init__(self):
+            self.sent = []
+
+        async def receive(self):
+            await asyncio.sleep(3600)
+
+        async def send_json(self, message):
+            self.sent.append(message)
+
+        async def close(self, code):
+            self.closed = code
+
+    async def deliver():
+        socket, subscriber = Listening(), Subscriber("client")
+        subscriber.offer([{"n": 1}])
+        subscriber.queue.put_nowait(None)  # the session ended after one batch
+        await asyncio.wait_for(_forward(socket, subscriber, lambda batch: batch), timeout=2)
+        return socket
+
+    socket = asyncio.run(deliver())
+    assert socket.sent == [{"n": 1}] and socket.closed == 4410
