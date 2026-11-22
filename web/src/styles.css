@@ -4524,6 +4524,16 @@ p.session-badge {
   color: var(--ink-3);
 }
 
+.access-card {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+}
+
+.access-why {
+  margin: 0 4px;
+}
+
 .chip:disabled {
   opacity: 0.45;
   cursor: default;
@@ -4819,7 +4829,7 @@ p.session-badge {
 
 .amp-row {
   display: grid;
-  grid-template-columns: 64px 1fr auto;
+  grid-template-columns: 92px 1fr auto;
   gap: 2px 10px;
   align-items: center;
   margin-top: 8px;

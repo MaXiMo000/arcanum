@@ -5,11 +5,13 @@ import { EngineLab } from "./EngineLab";
 import { PoolLab } from "./PoolLab";
 import { RaftLab } from "./RaftLab";
 import { ScalingLab } from "./ScalingLab";
+import { AccessLab } from "./AccessLab";
 
 const LABS = [
   { id: "engines", label: "B+tree vs LSM tree", Lab: EngineLab },
   { id: "buffer-pool", label: "Buffer pool policies", Lab: PoolLab },
   { id: "replication", label: "Replication (Raft)", Lab: RaftLab },
+  { id: "access", label: "Access methods", Lab: AccessLab },
   { id: "scaling", label: "Scaling (TPC-H)", Lab: ScalingLab },
 ] as const;
 type LabId = (typeof LABS)[number]["id"];

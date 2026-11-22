@@ -414,6 +414,17 @@ export interface ImportRequest {
   header: boolean;
 }
 
+type AccessEngine = "btree" | "hash" | "column";
+
+export interface AccessResult {
+  rows: number;
+  load_ms: Record<AccessEngine, number>;
+  queries: { key: string; title: string; about: string; per: "query" | "batch"; pages: Record<AccessEngine, number>;
+    answer: number | null; agree: boolean | null }[];
+  engines: Record<AccessEngine, { pages: number; bytes: number }>;
+  details: { hash_splits: number; hash_doublings: number; hash_depth: number; column_pages: Record<string, number> };
+}
+
 export interface ScalingQuery {
   title: string;
   about: string;
@@ -514,6 +525,8 @@ export const api = {
     call<QueryReply>("POST", `${sessionPath(id)}/tickets/${encodeURIComponent(ticket)}/cancel`),
   state: (id: string) => call<EngineState>("GET", `${sessionPath(id)}/state`),
   lab: (id: string, params: LabParams) => call<LabResult>("POST", `${sessionPath(id)}/labs/engines`, params),
+  accessLab: (id: string, params: { rows: number }) =>
+    call<AccessResult>("POST", `${sessionPath(id)}/labs/access`, params),
   scalingLab: (id: string) => call<ScalingResult>("POST", `${sessionPath(id)}/labs/scaling`, {}),
   poolLab: (id: string, params: PoolLabParams) => call<PoolLabResult>("POST", `${sessionPath(id)}/labs/buffer-pool`, params),
   cluster: (id: string, request: ClusterRequest) => call<ClusterReply>("POST", `${sessionPath(id)}/cluster`, request),

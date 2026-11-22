@@ -598,3 +598,10 @@ def test_students_follow_the_teachers_lesson_and_ask_questions_only_the_teacher_
     assert client.delete(f"/classrooms/{code}/questions/{asked.json()['id']}", headers=teacher).status_code == 204
     assert client.get(f"/classrooms/{code}", headers=teacher).json()["questions"] == []
     assert client.get(f"/classrooms/{code}").json()["lesson"] == {"id": "joins", "step": 2}
+
+
+def test_the_access_methods_lab_runs_through_the_server(client):
+    session = new_session(client)
+    reply = client.post(f"/sessions/{session}/labs/access", json={"rows": 1000})
+    assert reply.status_code == 200 and {q["key"] for q in reply.json()["queries"]} >= {"point", "range", "sum"}
+    assert client.post(f"/sessions/{session}/labs/access", json={"rows": 10**6}).status_code == 422
