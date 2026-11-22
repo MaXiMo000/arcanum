@@ -210,7 +210,7 @@ class _Parser:
             return self.query()
         tok = self.tok
         word = self.accept_kw("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "BEGIN", "COMMIT",
-                              "ROLLBACK", "EXPLAIN", "ANALYZE", "SAVEPOINT", "RELEASE", "START", "END")
+                              "ROLLBACK", "EXPLAIN", "ANALYZE", "SAVEPOINT", "RELEASE", "START", "END", "VACUUM")
         if word == "INSERT":
             return self.insert()
         if word == "UPDATE":
@@ -244,6 +244,9 @@ class _Parser:
             return n.Explain(self.statement(), analyze)
         if word == "ANALYZE":
             return n.Analyze(self.ident("a table name") if self.is_name() else None)
+        if word == "VACUUM":
+            full = bool(self.accept_kw("FULL"))
+            return n.Vacuum(self.ident("a table name") if self.is_name() else None, full)
         raise self.error(f"expected a statement, got {self.describe(tok)}", tok)
 
     def insert(self):

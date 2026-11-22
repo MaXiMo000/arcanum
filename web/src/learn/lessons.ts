@@ -861,6 +861,94 @@ SELECT id, ms FROM visits WHERE page = '/page-7';`,
     ],
   },
   {
+    id: "vacuum",
+    title: "Old versions and VACUUM",
+    summary: "Why changed rows leave versions behind, what keeps them alive, and what VACUUM gives back.",
+    minutes: 5,
+    steps: [
+      {
+        id: "snapshot",
+        title: "Session B takes a snapshot",
+        body: [
+          "In REPEATABLE READ, a transaction sees the database as it was at its first statement, for as long as it runs. Session B opens one and reads the orders.",
+        ],
+        sql: `BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*), round(sum(amount), 2) FROM orders;`,
+        session: "B",
+        focus: "results",
+        check: (ctx) => ctx.state?.sessions.B.xid !== null && ctx.state?.sessions.B.xid !== undefined,
+        success: (ctx) => `Session B saw a total of ${firstValue(ctx, 1)}, and its transaction stays open.`,
+        hint: "Session B already had a transaction open. Run COMMIT in session B (the playground's two-session mode), then this step again.",
+      },
+      {
+        id: "churn",
+        title: "Session A changes every order twice",
+        body: [
+          "An UPDATE does not overwrite a row: it adds a new version and marks the old one as replaced. Session B may still need the old ones, so they stay.",
+        ],
+        sql: `UPDATE orders SET amount = amount + 1;
+UPDATE orders SET amount = amount - 1;`,
+        focus: "results",
+        check: (ctx) => ctx.outcome?.results.filter((r) => r.status.startsWith("UPDATE")).length === 2,
+        success: () => "Every order now holds three versions: the one B sees, and two newer ones. The Row versions panel on the map shows them.",
+      },
+      {
+        id: "stuck",
+        title: "VACUUM cannot remove them yet",
+        body: [
+          "VACUUM drops versions that no snapshot can see any more. B's snapshot can see the oldest ones, so they must stay.",
+        ],
+        sql: "VACUUM orders;",
+        focus: "results",
+        check: (ctx) => Number(firstValue(ctx, 3)) > 0,
+        success: (ctx) =>
+          `${firstValue(ctx, 3)} old versions kept, for ${firstValue(ctx, 8)}. They take ${Number(firstValue(ctx, 5)).toLocaleString()} bytes of row data. In PostgreSQL this is how one forgotten transaction makes tables bloat.`,
+        hint: "Nothing was held: session B's transaction may have ended. Start again from the first step.",
+      },
+      {
+        id: "release",
+        title: "Session B finishes",
+        body: ["Session B reads once more (still its snapshot, so the old total) and commits."],
+        sql: `SELECT count(*), round(sum(amount), 2) FROM orders;
+COMMIT;`,
+        session: "B",
+        focus: "results",
+        check: (ctx) => ctx.outcome?.results.some((r) => r.status === "COMMIT") ?? false,
+        success: (ctx) =>
+          `B still saw ${firstValue(ctx, 1, 0)}. With its snapshot gone, nobody needs the old versions; Arcanum prunes the rows a transaction touched when it commits, as PostgreSQL prunes pages as it goes.`,
+      },
+      {
+        id: "clean",
+        title: "VACUUM again",
+        body: ["Now VACUUM finds nothing to keep."],
+        sql: "VACUUM orders;",
+        focus: "results",
+        check: (ctx) => Number(firstValue(ctx, 3)) === 0,
+        success: (ctx) => {
+          const before = ctx.earlier("stuck")?.results[0]?.rows[0]?.[5];
+          const now = Number(firstValue(ctx, 5));
+          return before !== undefined
+            ? `${now.toLocaleString()} bytes of row data, down from ${Number(before).toLocaleString()}: one version per row again.`
+            : `${now.toLocaleString()} bytes of row data: one version per row.`;
+        },
+      },
+      {
+        id: "full",
+        title: "VACUUM FULL",
+        body: [
+          "VACUUM frees versions inside rows, but the B+tree keeps the pages it has. VACUUM FULL rewrites the table and its indexes bottom up, packing every page, and gives the rest back to the free list.",
+          "It rewrites whole tables, so like a schema change it waits for other sessions' transactions.",
+        ],
+        sql: "VACUUM FULL orders;",
+        focus: "results",
+        check: (ctx) => Number(firstValue(ctx, 7)) < Number(firstValue(ctx, 6)),
+        success: (ctx) =>
+          `${firstValue(ctx, 6)} pages became ${firstValue(ctx, 7)}: inserting rows one by one splits pages in half, while a bulk rewrite fills them.`,
+        hint: "Nothing to compact this time: the trees were already dense.",
+      },
+    ],
+  },
+  {
     id: "wal",
     title: "The write-ahead log",
     summary: "Why a committed change survives a crash.",

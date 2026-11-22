@@ -103,6 +103,63 @@ class BTree:
         tree._store(Node(tree.root, True))
         return tree
 
+    @classmethod
+    def bulk_load(cls, pager, items, max_keys=None, fill=0.9):
+        """A new tree holding items, a sorted iterable of (key, value), built bottom up.
+
+        Leaves are packed to `fill` of a page (or to max_keys) in one pass and
+        the levels above built over them, so the tree comes out dense: inserting
+        the same items one by one splits every leaf in half on the way. Used to
+        rewrite a table compactly (VACUUM FULL).
+        """
+        tree = cls(pager, pager.allocate(), max_keys)  # the root page is taken first: it never moves
+        level = tree._pack([Node(0, True, [k], [v]) for k, v in items], fill)
+        while len(level) > 1:
+            level = tree._pack(level, fill, parents=True)
+        top = level[0] if level else Node(tree.root, True)
+        if top.page:
+            pager.free(top.page)
+        top.page = tree.root
+        tree._store(top)
+        return tree
+
+    def _pack(self, nodes, fill, parents=False):
+        """Pack single-entry leaves into full leaves, or a level of nodes under new parents."""
+        limit = CAPACITY * fill
+        keys_limit = self.max_keys  # a key cap is a demo setting, not a byte budget: fill it
+        groups, current, size = [], [], _NODE.size
+        for node in nodes:
+            entry = 6 + len(node.keys[0]) + (0 if parents else len(node.values[0]))
+            if current and (size + entry > limit or (keys_limit is not None and len(current) >= keys_limit + parents)):
+                groups.append(current)
+                current, size = [], _NODE.size
+            current.append(node)
+            size += entry
+        if current:
+            groups.append(current)
+        if len(groups) > 1 and len(groups[-1]) * 2 < len(groups[-2]):  # even out a short last group
+            both = groups[-2] + groups[-1]
+            groups[-2:] = [both[:len(both) // 2], both[len(both) // 2:]]
+        out = []
+        for group in groups:
+            page = self.pager.allocate()
+            if parents:
+                node = Node(page, False, [self._first_key(c) for c in group[1:]], children=[c.page for c in group])
+            else:
+                node = Node(page, True, [n.keys[0] for n in group], [n.values[0] for n in group])
+            out.append(node)
+        if not parents:
+            for left, right in pairwise(out):
+                left.next_leaf = right.page
+        for node in out:
+            self._store(node)
+        return out
+
+    def _first_key(self, node):
+        while not node.leaf:
+            node = self._load(node.children[0])
+        return node.keys[0]
+
     # ---- lookups -----------------------------------------------------------
 
     def get(self, key):

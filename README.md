@@ -455,6 +455,22 @@ transaction control statements: each log entry is one autocommit statement. A ra
 crashes, restarts and partitions and checks Raft's safety properties: at most one leader per term, and
 committed log prefixes that never disagree.
 
+## Row versions and VACUUM
+
+Every UPDATE and DELETE keeps the old version of the row beside the new one, so transactions that started
+earlier still see what they saw. When a transaction commits, Arcanum prunes the rows it touched: versions
+no snapshot can see any more are dropped and the rest frozen, as PostgreSQL prunes pages as it goes. While
+a long REPEATABLE READ or SERIALIZABLE transaction stays open, though, the versions it can see must stay,
+and rows grow.
+
+`VACUUM [table]` prunes every row of the table (or of every table) and returns one row per table: rows,
+versions removed, old versions it had to keep and the transaction keeping them, and the table's row bytes
+and pages before and after. `VACUUM FULL` also rewrites each table and its indexes bottom up
+(`BTree.bulk_load`), packing every page, and returns the pages it no longer needs to the free list:
+inserting rows one by one splits pages in half, so a compact rewrite is often a third smaller. Like
+PostgreSQL, VACUUM cannot run inside a transaction block, and VACUUM FULL waits for other sessions'
+transactions as a schema change does.
+
 ## Durability and crash recovery
 
 Arcanum keeps a write-ahead log next to the database file (`<name>-wal`):
@@ -478,10 +494,10 @@ never a mix.
 
 Two modes share one screen: the database in the middle, an inspector on the right.
 
-- **Learn**: fifteen short lessons: B+trees, growth and merges, indexes, the buffer pool, the optimizer,
+- **Learn**: sixteen short lessons: B+trees, growth and merges, indexes, the buffer pool, the optimizer,
   hash, merge and nested-loop joins, grouping, sorting and windows, statistics and estimates, the query
   advisor, designing indexes (composite, redundant, OR across two), two sessions at once, write skew and
-  SERIALIZABLE, transactions, the log and crash recovery. Every step runs real SQL on your own database
+  SERIALIZABLE, transactions, old versions and VACUUM, the log and crash recovery. Every step runs real SQL on your own database
   and checks what the engine actually did (the plan, nodes visited, pages read, splits, log frames) before
   moving on.
 - **Play**: an editor with syntax highlighting, name completion and errors underlined, example queries
@@ -786,6 +802,5 @@ tests/
 
 Arcanum aims to be the clearest way to see how a database works from the inside. Next:
 
-- **Vacuum**: dead row versions piling up under MVCC, and the space a vacuum gives back, drawn on the map.
 - **Sharding lab**: one table split across nodes by hash or by range, and what queries that cross shards cost.
 

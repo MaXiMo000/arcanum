@@ -23,7 +23,9 @@ from .plan import IndexScan, TableScan, explain, plan_tree
 from .ssi import SERIALIZABLE, SSI
 
 _DDL = (n.CreateTable, n.DropTable, n.CreateIndex, n.DropIndex, n.CreateView, n.DropView, n.AlterTable)
-_WRITES = (n.Insert, n.Update, n.Delete, n.Analyze, *_DDL)
+_WRITES = (n.Insert, n.Update, n.Delete, n.Analyze, n.Vacuum, *_DDL)
+VACUUM_COLUMNS = ["table", "rows", "versions_removed", "old_versions_kept", "bytes_before", "bytes_after",
+                  "pages_before", "pages_after", "kept_for"]
 
 
 @dataclass
@@ -169,7 +171,9 @@ class Database:
         if isinstance(statement, (n.Savepoint, n.RollbackTo, n.Release)):
             return self._savepoint(conn, statement)
 
-        if isinstance(statement, _DDL):
+        if isinstance(statement, n.Vacuum) and conn.txn is not None:
+            raise SqlError("VACUUM cannot run inside a transaction block")
+        if isinstance(statement, _DDL) or (isinstance(statement, n.Vacuum) and statement.full):
             others = [c for c in self.connections.values() if c is not conn and c.txn is not None]
             if others:
                 raise LockWaitError(f"session {others[0].name} has a transaction open; PostgreSQL would make this "
@@ -359,6 +363,8 @@ class Database:
             return self._traced(result, statement, text) if trace else result
         if isinstance(statement, n.CreateView):
             return self._create_view(binder, statement, text)
+        if isinstance(statement, n.Vacuum):
+            return self._vacuum(binder, statement)
         if isinstance(statement, n.AlterTable):
             Alter(self, Writer(self, binder)).run(statement)
             return Result(status="ALTER TABLE")
@@ -398,6 +404,22 @@ class Database:
                 self.catalog.analyze(table, self._snapshot)
             return Result(status="ANALYZE")
         raise SqlError(f"Arcanum doesn't support {type(statement).__name__} yet")
+
+    def _vacuum(self, binder, statement):
+        """Prune every row of the table (or of all tables) against the oldest snapshot still in use; FULL also
+        rewrites each table and index compactly. One row per table says what happened and, when old
+        versions had to stay, which transaction still needs them."""
+        tables = [binder.table(statement.table)] if statement.table else list(self.catalog.tables.values())
+        holders = [t for t in self.mvcc.running.values() if t is not self._txn and t.snapshot is not None]
+        oldest = min(holders, key=lambda t: t.snapshot.xmin, default=None)
+        horizon = self.mvcc.horizon(exclude=self._txn)
+        rows = []
+        for table in tables:
+            done = self.catalog.vacuum_table(table, horizon, statement.full)
+            held = f"session {oldest.owner}'s transaction {oldest.xid}" if done["kept"] and oldest else None
+            rows.append((table.name, done["rows"], done["removed"], done["kept"], done["bytes_before"],
+                         done["bytes_after"], done["pages_before"], done["pages_after"], held))
+        return Result(VACUUM_COLUMNS, rows, status="VACUUM FULL" if statement.full else "VACUUM", row_total=len(rows))
 
     def _create_view(self, binder, statement, text):
         name = statement.name

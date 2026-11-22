@@ -440,3 +440,9 @@ class Explain:
 @dataclass(slots=True)
 class Analyze:
     table: str | None = None
+
+
+@dataclass(slots=True)
+class Vacuum:
+    table: str | None = None  # every table when None
+    full: bool = False  # also rewrite each table and index compactly

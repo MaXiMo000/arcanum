@@ -732,6 +732,44 @@ class Catalog:
         self.set_meta("unsettled", 1 if self.unsettled else 0)
         return mentioned
 
+    def vacuum_table(self, table, horizon, full=False):
+        """VACUUM one table: prune every row (not only those touched since the last prune), and with full,
+        rebuild the table's tree and its indexes' trees compactly, giving their spare pages back to the
+        free list. Returns what it found and did."""
+        before_versions, before_bytes = self._version_count(table), self._data_bytes(table)
+        before_pages = self.tree_pages(table)
+        self.unsettled[table.name] = {key for key, _ in self.btree(table.root).scan()}
+        self.prune(horizon)
+        if full:
+            table.root = self._rebuild(table.root)
+            self.put_table(table, table.sql)
+            for index in table.indexes:
+                index.root = self._rebuild(index.root)
+                self.put_index(index, index.sql)
+        rows = sum(1 for _ in self.btree(table.root).scan())
+        after_versions = self._version_count(table)
+        return {"rows": rows, "removed": before_versions - after_versions, "kept": after_versions - rows,
+                "bytes_before": before_bytes, "bytes_after": self._data_bytes(table),
+                "pages_before": before_pages, "pages_after": self.tree_pages(table)}
+
+    def _data_bytes(self, table):
+        """Bytes of the table's stored rows, every version included (keys and values, without page overhead)."""
+        return sum(len(key) + len(value) for key, value in self.btree(table.root).scan())
+
+    def tree_pages(self, table):
+        """Pages in the table's tree and its indexes' trees (overflow pages not included)."""
+        return sum(len(self.btree(root).dump()) for root in [table.root, *(i.root for i in table.indexes)])
+
+    def _version_count(self, table):
+        return sum(len(self._versions(table, value)) for _, value in self.btree(table.root).scan())
+
+    def _rebuild(self, root):
+        """A dense copy of the tree at root (bulk loaded); the old tree's pages are freed."""
+        old = self.btree(root)
+        new = BTree.bulk_load(self.pager, list(old.scan()), self.max_keys)
+        old.drop()
+        return new.root
+
     def vacuum(self, horizon):
         """Prune every row of every table (used at open when rows may still hold unsettled versions)."""
         for table in self.tables.values():
