@@ -4,11 +4,13 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { api, ApiError, type ClusterNode, type ClusterReply, type ClusterRequest, type ClusterState, type NodeName } from "../api";
 import { formatValue } from "../format";
+import { LabTour, type TourStep } from "./LabTour";
 
 const NAMES: NodeName[] = ["n1", "n2", "n3"];
 const SPOT: Record<NodeName, [number, number]> = { n1: [160, 46], n2: [52, 214], n3: [268, 214] };
 const R = 36;
 const TICK_MS = 160; // playback: one simulated tick per frame
+const TOUR_TICK_MS = 70; // a tour step's ticks, drawn quicker
 const BATCH = 10; // ticks fetched per request while playing
 const TIMEOUT_MAX = 20; // the longest election timeout, for the timer ring
 const WRITES = [
@@ -112,6 +114,61 @@ export function RaftLab({ sessionId }: { sessionId: string | null }) {
 
   const state = frame ?? reply?.state ?? null;
   const leader = state?.nodes.find((x) => x.up && x.role === "leader") ?? null;
+
+  /** Run `ticks` ticks and draw them one by one; the state at the end. */
+  const animate = async (ticks: number) => {
+    setPlaying(false);
+    const r = await act({ action: "tick", ticks });
+    for (const f of r?.frames ?? []) {
+      setFrame(f);
+      await new Promise((done) => window.setTimeout(done, TOUR_TICK_MS));
+    }
+    return r?.state ?? null;
+  };
+  /** The leader of the majority, ticking until there is one. */
+  const electLeader = async () => {
+    let current = state;
+    for (let i = 0; i < 4; i++) {
+      const found = current?.nodes.find((n) => n.up && n.role === "leader" && current?.groups.some((g) => g.length > 1 && g.includes(n.name)));
+      if (found) return found.name;
+      current = await animate(20);
+    }
+    return null;
+  };
+  const stranded = useRef<NodeName | null>(null); // the leader the tour cuts off
+  const tour: TourStep[] = [
+    { title: "Elect a leader", body: "Followers time out (the orange rings), one stands for election, and a majority of votes makes it leader.",
+      run: electLeader },
+    { title: "Replicate a write", body: "The leader appends the statement and sends it in AppendEntries; once two of three nodes store it, it commits and every node applies it.",
+      run: async () => {
+        await electLeader();
+        await act({ action: "write", sql: WRITES[0]!.sql });
+        await animate(15);
+      } },
+    { title: "Cut off the leader", body: "Isolate the leader. The other two stop hearing heartbeats, time out and elect a new leader in a higher term. The old one still thinks it leads.",
+      run: async () => {
+        const name = await electLeader();
+        if (!name) return;
+        stranded.current = name;
+        await act({ action: "partition", groups: [[name], NAMES.filter((n) => n !== name)] });
+        await animate(45);
+      } },
+    { title: "Write to the stranded leader", body: "It accepts the write and appends it, but no majority can store it, so it never commits: an outlined entry that is never applied.",
+      run: async () => {
+        if (!stranded.current) return;
+        await act({ action: "write", sql: WRITES[2]!.sql, node: stranded.current });
+        await animate(10);
+      } },
+    { title: "Read from it", body: "A client still talking to the old leader gets stale data: it has not seen what the new majority committed, nor its own uncommitted write.",
+      run: async () => {
+        if (stranded.current) await readFrom(stranded.current);
+      } },
+    { title: "Heal the network", body: "The old leader hears the higher term, steps down, and the new leader overwrites its uncommitted entry: every log ends identical.",
+      run: async () => {
+        await act({ action: "heal" });
+        await animate(30);
+      } },
+  ];
   return (
     <div className="engine-lab" ref={root}>
       <header className="lab-head">
@@ -122,6 +179,8 @@ export function RaftLab({ sessionId }: { sessionId: string | null }) {
           elect a new leader and repair the logs.
         </p>
       </header>
+
+      <LabTour steps={tour} busy={busy || !sessionId} />
 
       <section className="lab-controls raft-controls" aria-label="Clock and faults">
         <div className="raft-buttons">

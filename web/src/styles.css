@@ -4321,6 +4321,76 @@ p.session-badge {
   text-transform: uppercase;
 }
 
+.lab-tour {
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+  border-radius: 14px;
+  background: var(--panel);
+}
+
+.lab-tour summary {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  cursor: pointer;
+}
+
+.lab-tour ol {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: tour;
+}
+
+.lab-tour li {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  counter-increment: tour;
+}
+
+.lab-tour li::before {
+  content: counter(tour);
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--panel-2);
+  color: var(--ink-2);
+  font: 600 12px var(--mono);
+}
+
+.lab-tour li.done::before {
+  content: "✓";
+  background: color-mix(in srgb, var(--ok) 25%, transparent);
+  color: var(--ok);
+}
+
+.lab-tour li.next {
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
+.lab-tour li p {
+  margin: 2px 0 0;
+}
+
+@media (max-width: 560px) {
+  .lab-tour li {
+    grid-template-columns: 26px minmax(0, 1fr);
+  }
+  .lab-tour li .button {
+    grid-column: 2;
+    justify-self: start;
+  }
+}
+
 .chip:disabled {
   opacity: 0.45;
   cursor: default;

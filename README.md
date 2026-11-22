@@ -475,7 +475,8 @@ Two modes share one screen: the database in the middle, an inspector on the righ
   `SERIALIZABLE`, the read/write dependencies between transactions appear as they form.
 - **Labs**: the B+tree versus LSM tree comparison, with a scrubber over the LSM tree's levels, and the
   buffer pool policies compared on one recorded trace, a three-node Raft cluster you can step, partition
-  and crash, and TPC-H-style queries charted as the data grows (see above).
+  and crash, and TPC-H-style queries charted as the data grows (see above). The first three have a guided
+  tour: a few experiments in order, each set up and run with one button, with what to look for.
 
 The inspector explains every statement:
 
@@ -755,5 +756,4 @@ tests/
 
 Arcanum aims to be the clearest way to see how a database works from the inside. Next:
 
-- **Lessons for the labs**: guided tours of replacement policies, replication and scaling.
 - **Classroom extras**: a teacher's lesson steps followed in lockstep, and questions sent back to the teacher.

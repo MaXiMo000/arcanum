@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { api, type PoolLabParams, type PoolLabResult, type PoolPolicy } from "../api";
 import { formatCount } from "../format";
+import { LabTour } from "./LabTour";
 import { useLab } from "../useLab";
 import { BarCompare } from "./BarCompare";
 import { LineChart } from "./LineChart";
@@ -25,6 +26,17 @@ const REAL = POLICIES.filter((p) => p.key !== "optimal");
 
 const percent = (rate: number) => `${(rate * 100).toFixed(rate > 0 && rate < 0.1 ? 1 : 0)}%`;
 
+const TOUR: { title: string; body: string; params: Partial<PoolLabParams> }[] = [
+  { title: "A scan floods LRU", params: { workload: "hot-scan", pool_pages: 32 },
+    body: "Hot keys keep the hit rate high until a full scan pushes them all out: the dips in the hit rate over time. 2Q sends the scan's pages through a small queue and keeps the hot ones." },
+  { title: "The loop LRU always loses", params: { workload: "loop", pool_pages: 64 },
+    body: "A table a little larger than the pool, scanned again and again: LRU and Clock evict each page just before it is needed and hit 0%. Only the optimal policy, which sees the future, keeps some." },
+  { title: "Give it memory", params: { workload: "hot-scan", pool_pages: 256 },
+    body: "With room for most of the table every policy converges: the hit rate against pool size shows where more memory stops paying off." },
+  { title: "Two trees, one pool", params: { workload: "index", pool_pages: 32 },
+    body: "Lookups through a secondary index read the index tree and then the table: two trees compete for the same pages." },
+];
+
 export function PoolLab({ sessionId }: { sessionId: string | null }) {
   const [params, setParams] = useState<PoolLabParams>(DEFAULTS);
   const { result, running, error, run } = useLab(sessionId, api.poolLab);
@@ -40,6 +52,16 @@ export function PoolLab({ sessionId }: { sessionId: string | null }) {
           pager can use. Every miss is a disk read.
         </p>
       </header>
+
+      <LabTour busy={running || !sessionId} steps={TOUR.map(({ title, body, params: changes }) => ({
+        title,
+        body,
+        run: () => {
+          const next = { ...DEFAULTS, ...changes };
+          setParams(next);
+          return run(next);
+        },
+      }))} />
 
       <section className="lab-controls" aria-label="Workload">
         <div className="lab-order lab-wide" role="radiogroup" aria-label="Workload">

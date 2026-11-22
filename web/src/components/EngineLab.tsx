@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type LabParams, type LabResult, type LsmMoment, type LsmShape } from "../api";
 import { formatCount } from "../format";
+import { LabTour } from "./LabTour";
 import { useLab } from "../useLab";
 import { BarCompare, type Bar } from "./BarCompare";
 import { LineChart, type Series } from "./LineChart";
@@ -17,6 +18,17 @@ function bytes(n: number): string {
 }
 
 const times = (a: number, b: number) => (Math.max(a, b) / Math.max(Math.min(a, b), 1e-9)).toFixed(1);
+
+const TOUR: { title: string; body: string; params: Partial<LabParams> }[] = [
+  { title: "Random keys", params: { order: "random", updates: 0.5 },
+    body: "Writes land all over the key space. The B+tree logs a whole page for almost every one; the LSM tree only appends, so it writes several times fewer bytes." },
+  { title: "Sequential keys", params: { order: "sequential", updates: 0 },
+    body: "Keys arrive in order and fill one page at a time, so the B+tree's page writes are cheap and its advantage on reads shows: one tree, one descent." },
+  { title: "Overwrite everything", params: { order: "random", updates: 1 },
+    body: "Every key is written twice. Old versions pile up in the LSM tree's levels until compaction drops them: watch space amplification and the compactions." },
+  { title: "More memory", params: { order: "random", updates: 0.5, memory_pages: 64 },
+    body: "A bigger memtable means fewer, larger flushes, and a bigger buffer pool means fewer B+tree page writes. Compare with the first step." },
+];
 
 export function EngineLab({ sessionId }: { sessionId: string | null }) {
   const [params, setParams] = useState<LabParams>(DEFAULTS);
@@ -33,6 +45,16 @@ export function EngineLab({ sessionId }: { sessionId: string | null }) {
           merges files later. Run one workload on both, on equal memory, and count every byte each one reads and writes.
         </p>
       </header>
+
+      <LabTour busy={running || !sessionId} steps={TOUR.map(({ title, body, params: changes }) => ({
+        title,
+        body,
+        run: () => {
+          const next = { ...DEFAULTS, ...changes };
+          setParams(next);
+          return run(next);
+        },
+      }))} />
 
       <section className="lab-controls" aria-label="Workload">
         <label>
