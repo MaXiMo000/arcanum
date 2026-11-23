@@ -523,7 +523,11 @@ async function call<T>(method: string, path: string, body?: unknown, token?: str
   }
   if (!response.ok) {
     const error = (data as { error?: ApiErrorBody } | null)?.error;
-    throw new ApiError(response.status, error ?? { type: "HttpError", message: `request failed (${response.status})` });
+    // A gateway error with no body of ours: the server is restarting or waking up (hosts that sleep when idle).
+    const message = [502, 503, 504].includes(response.status)
+      ? "the server is starting up; try again in a few seconds"
+      : `request failed (${response.status})`;
+    throw new ApiError(response.status, error ?? { type: "HttpError", message });
   }
   return data as T;
 }
