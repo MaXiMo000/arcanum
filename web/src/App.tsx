@@ -265,8 +265,9 @@ export default function App() {
       /** Sends the work instead of running `sql` (a CSV import); `sql` then only describes it. */
       send?: (id: string) => Promise<QueryReply>,
     ): Promise<Outcome | ApiError | Waiting | null> => {
-      let id = idRef.current;
-      if (!id) return null;
+      const opened = idRef.current;
+      if (!opened) return null;
+      let id: string = opened; // replaced if the server forgot the session and a fresh one opens
       setRunError(null);
       setComparison(null);
 
