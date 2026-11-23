@@ -469,7 +469,7 @@ export default function App() {
   };
   const stage =
     view === "lab" ? (
-      <Labs sessionId={sessionId} />
+      <Labs sessionId={sessionId} limits={state?.limits.labs ?? null} />
     ) : stageProps && view === "3d" ? (
       <Suspense fallback={<div className="stage-loading">Loading the 3D view…</div>}>
         <Vault {...stageProps} onUnavailable={use2d} />

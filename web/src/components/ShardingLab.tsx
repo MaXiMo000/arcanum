@@ -1,9 +1,9 @@
 // Sharding: one table split across several databases three ways, each question routed to the shards that can
 // answer it, and what that costs.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, type ShardingResult } from "../api";
 import { formatCount } from "../format";
-import { useLab } from "../useLab";
+import { labMax, useLab, type LabLimits } from "../useLab";
 import { BarCompare } from "./BarCompare";
 
 const CLASS: Record<string, string> = { "hash-id": "eng-btree", "range-id": "eng-lsm", "hash-customer": "eng-third" };
@@ -19,9 +19,15 @@ const WHY: Record<string, string> = {
     "A question about everything asks every shard whatever the key. Each sums its part and the router adds the parts: the work is split, so the busiest shard reads a fraction.",
 };
 
-export function ShardingLab({ sessionId }: { sessionId: string | null }) {
+export function ShardingLab({ sessionId, limits }: { sessionId: string | null; limits?: LabLimits }) {
   const [shards, setShards] = useState(4);
   const [rows, setRows] = useState(4000);
+  const mostShards = labMax(limits, "shards", 2, 8, 1);
+  const mostRows = labMax(limits, "rows", 1000, 10000, 1000);
+  useEffect(() => {
+    setShards((s) => Math.min(s, mostShards)); // this server's limits arrive with the session
+    setRows((r) => Math.min(r, mostRows));
+  }, [mostShards, mostRows]);
   const { result, running, error, run } = useLab(sessionId, api.shardingLab);
 
   return (
@@ -40,13 +46,13 @@ export function ShardingLab({ sessionId }: { sessionId: string | null }) {
           <span>
             Shards <b>{shards}</b>
           </span>
-          <input type="range" min={2} max={8} step={1} value={shards} onChange={(e) => setShards(Number(e.target.value))} />
+          <input type="range" min={2} max={mostShards} step={1} value={shards} onChange={(e) => setShards(Number(e.target.value))} />
         </label>
         <label>
           <span>
             Orders <b>{formatCount(rows)}</b>
           </span>
-          <input type="range" min={1000} max={10000} step={1000} value={rows} onChange={(e) => setRows(Number(e.target.value))} />
+          <input type="range" min={1000} max={mostRows} step={1000} value={rows} onChange={(e) => setRows(Number(e.target.value))} />
         </label>
         <button className="button primary" onClick={() => void run({ shards, rows })} disabled={running || !sessionId}>
           {running ? (

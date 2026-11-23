@@ -29,3 +29,11 @@ services:
         value: "100000"
       - key: ARCANUM_SESSION_TTL
         value: "900"
+      # Labs run real workloads. On the free plan's tenth of a CPU, a small slice of their size range keeps
+      # each lab under a minute; on Starter (0.5 CPU) or larger, raise this towards 1.
+      - key: ARCANUM_LAB_SCALE
+        value: "0.15"
+      - key: ARCANUM_LAB_TIMEOUT
+        value: "120"
+      - key: ARCANUM_MAX_CLASSROOMS
+        value: "10"

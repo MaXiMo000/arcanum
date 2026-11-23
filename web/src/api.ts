@@ -162,6 +162,8 @@ export interface Limits {
   max_pages: number;
   max_sql_bytes: number;
   max_import_bytes: number;
+  /** Per lab, the largest value this server allows for each size field (and the scaling lab's steps). */
+  labs?: Record<string, Record<string, number>>;
 }
 
 /** The two database sessions each visitor gets, side by side. */

@@ -657,3 +657,43 @@ def test_forwarding_ends_when_the_client_leaves_even_with_nothing_to_send():
 
     socket = asyncio.run(deliver())
     assert socket.sent == [{"n": 1}] and socket.closed == 4410
+
+
+def test_lab_sizes_follow_the_servers_lab_scale(make_client):
+    client = make_client(lab_scale=0.4, labs_per_minute=100)
+    session = new_session(client)
+    labs = client.post("/sessions").json()["limits"]["labs"]
+    assert labs["sharding"] == {"shards": 4, "rows": 4600} and labs["scaling"] == {"steps": 3}
+    refused = client.post(f"/sessions/{session}/labs/sharding", json={"shards": 8, "rows": 2000})
+    assert refused.status_code == 422 and "limited to 4" in refused.json()["error"]["message"]
+    ok = client.post(f"/sessions/{session}/labs/sharding", json={"shards": 4, "rows": 1000})
+    assert ok.status_code == 200
+    scaled = client.post(f"/sessions/{session}/labs/scaling", json={}).json()
+    assert len(scaled["sizes"]) == 3  # fewer doubling steps on a small machine
+
+
+def test_a_running_lab_never_takes_a_statement_slot(make_client):
+    client = make_client(max_concurrent_queries=1, max_concurrent_labs=1, labs_per_minute=100)
+    manager = client.app.state.manager
+    session = new_session(client)
+    assert manager.lab_slots is not manager.slots
+
+    async def hold_lab_slot_and_query():
+        await manager.lab_slots.acquire()  # a lab is running somewhere
+        try:
+            return await manager.sessions[session].request({"op": "state", "node_limit": 1})
+        finally:
+            manager.lab_slots.release()
+
+    assert client.portal.call(hold_lab_slot_and_query)["ok"]
+
+
+def test_the_page_carries_absolute_link_preview_images(tmp_path):
+    web = tmp_path / "web"
+    web.mkdir()
+    (web / "index.html").write_text('<meta property="og:image" content="/og.jpg" /><div id="root"></div>')
+    settings = Settings(data_dir=str(tmp_path / "data"), web_dir=str(web), public_url="https://arcanum.example.org/")
+    with TestClient(create_app(settings)) as client:
+        page = client.get("/")
+    assert page.status_code == 200 and 'content="https://arcanum.example.org/og.jpg"' in page.text
+    assert "default-src 'self'" in page.headers["content-security-policy"]  # the page keeps its policy

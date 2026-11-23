@@ -667,10 +667,17 @@ The repository is a ready [Render Blueprint](https://render.com/docs/infrastruct
 Render dashboard choose **New > Blueprint**, pick this repository, and Render builds the `Dockerfile`
 and starts the service from `render.yaml`. The API and the web UI are served together from one URL.
 
-`render.yaml` sizes the limits for the free instance (512 MB): up to 8 sessions at a time, each with
-its own engine process, use under 200 MB. It also enables HSTS and trusts only Render's private proxy
-addresses for `X-Forwarded-For`, so per-client limits see each visitor's real address. Sessions live in
-the instance's temporary storage and end when it restarts, which suits a demo.
+`render.yaml` sizes the limits for the free instance (512 MB, a tenth of a CPU). With six sessions open and
+five of the heaviest labs running at full size at once, the whole service peaked at 192 MB in testing. The free plan's CPU is
+the real limit, so the labs run at a small slice of their size range (`ARCANUM_LAB_SCALE=0.15`); each
+answers in under a minute, and the page's sliders stop at what the server allows. Labs take their own
+slot (`ARCANUM_MAX_CONCURRENT_LABS`), so a running lab never makes a statement wait. On Starter (0.5 CPU)
+or larger, raise the lab scale towards 1.
+
+It also enables HSTS and trusts only Render's private proxy addresses for `X-Forwarded-For`, so per-client
+limits see each visitor's real address. Sessions live in the instance's temporary storage and end when it
+restarts, which suits a demo. A free instance sleeps when idle, so the first visit after a while takes
+about a minute to wake it.
 
 ### Any container host
 

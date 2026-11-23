@@ -1,9 +1,9 @@
 // Three access methods on one table: a B+tree, a hash index and a column store, asked the same questions,
 // each measured by the pages it reads.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, type AccessResult } from "../api";
 import { formatCount } from "../format";
-import { useLab } from "../useLab";
+import { labMax, useLab, type LabLimits } from "../useLab";
 import { BarCompare } from "./BarCompare";
 
 const ENGINES = [
@@ -20,8 +20,10 @@ const WHY: Record<string, string> = {
   insert: "The B+tree and the column store append near the end; new keys hash to buckets all over the index, so it rewrites almost all of them.",
 };
 
-export function AccessLab({ sessionId }: { sessionId: string | null }) {
+export function AccessLab({ sessionId, limits }: { sessionId: string | null; limits?: LabLimits }) {
   const [rows, setRows] = useState(5000);
+  const most = labMax(limits, "rows", 1000, 20000, 1000);
+  useEffect(() => setRows((r) => Math.min(r, most)), [most]); // this server's limits arrive with the session
   const { result, running, error, run } = useLab(sessionId, api.accessLab);
 
   return (
@@ -39,7 +41,7 @@ export function AccessLab({ sessionId }: { sessionId: string | null }) {
           <span>
             Rows <b>{formatCount(rows)}</b>
           </span>
-          <input type="range" min={1000} max={20000} step={1000} value={rows} onChange={(e) => setRows(Number(e.target.value))} />
+          <input type="range" min={1000} max={most} step={1000} value={rows} onChange={(e) => setRows(Number(e.target.value))} />
         </label>
         <button className="button primary" onClick={() => void run({ rows })} disabled={running || !sessionId}>
           {running ? (

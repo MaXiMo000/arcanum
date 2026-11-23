@@ -154,20 +154,23 @@ class Session:
 
     # ---- requests (called from the event loop) ----------------------------------------------
 
-    async def _slot(self):
+    async def _slot(self, slots=None, busy="the server is busy; try again shortly"):
         try:
-            await asyncio.wait_for(self.slots.acquire(), self.settings.queue_timeout)
+            await asyncio.wait_for((slots or self.slots).acquire(), self.settings.queue_timeout)
         except TimeoutError:
-            raise SessionError(503, "ServerBusy", "the server is busy; try again shortly") from None
+            raise SessionError(503, "ServerBusy", busy) from None
 
-    async def request(self, message, timeout=None):
+    async def request(self, message, timeout=None, slots=None, busy="the server is busy; try again shortly"):
+        """Send a message to the worker and wait for its reply, holding one of `slots` (the shared statement
+        slots unless given; labs pass their own, so a long lab never keeps a statement waiting)."""
+        slots = slots or self.slots
         async with self.lock:
-            await self._slot()
+            await self._slot(slots, busy)
             try:
                 self.last_used = time.monotonic()
                 return await asyncio.to_thread(self.call, message, timeout or self.settings.query_timeout)
             finally:
-                self.slots.release()
+                slots.release()
                 self.last_used = time.monotonic()
 
     async def crash(self, during_write):
@@ -229,6 +232,7 @@ class SessionManager:
         self.settings = settings
         self.sessions = {}
         self.slots = None  # created inside the running event loop
+        self.lab_slots = None  # labs run long: they share their own, smaller limit
         data_dir = Path(settings.data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
         if os.name == "posix":
@@ -240,6 +244,7 @@ class SessionManager:
     async def create(self, owner):
         if self.slots is None:
             self.slots = asyncio.Semaphore(self.settings.max_concurrent_queries)
+            self.lab_slots = asyncio.Semaphore(self.settings.max_concurrent_labs)
         owned = sum(1 for s in self.sessions.values() if s.owner == owner)
         if owned >= self.settings.max_sessions_per_client:
             raise SessionError(429, "TooManySessions",

@@ -1,10 +1,10 @@
 // Buffer pool replacement policies: one recorded page-access trace replayed through LRU, Clock and 2Q,
 // with Belady's optimal policy as the ceiling no real policy can reach.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, type PoolLabParams, type PoolLabResult, type PoolPolicy } from "../api";
 import { formatCount } from "../format";
 import { LabTour } from "./LabTour";
-import { useLab } from "../useLab";
+import { capParams, labMax, useLab, type LabLimits } from "../useLab";
 import { BarCompare } from "./BarCompare";
 import { LineChart } from "./LineChart";
 
@@ -37,8 +37,9 @@ const TOUR: { title: string; body: string; params: Partial<PoolLabParams> }[] = 
     body: "Lookups through a secondary index read the index tree and then the table: two trees compete for the same pages." },
 ];
 
-export function PoolLab({ sessionId }: { sessionId: string | null }) {
+export function PoolLab({ sessionId, limits }: { sessionId: string | null; limits?: LabLimits }) {
   const [params, setParams] = useState<PoolLabParams>(DEFAULTS);
+  useEffect(() => setParams((p) => capParams(p, limits)), [limits]); // this server's limits arrive with the session
   const { result, running, error, run } = useLab(sessionId, api.poolLab);
   const set = <K extends keyof PoolLabParams>(key: K, value: PoolLabParams[K]) => setParams((p) => ({ ...p, [key]: value }));
 
@@ -57,7 +58,7 @@ export function PoolLab({ sessionId }: { sessionId: string | null }) {
         title,
         body,
         run: () => {
-          const next = { ...DEFAULTS, ...changes };
+          const next = capParams({ ...DEFAULTS, ...changes }, limits);
           setParams(next);
           return run(next);
         },
@@ -83,13 +84,13 @@ export function PoolLab({ sessionId }: { sessionId: string | null }) {
           <span>
             Rows <b>{formatCount(params.rows)}</b>
           </span>
-          <input type="range" min={500} max={20000} step={500} value={params.rows} onChange={(e) => set("rows", Number(e.target.value))} />
+          <input type="range" min={500} max={labMax(limits, "rows", 500, 20000, 500)} step={500} value={params.rows} onChange={(e) => set("rows", Number(e.target.value))} />
         </label>
         <label>
           <span>
             Lookups <b>{formatCount(params.lookups)}</b>
           </span>
-          <input type="range" min={100} max={5000} step={100} value={params.lookups} onChange={(e) => set("lookups", Number(e.target.value))} />
+          <input type="range" min={100} max={labMax(limits, "lookups", 100, 5000, 100)} step={100} value={params.lookups} onChange={(e) => set("lookups", Number(e.target.value))} />
         </label>
         <button className="button primary" onClick={() => void run(params)} disabled={running || !sessionId}>
           {running ? (

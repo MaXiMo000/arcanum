@@ -19,7 +19,7 @@ const LABS = [
 type LabId = (typeof LABS)[number]["id"];
 const LAB_KEY = "arcanum.lab";
 
-export function Labs({ sessionId }: { sessionId: string | null }) {
+export function Labs({ sessionId, limits }: { sessionId: string | null; limits: Record<string, Record<string, number>> | null }) {
   const [current, setCurrent] = useState<LabId>(() => LABS.find((l) => l.id === readStorage(local, LAB_KEY))?.id ?? "engines");
   const choose = (id: LabId) => {
     setCurrent(id);
@@ -38,7 +38,7 @@ export function Labs({ sessionId }: { sessionId: string | null }) {
       {/* Both stay mounted so each keeps its settings and last result while the other is shown. */}
       {LABS.map(({ id, Lab }) => (
         <div key={id} role="tabpanel" id={`lab-${id}`} aria-labelledby={`lab-tab-${id}`} hidden={current !== id}>
-          <Lab sessionId={sessionId} />
+          <Lab sessionId={sessionId} limits={limits?.[id] ?? null} />
         </div>
       ))}
     </div>

@@ -41,10 +41,11 @@ from typing import Annotated, Literal
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from ..labs.scaling import SIZES as SCALING_SIZES
 from .classroom import ClassroomManager, normalize
 from .sessions import SessionError, SessionManager, Subscriber
 
@@ -90,6 +91,8 @@ class Settings:
     crashes_per_minute: int = 6  # crash demos per client
     labs_per_minute: int = 6  # engine comparisons per client
     lab_timeout: float = 60  # seconds an engine comparison may run
+    max_concurrent_labs: int = 1  # labs running at once, apart from the statement slots
+    lab_scale: float = 1.0  # share (0-1] of each lab's size range allowed: lower it on small machines
     max_websockets: int = 200
     max_websockets_per_client: int = 4
     max_websockets_per_session: int = 4
@@ -102,6 +105,7 @@ class Settings:
     allowed_origins: list = field(default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"])
     enable_docs: bool = False
     hsts: bool = False  # send Strict-Transport-Security (only when served over HTTPS)
+    public_url: str = ""  # e.g. https://arcanum.example.org: makes link-preview images absolute
 
     @classmethod
     def from_env(cls):
@@ -111,19 +115,20 @@ class Settings:
                       "worker_memory_mb", "max_keys", "pool_size", "event_limit", "rate_burst", "sessions_per_minute",
                       "crashes_per_minute", "labs_per_minute", "max_websockets", "max_websockets_per_client", "max_websockets_per_session",
                       "max_classrooms", "max_classrooms_per_client", "max_students_per_classroom",
-                      "classrooms_per_minute", "questions_per_minute"]
+                      "classrooms_per_minute", "questions_per_minute", "max_concurrent_labs"]
         float_fields = ["session_ttl", "query_timeout", "lock_timeout", "queue_timeout", "rate_per_second",
-                        "lab_timeout", "classroom_ttl"]
+                        "lab_timeout", "classroom_ttl", "lab_scale"]
         values = {name: _env(f"ARCANUM_{name.upper()}", getattr(d, name), int) for name in int_fields}
         values |= {name: _env(f"ARCANUM_{name.upper()}", getattr(d, name), float) for name in float_fields}
         origins = _env("ARCANUM_ALLOWED_ORIGINS", ",".join(d.allowed_origins))
-        public_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")  # set by Render for every service
-        if public_url:
-            origins = f"{origins},{public_url}"
+        render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")  # set by Render for every service
+        if render_url:
+            origins = f"{origins},{render_url}"
+        public_url = _env("ARCANUM_PUBLIC_URL", render_url)
         return cls(data_dir=_env("ARCANUM_DATA_DIR", d.data_dir), web_dir=_env("ARCANUM_WEB_DIR", d.web_dir),
                    allowed_origins=[o.strip() for o in origins.split(",") if o.strip()],
                    enable_docs=_flag(_env("ARCANUM_ENABLE_DOCS", "0")), hsts=_flag(_env("ARCANUM_HSTS", "0")),
-                   **values)
+                   public_url=public_url, **values)
 
 
 class RateLimiter:
@@ -240,6 +245,23 @@ class ScalingLab(BaseModel):
 
 LABS = {"engines": EnginesLab, "buffer-pool": BufferPoolLab, "scaling": ScalingLab, "access": AccessLab,
         "sharding": ShardingLab}
+# The fields that decide how much work a lab does. ARCANUM_LAB_SCALE lowers their upper limits, so a small
+# instance answers in seconds instead of timing out; tuning knobs (value sizes, pool sizes) keep their range.
+LAB_SIZES = {"engines": ("keys",), "buffer-pool": ("rows", "lookups"), "access": ("rows",), "sharding": ("shards", "rows")}
+
+
+def lab_limits(scale):
+    """{lab: {field: the largest value allowed}}: each size field's range cut to `scale` of its length, and
+    for the scaling lab, how many of its doubling sizes run."""
+    scale = min(1.0, max(0.05, scale))
+    limits = {}
+    for lab, names in LAB_SIZES.items():
+        limits[lab] = {}
+        for name in names:
+            bounds = {k: getattr(m, k) for m in LABS[lab].model_fields[name].metadata for k in ("ge", "le") if hasattr(m, k)}
+            limits[lab][name] = int(bounds["ge"] + (bounds["le"] - bounds["ge"]) * scale)
+    limits["scaling"] = {"steps": max(3, round(len(SCALING_SIZES) * scale))}
+    return limits
 
 NodeName = Literal["n1", "n2", "n3"]
 
@@ -390,9 +412,10 @@ def create_app(settings=None):
     async def health():
         return {"status": "ok"}
 
+    labs = lab_limits(settings.lab_scale)
     limits = {"query_timeout": settings.query_timeout, "max_rows": settings.max_rows,
               "max_pages": settings.max_pages, "max_sql_bytes": settings.max_sql_bytes,
-              "max_import_bytes": settings.max_import_bytes}
+              "max_import_bytes": settings.max_import_bytes, "labs": labs}
 
     @app.post("/sessions", status_code=201)
     async def create_session(request: Request):
@@ -559,10 +582,16 @@ def create_app(settings=None):
         except ValidationError as e:
             fields = sorted({".".join(str(p) for p in err.get("loc", ())) or "body" for err in e.errors()})
             return _error(422, "InvalidRequest", f"invalid request: check {', '.join(fields)}")
+        values = params.model_dump()
+        for name, most in labs.get(lab, {}).items():
+            if name in values and values[name] > most:
+                return _error(422, "LabTooLarge", f"{name} is limited to {most:,} on this server")
+        if lab == "scaling":
+            values["sizes"] = list(SCALING_SIZES[:labs["scaling"]["steps"]])
         if not limiter.allow(_client(request), "lab", settings.labs_per_minute / 60, max(1, settings.labs_per_minute // 2)):
             return _error(429, "RateLimited", "labs are limited; wait a few seconds", {"Retry-After": "10"})
-        reply = await session.request({"op": "lab", "lab": lab, "params": params.model_dump()},
-                                      timeout=settings.lab_timeout)
+        reply = await session.request({"op": "lab", "lab": lab, "params": values}, timeout=settings.lab_timeout,
+                                      slots=manager.lab_slots, busy="another lab is running; try again in a moment")
         if not reply.pop("ok"):
             return JSONResponse({"error": reply["error"]}, status_code=400)
         return reply
@@ -610,6 +639,12 @@ def create_app(settings=None):
 
     web_dir = Path(settings.web_dir)
     if (web_dir / "index.html").is_file():
+        page = _page(web_dir / "index.html", settings.public_url)
+
+        @app.get("/", include_in_schema=False)
+        async def index():
+            return HTMLResponse(page)
+
         app.mount("/", StaticFiles(directory=web_dir, html=True), name="web")
     return app
 
@@ -641,6 +676,14 @@ async def _forward(websocket, subscriber, messages):
     finally:
         batch.cancel()
         inbound.cancel()
+
+
+def _page(path, public_url):
+    """The built index.html, with link-preview image addresses made absolute when the public URL is known
+    (sites that render previews do not resolve relative ones)."""
+    html = path.read_text(encoding="utf-8")
+    base = public_url.rstrip("/")
+    return html.replace('content="/og.jpg"', f'content="{base}/og.jpg"') if base else html
 
 
 def _same_origin(connection, origin):

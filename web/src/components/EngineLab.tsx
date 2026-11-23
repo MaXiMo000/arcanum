@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, type LabParams, type LabResult, type LsmMoment, type LsmShape } from "../api";
 import { formatCount } from "../format";
 import { LabTour } from "./LabTour";
-import { useLab } from "../useLab";
+import { capParams, labMax, useLab, type LabLimits } from "../useLab";
 import { BarCompare, type Bar } from "./BarCompare";
 import { LineChart, type Series } from "./LineChart";
 
@@ -30,8 +30,9 @@ const TOUR: { title: string; body: string; params: Partial<LabParams> }[] = [
     body: "A bigger memtable means fewer, larger flushes, and a bigger buffer pool means fewer B+tree page writes. Compare with the first step." },
 ];
 
-export function EngineLab({ sessionId }: { sessionId: string | null }) {
+export function EngineLab({ sessionId, limits }: { sessionId: string | null; limits?: LabLimits }) {
   const [params, setParams] = useState<LabParams>(DEFAULTS);
+  useEffect(() => setParams((p) => capParams(p, limits)), [limits]); // this server's limits arrive with the session
   const { result, running, error, run } = useLab(sessionId, api.lab);
   const set = <K extends keyof LabParams>(key: K, value: LabParams[K]) => setParams((p) => ({ ...p, [key]: value }));
 
@@ -50,7 +51,7 @@ export function EngineLab({ sessionId }: { sessionId: string | null }) {
         title,
         body,
         run: () => {
-          const next = { ...DEFAULTS, ...changes };
+          const next = capParams({ ...DEFAULTS, ...changes }, limits);
           setParams(next);
           return run(next);
         },
@@ -61,7 +62,7 @@ export function EngineLab({ sessionId }: { sessionId: string | null }) {
           <span>
             Keys <b>{formatCount(params.keys)}</b>
           </span>
-          <input type="range" min={500} max={10000} step={500} value={params.keys} onChange={(e) => set("keys", Number(e.target.value))} />
+          <input type="range" min={500} max={labMax(limits, "keys", 500, 10000, 500)} step={500} value={params.keys} onChange={(e) => set("keys", Number(e.target.value))} />
         </label>
         <label>
           <span>
