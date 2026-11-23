@@ -32,6 +32,7 @@ from .expr import (
     JSONB,
     NULL,
     NUMERIC,
+    ORDERED_SET,
     REAL,
     TEMPORAL,
     TEXT,
@@ -62,6 +63,7 @@ from .expr import (
 )
 from .functions import (
     AGGREGATES,
+    DISTRIBUTION,
     FUNCTIONS,
     RANKING,
     STABLE,
@@ -118,6 +120,7 @@ class Binder:
         self.catalog = catalog
         self.sql = sql
         self._ids = itertools.count()
+        self.target_aliases = {}  # table name -> the alias an UPDATE or DELETE gives its target
 
     def error(self, message, node=None):
         return SqlError(message, self.sql, getattr(node, "pos", None))
@@ -168,8 +171,9 @@ class Binder:
         outer = self.table_level(table)
         sub = self.subexpr_level(outer)
         plan, sub.entries = self.from_item(sub, from_node)
-        if any(e.table == table.name for e in sub.entries):
-            raise self.error(f"table name {table.name} is specified more than once; give one an alias")
+        name = self.target_aliases.get(table.name, table.name)
+        if any(e.table == name for e in sub.entries):
+            raise self.error(f"table name {name} is specified more than once; give one an alias")
         own, rest = [], []
         if where_node is not None:
             for c in conjuncts(self.condition(sub, where_node, "WHERE")):
@@ -221,8 +225,10 @@ class Binder:
         return pos
 
     def table_level(self, table):
+        """The names a statement's target table offers: its columns, under its alias if it was given one."""
         level = Level()
-        level.entries = [Entry(table.name, c.name, c.type, Col(i, c.type, c.name)) for i, c in enumerate(table.columns)]
+        name = self.target_aliases.get(table.name, table.name)
+        level.entries = [Entry(name, c.name, c.type, Col(i, c.type, c.name)) for i, c in enumerate(table.columns)]
         return level
 
     # ---- queries ------------------------------------------------------------------
@@ -940,6 +946,10 @@ class Binder:
         result = Op("AND", (Op(">=", (e, low), BOOLEAN), Op("<=", (e, high), BOOLEAN)), BOOLEAN)
         return Op("NOT", (result,), BOOLEAN) if node.negated else result
 
+    def _bind_RowValue(self, level, node):
+        raise self.error("Arcanum supports row values only in comparisons and IN lists, such as (a, b) = (1, 2)",
+                         node)
+
     def _bind_InList(self, level, node):
         needle = self.expr(level, node.expr)
         items = [self.expr(level, item) for item in node.items]
@@ -975,7 +985,12 @@ class Binder:
         word = "ILIKE" if node.insensitive else "LIKE"
         self.require(e, (TEXT,), node.expr, word)
         self.require(pattern, (TEXT,), node.pattern, word)
-        result = Op(word, (e, pattern), BOOLEAN)
+        args = (e, pattern)
+        if node.escape is not None:
+            escape = self.expr(level, node.escape)
+            self.require(escape, (TEXT,), node.escape, "ESCAPE")
+            args += (escape,)
+        result = Op(word, args, BOOLEAN)
         return Op("NOT", (result,), BOOLEAN) if node.negated else result
 
     def _bind_Case(self, level, node):
@@ -1047,10 +1062,12 @@ class Binder:
             if not args:
                 raise self.error("grouping needs at least one argument", node)
             return Op("GROUPING_CALL", tuple(args), INTEGER)
-        if name in ("CONCAT", "CONCAT_WS"):
+        if name in ("CONCAT", "CONCAT_WS", "FORMAT"):
             if not args or (name == "CONCAT_WS" and len(args) < 2):
                 raise self.error(f"{name.lower()} needs {'a separator and values' if name == 'CONCAT_WS' else 'arguments'}",
                                  node)
+            if name == "FORMAT":
+                self.require(args[0], (TEXT,), node.args[0], "format")
             return Op(name, tuple(args), TEXT)
         if name == "NULLIF":
             if len(args) != 2:
@@ -1105,6 +1122,11 @@ class Binder:
         if node.distinct and order and any(x not in [self.expr(level, a) for a in node.args] for x, _, _ in order):
             raise self.error("in an aggregate with DISTINCT, ORDER BY expressions must appear in the argument list",
                              node)
+        if (name in ORDERED_SET) != node.within_group:
+            raise self.error(f"{name.lower()} needs WITHIN GROUP (ORDER BY ...)" if name in ORDERED_SET
+                             else f"{name.lower()} is not an ordered-set aggregate, so it takes no WITHIN GROUP", node)
+        if name in ORDERED_SET:
+            return self.ordered_set(level, node, order, keep)
         if node.star:
             if name != "COUNT":
                 raise self.error(f"{name.lower()}(*) is not valid; only count(*) is", node)
@@ -1138,6 +1160,28 @@ class Binder:
         t = INTEGER if name == "COUNT" else (DECIMAL if arg.type == DECIMAL else REAL) if name == "AVG" else arg.type
         return AggCall(name, (arg,), node.distinct, t, order, keep)
 
+    def ordered_set(self, level, node, order, keep):
+        """percentile_cont(f), percentile_disc(f) and mode() WITHIN GROUP (ORDER BY x). The call's arguments
+        are (x, f): the sorted value first, so a NULL x is skipped like any aggregate input."""
+        name = node.name
+        if node.distinct:
+            raise self.error(f"{name.lower()} cannot take DISTINCT", node)
+        if len(order) != 1:
+            raise self.error(f"{name.lower()} sorts exactly one value: WITHIN GROUP (ORDER BY x)", node)
+        value = order[0][0]
+        if name == "MODE":
+            if node.args:
+                raise self.error("mode takes no arguments: mode() WITHIN GROUP (ORDER BY x)", node)
+            return AggCall(name, (value,), False, value.type, order, keep)
+        if len(node.args) != 1:
+            raise self.error(f"{name.lower()} takes one argument: the fraction, between 0 and 1", node)
+        fraction = self.coerce(self.expr(level, node.args[0]), REAL, node.args[0])
+        if contains(fraction, AggCall) or column_indexes(fraction):
+            raise self.error(f"the fraction of {name.lower()} must be the same for the whole group", node.args[0])
+        if name == "PERCENTILE_CONT":
+            self.require(value, NUMERIC, node, name.lower())
+        return AggCall(name, (value, fraction), False, REAL if name == "PERCENTILE_CONT" else value.type, order, keep)
+
     def window_call(self, level, node):
         name, spec = node.name, node.over
         if name not in WINDOW_ONLY and name not in AGGREGATES:
@@ -1154,10 +1198,22 @@ class Binder:
         if name in AGGREGATES:
             agg = self.aggregate(level, n.Call(name, node.args, star=node.star, pos=node.pos))
             args, t = agg.args, agg.type
-        elif name in RANKING:
+        elif name in RANKING or name in DISTRIBUTION:
             if node.args or node.star:
                 raise self.error(f"{name.lower()} takes no arguments", node)
-            args, t = (), INTEGER
+            args, t = (), INTEGER if name in RANKING else REAL
+        elif name == "NTILE":
+            if len(node.args) != 1:
+                raise self.error("ntile takes exactly one argument: the number of buckets", node)
+            args = (self.expr(level, node.args[0]),)
+            self.require(args[0], (INTEGER,), node.args[0], "ntile")
+            t = INTEGER
+        elif name == "NTH_VALUE":
+            if len(node.args) != 2:
+                raise self.error("nth_value takes two arguments: a value and which row's", node)
+            args = (self.expr(level, node.args[0]), self.expr(level, node.args[1]))
+            self.require(args[1], (INTEGER,), node.args[1], "nth_value")
+            t = args[0].type
         elif name in ("LAG", "LEAD"):
             if not 1 <= len(node.args) <= 3:
                 raise self.error(f"{name.lower()} takes one to three arguments", node)

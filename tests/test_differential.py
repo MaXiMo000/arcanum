@@ -256,6 +256,17 @@ CORPUS = [
     ("SELECT d.name, (SELECT avg(salary) FROM emp e WHERE e.dept = d.name) FROM dept d", False),
     ("SELECT id, amount, region FROM sales ORDER BY region DESC NULLS LAST, amount NULLS FIRST, id", True),
     ("SELECT emp_id, day, amount FROM sales ORDER BY amount DESC NULLS LAST, day NULLS FIRST, id LIMIT 40", True),
+    # row values, distribution window functions, named windows and LIKE ... ESCAPE
+    ("SELECT id FROM sales WHERE (emp_id, day) = (3, 2) OR (emp_id, day) < (2, 1)", False),
+    ("SELECT id FROM emp WHERE (dept, hired) >= ('ops', 2015) AND (dept, hired) <> ('ops', 2016)", False),
+    ("SELECT id, ntile(4) OVER (ORDER BY id), percent_rank() OVER (ORDER BY hired), "
+     "cume_dist() OVER (PARTITION BY dept ORDER BY hired) FROM emp", False),
+    ("SELECT id, nth_value(name, 3) OVER (PARTITION BY dept ORDER BY id), "
+     "nth_value(salary, 2) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM emp", False),
+    ("SELECT id, sum(amount) OVER w, rank() OVER (w ORDER BY day), count(*) OVER r FROM sales "
+     "WINDOW w AS (PARTITION BY region), r AS (ORDER BY id ROWS 2 PRECEDING)", False),
+    ("SELECT id FROM emp WHERE name || '_%' LIKE '%!_!%' ESCAPE '!' AND name NOT LIKE '%!%%' ESCAPE '!'", False),
+    ("SELECT id FROM sales ORDER BY id LIMIT 5 OFFSET 3", True),
 ]
 
 

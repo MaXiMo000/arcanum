@@ -80,27 +80,32 @@ with Database("company.db") as db:
 - `CREATE TABLE` with `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `FOREIGN KEY` /
   `REFERENCES` (`ON DELETE NO ACTION | RESTRICT | CASCADE | SET NULL`), named `CONSTRAINT`s, `SERIAL`
   types and `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`; `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`
+- `CREATE TABLE ... [(columns)] AS query [WITH [NO] DATA]` and `SELECT ... INTO table`; `TRUNCATE [TABLE] a, b
+  [CASCADE]`, which refuses a table another one references unless that one is emptied too
 - `ALTER TABLE`:
   - `ADD` / `DROP COLUMN`, `RENAME [COLUMN]` and `RENAME TO`.
   - `ALTER COLUMN ... SET` / `DROP DEFAULT`, `SET` / `DROP NOT NULL` and `TYPE`.
   - `ADD` / `DROP CONSTRAINT` (`CHECK`, `FOREIGN KEY`, `UNIQUE`).
 - `CREATE [OR REPLACE] VIEW` and `DROP VIEW`. Views are read-only and are expanded where they are used.
-- `INSERT ... VALUES` / `INSERT ... SELECT` with `ON CONFLICT [(columns)] DO NOTHING | DO UPDATE SET ...
-  [WHERE ...]` (the proposed row as `EXCLUDED`), `UPDATE [... FROM]`, `DELETE [... USING]`; all three with
-  `RETURNING`
+- `INSERT ... VALUES` / `INSERT ... SELECT` / `INSERT ... DEFAULT VALUES` with `ON CONFLICT [(columns)] DO NOTHING | DO UPDATE SET ...
+  [WHERE ...]` (the proposed row as `EXCLUDED`), `UPDATE [... FROM]`, `DELETE [... USING]` (the target may take an
+  alias, `UPDATE orders o`); all three with `RETURNING`
 - `SELECT` with `DISTINCT`, `DISTINCT ON`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... NULLS FIRST|LAST`, `LIMIT` and `OFFSET`
+  in either order, and the standard `OFFSET n ROWS FETCH { FIRST | NEXT } n ROWS ONLY`
 - `INNER`, `LEFT`, `RIGHT`, `FULL` and `CROSS` joins, with `ON` or `USING`
 - Scalar, `IN`, `EXISTS`, correlated and `FROM` subqueries; `LATERAL` subqueries and functions in `FROM`
   (`unnest`, `generate_series`, `jsonb_each`, `jsonb_array_elements`, `jsonb_object_keys`,
   `regexp_split_to_table`), with `AS t(a, b)` column names
 - `GROUP BY ROLLUP (...)`, `CUBE (...)` and `GROUPING SETS (...)`, with `grouping()`
 - `WITH` and `WITH RECURSIVE`
-- Window functions `row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`, `last_value` and
-  every aggregate, with `PARTITION BY`, `ORDER BY` and `ROWS` / `RANGE` frames
+- Window functions `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`,
+  `first_value`, `last_value`, `nth_value` and every aggregate, with `PARTITION BY`, `ORDER BY` and `ROWS` /
+  `RANGE` frames; named windows (`WINDOW w AS (...)`, `OVER w`, `OVER (w ORDER BY ...)`)
 - `UNION`, `INTERSECT` and `EXCEPT`, each with or without `ALL`
 - Aggregates `count`, `sum`, `avg`, `min`, `max`, `string_agg`, `array_agg`, `jsonb_agg`, `jsonb_object_agg`,
   `bool_and`, `bool_or` and `every`, with
-  `DISTINCT`, `ORDER BY` inside the call and `FILTER (WHERE ...)`
+  `DISTINCT`, `ORDER BY` inside the call and `FILTER (WHERE ...)`; the ordered-set aggregates
+  `percentile_cont`, `percentile_disc` and `mode() WITHIN GROUP (ORDER BY ...)`
 - Dates and times:
   - Typed literals (`DATE '2024-01-31'`, `INTERVAL '7 days'`) and `x::type` casts.
   - `CURRENT_DATE`, `CURRENT_TIMESTAMP` and `now()`, fixed for the whole statement.
@@ -108,8 +113,9 @@ with Database("company.db") as db:
   - `EXTRACT` / `date_part`, `date_trunc`, `age`, `to_char`, `to_date`, `to_timestamp`, `make_date`.
 - Text: `length`, `lower`, `upper`, `trim`/`ltrim`/`rtrim`/`btrim`, `replace`, `substr`, `left`, `right`,
   `lpad`/`rpad`, `position`/`strpos`, `split_part`, `initcap`, `repeat`, `reverse`, `starts_with`, `concat`,
-  `concat_ws`, `translate`, `chr`/`ascii` and `regexp_replace`.
-- Pattern matching: `LIKE`, `ILIKE`, and the regular expression operators `~`, `~*`, `!~` and `!~*`.
+  `concat_ws`, `format` (`%s`, `%I`, `%L`, positions and widths), `quote_ident`, `quote_literal`, `md5`,
+  `translate`, `chr`/`ascii` and `regexp_replace`.
+- Pattern matching: `LIKE` and `ILIKE` (backslash escapes a wildcard, or `ESCAPE 'c'`), and the regular expression operators `~`, `~*`, `!~` and `!~*`.
 - Numbers: `abs`, `round`, `trunc`, `ceil`, `floor`, `mod`, `power`, `sqrt`, `exp`, `ln`, `log`, `sign`,
   `pi` and `random`.
 - Arrays:
@@ -123,10 +129,12 @@ with Database("company.db") as db:
     `jsonb_array_length`, `jsonb_extract_path[_text]`, `jsonb_strip_nulls` and `jsonb_pretty`, with
     `json_*` spellings.
 - Other: `coalesce`, `ifnull`, `nullif`, `greatest` and `least`; `CASE`, `CAST`, `BETWEEN`, `IN`,
-  `IS [NOT] NULL`, `IS [NOT] TRUE / FALSE / UNKNOWN`, `IS [NOT] DISTINCT FROM` and `||`.
+  `IS [NOT] NULL`, `IS [NOT] TRUE / FALSE / UNKNOWN`, `IS [NOT] DISTINCT FROM` and `||`; row values
+  compared field by field (`(a, b) = (1, 2)`, `(a, b) < (c, d)`, `(a, b) IN ((1, 2), (3, 4))`).
 - `SAVEPOINT`, `ROLLBACK TO SAVEPOINT` and `RELEASE SAVEPOINT`
-- `BEGIN [ISOLATION LEVEL READ COMMITTED | REPEATABLE READ | SERIALIZABLE]`, `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]`,
-  `ANALYZE [table]`
+- `BEGIN [ISOLATION LEVEL READ COMMITTED | REPEATABLE READ | SERIALIZABLE] [READ ONLY | READ WRITE]`,
+  `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]` or `EXPLAIN (ANALYZE, COSTS off, ...)`, `ANALYZE [table]` and
+  `VACUUM [FULL] [ANALYZE]` or `VACUUM (FULL, ANALYZE)`
 
 ### Semantics
 

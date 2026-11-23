@@ -256,6 +256,9 @@ def column_indexes(e):
     return {node.index for node in walk(e) if isinstance(node, Col)}
 
 
+# Ordered-set aggregates: f(direct arguments) WITHIN GROUP (ORDER BY the aggregated value).
+ORDERED_SET = frozenset({"PERCENTILE_CONT", "PERCENTILE_DISC", "MODE"})
+
 # ---- formatting (EXPLAIN) --------------------------------------------------------
 
 _INFIX = {"AND", "OR", "=", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "^", "||", "LIKE", "ILIKE", "~", "~*",
@@ -282,6 +285,10 @@ def format_expr(e):
     if isinstance(e, SubqueryExpr):
         label = {"SCALAR": "(subquery)", "EXISTS": "EXISTS (subquery)", "IN": "IN (subquery)"}[e.kind]
         return f"{format_expr(e.arg)} {label}" if e.arg is not None else label
+    if isinstance(e, AggCall) and e.name in ORDERED_SET:
+        order = " ".join([format_expr(e.order[0][0])] + ["DESC"] * bool(e.order[0][1]))
+        text = f"{e.name.lower()}({', '.join(map(format_expr, e.args[1:]))}) WITHIN GROUP (ORDER BY {order})"
+        return text + (f" FILTER (WHERE {format_expr(e.filter)})" if e.filter is not None else "")
     if isinstance(e, AggCall):
         inner = ", ".join(map(format_expr, e.args)) or "*"
         if e.order:
@@ -296,6 +303,8 @@ def format_expr(e):
             parts.append("ORDER BY " + ", ".join(format_expr(x) + (" DESC" if d else "") for x, d, _ in e.order))
         return f"{e.name.lower()}({', '.join(map(format_expr, e.args))}) OVER ({' '.join(parts)})"
     args = [format_expr(a) for a in e.args]
+    if e.op in ("LIKE", "ILIKE") and len(args) == 3:
+        return f"({args[0]} {e.op} {args[1]} ESCAPE {args[2]})"
     if e.op in _INFIX or e.op in _SHOWN_AS:
         return f"({args[0]} {_SHOWN_AS.get(e.op, e.op)} {args[1]})"
     if e.op == "NOT":

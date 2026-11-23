@@ -10,6 +10,7 @@ and NULL handling come for free.
 
 import datetime
 import functools
+import hashlib
 import math
 import random
 import re
@@ -25,6 +26,7 @@ from .expr import (
     INTEGER,
     INTERVAL,
     JSONB,
+    ORDERED_SET,
     REAL,
     TEXT,
     TIMESTAMP,
@@ -102,20 +104,43 @@ def regexp_replace(value, pattern, replacement, flags=""):
         raise ExecutionError(f"invalid replacement {replacement!r}: {e}") from None
 
 
-def like(value, pattern):
+_ANY, _ONE = object(), object()  # the wildcards % and _, told apart from escaped literal characters
+
+
+def like_tokens(pattern, escape="\\"):
+    """A LIKE pattern as characters and wildcards. The escape character (backslash unless ESCAPE says
+    otherwise, none for ESCAPE '') makes the character after it literal."""
+    if escape is not None and len(escape) > 1:
+        raise ExecutionError("invalid escape string: ESCAPE takes a single character")
+    tokens, i = [], 0
+    while i < len(pattern):
+        c = pattern[i]
+        if escape and c == escape:
+            i += 1
+            if i == len(pattern):
+                raise ExecutionError("LIKE pattern must not end with the escape character")
+            tokens.append(pattern[i])
+        else:
+            tokens.append(_ANY if c == "%" else _ONE if c == "_" else c)
+        i += 1
+    return tokens
+
+
+def like(value, pattern, escape="\\"):
     """SQL LIKE: % matches any run of characters, _ matches one. Case-sensitive.
 
     A two-pointer match that only ever backtracks to the latest %, so it runs in
     O(len(value) * len(pattern)) whatever the pattern; a regex translation could
     take exponential time on patterns like '%a%a%a%a%b'.
     """
+    pattern = like_tokens(pattern, escape)
     v = p = 0
     star, resume = -1, 0
     while v < len(value):
-        if p < len(pattern) and pattern[p] == "%":
+        if p < len(pattern) and pattern[p] is _ANY:
             star, resume = p, v
             p += 1
-        elif p < len(pattern) and (pattern[p] == "_" or pattern[p] == value[v]):
+        elif p < len(pattern) and (pattern[p] is _ONE or pattern[p] == value[v]):
             v += 1
             p += 1
         elif star != -1:
@@ -123,7 +148,7 @@ def like(value, pattern):
             v, p = resume, star + 1
         else:
             return False
-    while p < len(pattern) and pattern[p] == "%":
+    while p < len(pattern) and pattern[p] is _ANY:
         p += 1
     return p == len(pattern)
 
@@ -214,6 +239,62 @@ def _btrim(s, chars=" "):
     return s.strip(chars)
 
 
+def quote_ident(name):
+    """An identifier as SQL text: bare when it can be, else in double quotes (PostgreSQL's quote_ident)."""
+    from ..sql.parser import RESERVED  # noqa: PLC0415 (the parser is not needed until a query runs)
+
+    if re.fullmatch(r"[a-z_][a-z0-9_$]*", name) and name.upper() not in RESERVED:
+        return name
+    return '"' + name.replace('"', '""') + '"'
+
+
+def quote_literal(text):
+    """A value as an SQL string literal; backslashes make it an E'' string, as in PostgreSQL."""
+    quoted = text.replace("'", "''")
+    if "\\" not in text:
+        return f"'{quoted}'"
+    doubled = quoted.replace("\\", "\\\\")
+    return f"E'{doubled}'"
+
+
+_FORMAT_SPEC = re.compile(r"%(?:(\d+)\$)?(-)?(\d+)?([sIL%])")
+
+
+def format_text(fmt, args):
+    """PostgreSQL's format(): %s inserts a value as text (NULL as nothing), %I as a quoted identifier and %L
+    as a quoted literal (NULL as NULL); %n$ picks argument n, a width pads (- on the right); %% is a %."""
+    out, i, following = [], 0, 0
+    while (j := fmt.find("%", i)) != -1:
+        out.append(fmt[i:j])
+        spec = _FORMAT_SPEC.match(fmt, j)
+        if spec is None:
+            raise ExecutionError("format: unrecognized format specifier after %; use %s, %I, %L or %%")
+        position, left, width, kind = spec.groups()
+        i = spec.end()
+        if kind == "%":
+            out.append("%")
+            continue
+        index = int(position) - 1 if position else following
+        if index < 0:
+            raise ExecutionError("format: argument positions start at 1")
+        if index >= len(args):
+            raise ExecutionError("format: too few arguments")
+        following, value = index + 1, args[index]
+        if kind == "s":
+            text = "" if value is None else to_text(value)
+        elif kind == "I":
+            if value is None:
+                raise ExecutionError("format: a NULL cannot be formatted as an SQL identifier")
+            text = quote_ident(to_text(value))
+        else:
+            text = "NULL" if value is None else quote_literal(to_text(value))
+        if width:
+            text = text.ljust(int(width)) if left else text.rjust(int(width))
+        out.append(text)
+    out.append(fmt[i:])
+    return "".join(out)
+
+
 # name -> (accepted argument signatures, result type or "same", implementation)
 # Signature letters: N numeric, I integer, T text, D date, S date or timestamp, V interval, R an array,
 # J jsonb, B boolean, A any. Results that depend on an argument's type are worked out by the binder.
@@ -288,6 +369,9 @@ FUNCTIONS = {
     "LENGTH": (("T",), INTEGER, len),
     "LOWER": (("T",), TEXT, str.lower),
     "UPPER": (("T",), TEXT, str.upper),
+    "MD5": (("T",), TEXT, lambda s: hashlib.md5(s.encode(), usedforsecurity=False).hexdigest()),
+    "QUOTE_IDENT": (("T",), TEXT, quote_ident),
+    "QUOTE_LITERAL": (("A",), TEXT, lambda v: quote_literal(to_text(v))),
     "TRIM": (("T",), TEXT, lambda s: s.strip(" ")),
     "LTRIM": (("T",), TEXT, lambda s: s.lstrip(" ")),
     "RTRIM": (("T",), TEXT, lambda s: s.rstrip(" ")),
@@ -298,11 +382,12 @@ FUNCTIONS = {
 }
 
 AGGREGATES = {"COUNT", "SUM", "AVG", "MIN", "MAX", "STRING_AGG", "BOOL_AND", "BOOL_OR", "EVERY", "ARRAY_AGG",
-              "JSONB_AGG", "JSON_AGG", "JSONB_OBJECT_AGG", "JSON_OBJECT_AGG"}
+              "JSONB_AGG", "JSON_AGG", "JSONB_OBJECT_AGG", "JSON_OBJECT_AGG", *ORDERED_SET}
 # Functions that accept any number of arguments and NULLs among them.
 VARIADIC = {"JSONB_BUILD_OBJECT": ct.build_object, "JSON_BUILD_OBJECT": ct.build_object,
             "JSONB_BUILD_ARRAY": ct.build_array, "JSON_BUILD_ARRAY": ct.build_array}
 # Functions evaluated once per statement, so every row sees the same moment (PostgreSQL fixes it per transaction).
 STABLE = {"NOW", "CURRENT_TIMESTAMP", "LOCALTIMESTAMP", "CURRENT_DATE"}
 RANKING = {"ROW_NUMBER", "RANK", "DENSE_RANK"}
-WINDOW_ONLY = RANKING | {"LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE"}
+DISTRIBUTION = {"PERCENT_RANK", "CUME_DIST"}  # a row's relative position in its partition, from 0 or above 0 to 1
+WINDOW_ONLY = RANKING | DISTRIBUTION | {"LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE", "NTILE"}

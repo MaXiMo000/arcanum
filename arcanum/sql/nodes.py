@@ -89,6 +89,14 @@ class Like:
     pattern: object
     negated: bool = False
     insensitive: bool = False  # ILIKE
+    escape: object = None  # LIKE ... ESCAPE: the character that makes the next one literal (default backslash)
+
+
+@dataclass(slots=True)
+class RowValue:
+    """(a, b) or ROW(a, b): the parser turns comparisons of rows into comparisons of their fields."""
+    items: list
+    pos: int | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(slots=True)
@@ -146,6 +154,7 @@ class Call:
     pos: int | None = field(default=None, compare=False, repr=False)  # offset in the SQL text
     order_by: list = field(default_factory=list)  # string_agg(x, ',' ORDER BY y)
     filter: object = None  # count(*) FILTER (WHERE ...)
+    within_group: bool = False  # order_by came from WITHIN GROUP (ORDER BY ...): an ordered-set aggregate
 
 
 # ---- queries -------------------------------------------------------------------
@@ -391,6 +400,23 @@ class Update:
     where: object = None
     returning: list | None = None
     from_: object = None  # UPDATE ... FROM: other tables joined to each target row
+    alias: str | None = None  # UPDATE orders o ...: the name the target goes by in the statement
+
+
+@dataclass(slots=True)
+class Truncate:
+    tables: list  # table names
+    cascade: bool = False  # also empty every table whose foreign keys reference these
+
+
+@dataclass(slots=True)
+class CreateTableAs:
+    """CREATE TABLE name [(columns)] AS query [WITH [NO] DATA], and SELECT ... INTO name."""
+    name: str
+    query: object
+    columns: list | None = None
+    if_not_exists: bool = False
+    with_data: bool = True
 
 
 @dataclass(slots=True)
@@ -399,11 +425,13 @@ class Delete:
     where: object = None
     returning: list | None = None
     using: object = None  # DELETE ... USING: other tables joined to each target row
+    alias: str | None = None  # DELETE FROM orders o ...: the name the target goes by in the statement
 
 
 @dataclass(slots=True)
 class Begin:
     isolation: str | None = None  # READ COMMITTED, REPEATABLE READ or SERIALIZABLE; None for the default
+    read_only: bool = False  # BEGIN READ ONLY: the transaction may read but not change anything
 
 
 @dataclass(slots=True)
@@ -446,3 +474,4 @@ class Analyze:
 class Vacuum:
     table: str | None = None  # every table when None
     full: bool = False  # also rewrite each table and index compactly
+    analyze: bool = False  # VACUUM ANALYZE: then refresh the planner's statistics

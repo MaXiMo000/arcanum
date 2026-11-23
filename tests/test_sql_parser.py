@@ -244,7 +244,7 @@ def test_complex_queries_parse(sql):
     ("CREATE TABLE t (id INT PRIMARY KEY, x INT PRIMARY KEY)", 1, 37, "more than one primary key"),
     ("CREATE TABLE t (id UUID)", 1, 20, "expected a type"),
     ("SELECT a FROM t JOIN u", 1, 23, "expected ON or USING"),
-    ("SELECT count(*) OVER w FROM t", 1, 22, "named windows"),
+    ("SELECT count(*) OVER w FROM t", 1, 22, "window w does not exist"),
 ])
 def test_errors_point_at_the_problem(sql, line, col, message):
     with pytest.raises(SqlError, match=re.escape(message)) as info:

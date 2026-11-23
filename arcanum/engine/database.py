@@ -1,5 +1,6 @@
 """The public entry point: open a database file and run SQL against it."""
 
+import re
 import time
 from dataclasses import dataclass, field, replace
 from decimal import DecimalException
@@ -22,8 +23,10 @@ from .optimizer import Optimizer, mark_index_only
 from .plan import IndexScan, TableScan, explain, plan_tree
 from .ssi import SERIALIZABLE, SSI
 
-_DDL = (n.CreateTable, n.DropTable, n.CreateIndex, n.DropIndex, n.CreateView, n.DropView, n.AlterTable)
-_WRITES = (n.Insert, n.Update, n.Delete, n.Analyze, n.Vacuum, *_DDL)
+_DDL = (n.CreateTable, n.CreateTableAs, n.DropTable, n.CreateIndex, n.DropIndex, n.CreateView, n.DropView,
+        n.AlterTable)
+_WRITES = (n.Insert, n.Update, n.Delete, n.Truncate, n.Analyze, n.Vacuum, *_DDL)
+_CHANGES = tuple(s for s in _WRITES if s is not n.Analyze)  # what a READ ONLY transaction refuses
 VACUUM_COLUMNS = ["table", "rows", "versions_removed", "old_versions_kept", "bytes_before", "bytes_after",
                   "pages_before", "pages_after", "kept_for"]
 
@@ -161,6 +164,7 @@ class Database:
             if conn.txn is not None:
                 raise SqlError("a transaction is already in progress")
             conn.txn = self._begin(conn, statement.isolation or READ_COMMITTED)
+            conn.read_only = statement.read_only
             return Result(status="BEGIN")
         if isinstance(statement, (n.Commit, n.Rollback)):
             if conn.txn is None:
@@ -170,6 +174,8 @@ class Database:
             return Result(status="COMMIT" if commit else "ROLLBACK")
         if isinstance(statement, (n.Savepoint, n.RollbackTo, n.Release)):
             return self._savepoint(conn, statement)
+        if conn.txn is not None and conn.read_only and isinstance(statement, _CHANGES):
+            raise SqlError(f"cannot execute {_command(statement)} in a read-only transaction")
 
         if isinstance(statement, n.Vacuum) and conn.txn is not None:
             raise SqlError("VACUUM cannot run inside a transaction block")
@@ -297,6 +303,7 @@ class Database:
         if conn.txn is txn:
             conn.txn = None
             conn.savepoints = []
+            conn.read_only = False
         # The commit itself: versions the transaction made are frozen where no snapshot needs them, and
         # the commit log keeps its id only while some version still mentions it.
         mentioned = self.catalog.prune(self.mvcc.horizon())
@@ -346,9 +353,15 @@ class Database:
         if isinstance(statement, n.Insert):
             return Writer(self, binder).insert(statement)
         if isinstance(statement, (n.Update, n.Delete)):
+            if statement.alias:
+                binder.target_aliases[statement.table] = statement.alias
             writer = Writer(self, binder)
             result = writer.update(statement) if isinstance(statement, n.Update) else writer.delete(statement)
             return self._traced(result, statement, text) if trace else result
+        if isinstance(statement, n.Truncate):
+            return self._truncate(binder, statement)
+        if isinstance(statement, n.CreateTableAs):
+            return self._create_table_as(binder, statement)
         if isinstance(statement, n.CreateTable):
             if statement.name in self.catalog.tables and statement.if_not_exists:
                 return Result(status="CREATE TABLE")
@@ -405,6 +418,42 @@ class Database:
             return Result(status="ANALYZE")
         raise SqlError(f"Arcanum doesn't support {type(statement).__name__} yet")
 
+    def _truncate(self, binder, statement):
+        """Empty the tables. Like PostgreSQL, refuse when a table outside the list references one by a foreign
+        key, unless CASCADE empties those too; referencing tables are emptied first."""
+        names = list(dict.fromkeys(binder.table(name).name for name in statement.tables))
+        for name in names:  # grows while CASCADE adds referencing tables
+            for child, fk in self.catalog.referencing(name):
+                if child.name in names:
+                    continue
+                if not statement.cascade:
+                    raise SqlError(f"cannot truncate table {name}: foreign key {fk.name} on table {child.name} "
+                                   f"references it; truncate {child.name} too, or use CASCADE")
+                names.append(child.name)
+        writer = Writer(self, binder)
+        for name in reversed(names):
+            writer.delete(n.Delete(name))
+        return Result(status="TRUNCATE TABLE")
+
+    def _create_table_as(self, binder, statement):
+        """CREATE TABLE ... AS and SELECT ... INTO: a table with the query's column names and types, filled
+        with its rows. The table is stored as the plain CREATE TABLE it amounts to."""
+        if statement.name in self.catalog.tables and statement.if_not_exists:
+            return Result(status="CREATE TABLE AS")
+        columns = binder.bind_query(statement.query).columns
+        names = list(statement.columns or [])
+        if len(names) > len(columns):
+            raise SqlError(f"CREATE TABLE AS names {len(names)} columns but the query returns {len(columns)}")
+        names += [c.name for c in columns[len(names):]]
+        defs = ", ".join(f"{_quoted(name)} {'TEXT' if c.type == 'NULL' else c.type}"
+                         for name, c in zip(names, columns, strict=True))
+        sql = f"CREATE TABLE {_quoted(statement.name)} ({defs})"
+        self.catalog.create_table(parse_statements(sql)[0][0], sql)
+        if not statement.with_data:
+            return Result(status="CREATE TABLE AS")
+        inserted = Writer(self, binder).insert(n.Insert(statement.name, statement.query, names))
+        return Result(status=f"SELECT {inserted.status.split()[-1]}")
+
     def _vacuum(self, binder, statement):
         """Prune every row of the table (or of all tables) against the oldest snapshot still in use; FULL also
         rewrites each table and index compactly. One row per table says what happened and, when old
@@ -419,6 +468,9 @@ class Database:
             held = f"session {oldest.owner}'s transaction {oldest.xid}" if done["kept"] and oldest else None
             rows.append((table.name, done["rows"], done["removed"], done["kept"], done["bytes_before"],
                          done["bytes_after"], done["pages_before"], done["pages_after"], held))
+        if statement.analyze:
+            for table in tables:
+                self.catalog.analyze(table, self._snapshot)
         return Result(VACUUM_COLUMNS, rows, status="VACUUM FULL" if statement.full else "VACUUM", row_total=len(rows))
 
     def _create_view(self, binder, statement, text):
@@ -488,6 +540,15 @@ class Database:
         return locked
 
 
+def _command(statement):
+    """The SQL command a statement node stands for: CreateTableAs -> CREATE TABLE AS."""
+    return re.sub(r"(?<!^)(?=[A-Z])", " ", type(statement).__name__).upper()
+
+
+def _quoted(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _as_sql_error(e):
     """The SQL error for a Python error a statement can provoke with legal SQL; other errors unchanged."""
     if isinstance(e, RecursionError):
@@ -509,6 +570,7 @@ class Connection:
         self.ddl = False  # whether that transaction changed the schema (and so holds a page savepoint)
         self.ddl_at = 0  # how many savepoints existed when it first did
         self.savepoints = []  # [{"name", "xid": the id it writes with, "xids": every id it owns}], oldest first
+        self.read_only = False  # whether that transaction began READ ONLY
 
     @property
     def in_transaction(self):

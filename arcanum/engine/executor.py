@@ -12,6 +12,7 @@ NULL follows SQL's three-valued logic: comparisons with NULL yield NULL
 
 import heapq
 import itertools
+import math
 import operator
 import struct
 import tempfile
@@ -46,6 +47,7 @@ from .functions import (
     FUNCTIONS,
     STABLE,
     VARIADIC,
+    format_text,
     interval_divide,
     interval_times,
     like,
@@ -176,7 +178,7 @@ _BINARY = {
     "=": operator.eq, "!=": operator.ne, "<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge,
     "+": lambda a, b: check_int(a + b), "-": lambda a, b: check_int(a - b), "*": lambda a, b: check_int(a * b),
     "/": divide, "%": modulo, "^": power, "||": lambda a, b: bounded(to_text(a) + to_text(b)), "LIKE": like,
-    "ILIKE": lambda a, b: like(a.lower(), b.lower()),
+    "ILIKE": lambda a, b, *escape: like(a.lower(), b.lower(), *(e.lower() for e in escape)),
     "~": regex_match, "~*": lambda a, b: regex_match(a, b, True),
     "!~": lambda a, b: not regex_match(a, b), "!~*": lambda a, b: not regex_match(a, b, True),
     "DT+": temporal_plus, "DT-": temporal_minus, "IV*": interval_times, "IV/": interval_divide,
@@ -187,7 +189,14 @@ _BINARY = {
 
 
 def _variadic(op, fns):
-    """CONCAT, CONCAT_WS, GREATEST and LEAST, which skip NULL arguments instead of returning NULL."""
+    """CONCAT, CONCAT_WS, FORMAT, GREATEST and LEAST, which skip NULL arguments instead of returning NULL."""
+    if op == "FORMAT":
+        first, rest = fns[0], fns[1:]
+
+        def format_(row, outer):
+            fmt = first(row, outer)
+            return None if fmt is None else bounded(format_text(fmt, [f(row, outer) for f in rest]))
+        return format_
     if op == "CONCAT":
         return lambda row, outer: bounded("".join(to_text(v) for f in fns if (v := f(row, outer)) is not None))
     if op == "CONCAT_WS":
@@ -296,7 +305,7 @@ def _compile(e, ctx):
     if op == "CAST":
         target = e.type
         return _strict(lambda v: cast(v, target), fns)
-    if op in ("CONCAT", "CONCAT_WS", "GREATEST", "LEAST"):
+    if op in ("CONCAT", "CONCAT_WS", "FORMAT", "GREATEST", "LEAST"):
         return _variadic(op, fns)
     if op == "ARRAY":
         return lambda row, outer: tuple(f(row, outer) for f in fns)
@@ -954,7 +963,23 @@ def _window_values(call, members, rows, peers, ordered, frame, ctx, outer):
                 rank += 1
             out.append(rank)
         return out
+    if name == "PERCENT_RANK":
+        return [s / (n - 1) if n > 1 else 0.0 for s in starts]
+    if name == "CUME_DIST":
+        return [e / n for e in ends]
     fns = [ctx.compile(a) for a in call.args]
+    if name == "NTILE":
+        buckets = fns[0](rows[members[0]], outer) if n else None
+        if buckets is None:
+            return [None] * n
+        if buckets <= 0:
+            raise ExecutionError("argument of ntile must be greater than zero")
+        # As in PostgreSQL: the first n % buckets buckets take one row more than the rest.
+        size, extra = divmod(n, buckets)
+        out = []
+        for bucket in range(min(buckets, n)):
+            out += [bucket + 1] * (size + (bucket < extra))
+        return out
     values = [fns[0](rows[i], outer) for i in members] if fns else [1] * n  # COUNT(*) counts 1 per row
     if name in ("LAG", "LEAD"):
         offset = call.args[1].value if len(call.args) > 1 else 1
@@ -972,6 +997,14 @@ def _window_values(call, members, rows, peers, ordered, frame, ctx, outer):
         return [values[s] if s < e else None for s, e in bounds]
     if name == "LAST_VALUE":
         return [values[e - 1] if s < e else None for s, e in bounds]
+    if name == "NTH_VALUE":
+        out = []
+        for t, (s, e) in enumerate(bounds):
+            which = fns[1](rows[members[t]], outer)
+            if which is not None and which <= 0:
+                raise ExecutionError("argument of nth_value must be greater than zero")
+            out.append(values[s + which - 1] if which is not None and s + which - 1 < e else None)
+        return out
     if all(s == 0 for s, _ in bounds):
         # Every frame starts at the partition start and frame ends never move back, so one running total serves all rows.
         acc, position, out = make_accumulator(name, False), 0, []
@@ -1148,10 +1181,55 @@ class _JsonbObjectAgg(_Accumulator):
         return ct.build_object(*self.pairs) if self.pairs else None
 
 
+class _Percentile(_Accumulator):
+    """percentile_cont and percentile_disc: the sorted values arrive in order with the fraction beside them.
+    cont interpolates between the two values around the fraction; disc takes the first value at or past it."""
+
+    def __init__(self, distinct, continuous):
+        self.continuous = continuous
+        super().__init__(distinct)
+
+    def reset(self):
+        self.values, self.fraction = [], None
+
+    def step(self, v):
+        value, fraction = v
+        if fraction is not None and not 0 <= fraction <= 1:
+            raise ExecutionError(f"percentile value {to_text(fraction)} is not between 0 and 1")
+        self.fraction = fraction
+        self.values.append(value)
+
+    def result(self):
+        values, f = self.values, self.fraction
+        if not values or f is None:
+            return None
+        if not self.continuous:
+            return values[max(math.ceil(f * len(values)) - 1, 0)]
+        position = f * (len(values) - 1)
+        low, high = math.floor(position), math.ceil(position)
+        a, b = float(values[low]), float(values[high])
+        return a + (b - a) * (position - low)
+
+
+class _Mode(_Accumulator):
+    """mode(): the most frequent value; among equally frequent ones, the first in the sort order."""
+
+    def reset(self):
+        self.counts = Counter()
+
+    def step(self, v):
+        self.counts[v] += 1
+
+    def result(self):
+        return max(self.counts, key=self.counts.__getitem__) if self.counts else None  # max keeps the first of ties
+
+
 _ACCUMULATORS = {"COUNT": _Count, "SUM": _Sum, "AVG": _Avg, "MIN": _Min, "MAX": _Max, "STRING_AGG": _StringAgg,
                  "BOOL_AND": _BoolAnd, "EVERY": _BoolAnd, "BOOL_OR": _BoolOr, "ARRAY_AGG": _ArrayAgg,
                  "JSONB_AGG": _JsonbAgg, "JSON_AGG": _JsonbAgg, "JSONB_OBJECT_AGG": _JsonbObjectAgg,
-                 "JSON_OBJECT_AGG": _JsonbObjectAgg}
+                 "JSON_OBJECT_AGG": _JsonbObjectAgg, "MODE": _Mode,
+                 "PERCENTILE_CONT": lambda distinct: _Percentile(distinct, continuous=True),
+                 "PERCENTILE_DISC": lambda distinct: _Percentile(distinct, continuous=False)}
 
 
 def make_accumulator(name, distinct, order=()):

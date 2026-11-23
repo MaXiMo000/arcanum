@@ -6,13 +6,15 @@ Expression precedence, loosest first:
 Set operations: INTERSECT binds tighter than UNION and EXCEPT, as in standard SQL.
 """
 
+import functools
+
 from ..errors import SqlError
 from . import nodes as n
 from .lexer import EOF, FLOAT, INT, OP, QUOTED, STRING, WORD, tokenize
 
 # Words that are never a bare name. Other keywords (KEY, INDEX, ROWS, FIRST, ...)
 # only mean something in one spot, so they stay usable as table and column names.
-RESERVED = frozenset(["ALL", "AND", "AS", "ASC", "BETWEEN", "BY", "CASE", "CAST", "CHECK", "CONSTRAINT", "CROSS", "DESC", "DISTINCT", "ELSE", "END", "EXCEPT", "EXISTS", "FALSE", "FOREIGN", "FROM", "FULL", "GROUP", "HAVING", "IN", "INNER", "INTERSECT", "IS", "JOIN", "LATERAL", "LEFT", "LIKE", "LIMIT", "NATURAL", "NOT", "NULL", "OFFSET", "ON", "OR", "ORDER", "OUTER", "OVER", "REFERENCES", "RETURNING", "RIGHT", "SELECT", "SET", "THEN", "TRUE", "UNION", "USING", "VALUES", "WHEN", "WHERE", "WINDOW", "WITH"])
+RESERVED = frozenset(["ALL", "AND", "AS", "ASC", "BETWEEN", "BY", "CASE", "CAST", "CHECK", "CONSTRAINT", "CROSS", "DESC", "DISTINCT", "ELSE", "END", "EXCEPT", "EXISTS", "FALSE", "FETCH", "FOREIGN", "FROM", "FULL", "GROUP", "HAVING", "IN", "INNER", "INTERSECT", "INTO", "IS", "JOIN", "LATERAL", "LEFT", "LIKE", "LIMIT", "NATURAL", "NOT", "NULL", "OFFSET", "ON", "OR", "ORDER", "OUTER", "OVER", "REFERENCES", "RETURNING", "RIGHT", "SELECT", "SET", "THEN", "TRUE", "UNION", "USING", "VALUES", "WHEN", "WHERE", "WINDOW", "WITH"])
 
 SERIALS = {"SERIAL", "BIGSERIAL", "SMALLSERIAL", "SERIAL4", "SERIAL8", "SERIAL2"}  # INTEGER with a sequence
 TYPES = {
@@ -92,6 +94,8 @@ class _Parser:
         self.tokens = tokenize(sql)
         self.i = 0
         self.nesting = 0
+        self.window_refs = []  # per SELECT being parsed: [(spec, window name, parenthesized, token)] to resolve
+        self.select_into = None  # (token, table name) of a SELECT ... INTO, which makes the statement a CREATE TABLE AS
 
     def nest(self):
         self.nesting += 1
@@ -129,10 +133,31 @@ class _Parser:
             return f"string {tok.value!r}"
         return f"'{tok.value}'"
 
+    def expect_kw_of(self, *words):
+        word = self.accept_kw(*words)
+        if not word:
+            raise self.error(f"expected {' or '.join(words)}, got {self.describe()}")
+        return word
+
+    def transaction_modes(self):
+        """BEGIN's optional modes, in any order and comma-separated: ISOLATION LEVEL ..., READ ONLY,
+        READ WRITE and [NOT] DEFERRABLE (accepted; it only matters to PostgreSQL's read-only SERIALIZABLE)."""
+        isolation, read_only = None, False
+        while True:
+            if self.is_kw("ISOLATION"):
+                isolation = self.isolation_level()
+            elif self.is_kw("READ") and self.is_kw("ONLY", "WRITE", tok=self.peek()):
+                self.advance()
+                read_only = self.advance().value.upper() == "ONLY"
+            elif self.accept_kw("NOT"):
+                self.expect_kw("DEFERRABLE")
+            elif not self.accept_kw("DEFERRABLE"):
+                return n.Begin(isolation, read_only)
+            self.accept_op(",")
+
     def isolation_level(self):
-        """The optional ISOLATION LEVEL clause of BEGIN."""
-        if not self.accept_kw("ISOLATION"):
-            return None
+        """The ISOLATION LEVEL clause of BEGIN."""
+        self.expect_kw("ISOLATION")
         self.expect_kw("LEVEL")
         if self.accept_kw("READ"):
             if self.accept_kw("COMMITTED"):
@@ -206,11 +231,22 @@ class _Parser:
     # ---- statements ----------------------------------------------------------
 
     def statement(self):
+        stmt = self._statement()
+        if self.select_into is None:
+            return stmt
+        tok, name = self.select_into
+        self.select_into = None
+        if not isinstance(stmt, n.Query):
+            raise self.error("SELECT ... INTO is only allowed as a statement of its own", tok)
+        return n.CreateTableAs(name, stmt)
+
+    def _statement(self):
         if self.starts_query() or self.is_op("("):
             return self.query()
         tok = self.tok
         word = self.accept_kw("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "BEGIN", "COMMIT",
-                              "ROLLBACK", "EXPLAIN", "ANALYZE", "SAVEPOINT", "RELEASE", "START", "END", "VACUUM")
+                              "ROLLBACK", "EXPLAIN", "ANALYZE", "SAVEPOINT", "RELEASE", "START", "END", "VACUUM",
+                              "TRUNCATE")
         if word == "INSERT":
             return self.insert()
         if word == "UPDATE":
@@ -230,32 +266,89 @@ class _Parser:
             return n.Release(self.ident("a savepoint name"))
         if word == "START":
             self.expect_kw("TRANSACTION")
-            return n.Begin(self.isolation_level())
+            return self.transaction_modes()
         if word in ("BEGIN", "COMMIT", "ROLLBACK", "END"):
             self.accept_kw("TRANSACTION", "WORK")
             if word == "BEGIN":
-                return n.Begin(self.isolation_level())
+                return self.transaction_modes()
             if word == "ROLLBACK" and self.accept_kw("TO"):
                 self.accept_kw("SAVEPOINT")
                 return n.RollbackTo(self.ident("a savepoint name"))
             return n.Rollback() if word == "ROLLBACK" else n.Commit()
         if word == "EXPLAIN":
-            analyze = bool(self.accept_kw("ANALYZE"))
+            analyze = self.explain_options()
             return n.Explain(self.statement(), analyze)
         if word == "ANALYZE":
             return n.Analyze(self.ident("a table name") if self.is_name() else None)
         if word == "VACUUM":
-            full = bool(self.accept_kw("FULL"))
-            return n.Vacuum(self.ident("a table name") if self.is_name() else None, full)
+            if self.is_op("("):
+                options = self.options("VACUUM", {"FULL", "ANALYZE", "VERBOSE"})
+                full, analyze = options.get("FULL", False), options.get("ANALYZE", False)
+            else:
+                full = bool(self.accept_kw("FULL"))
+                self.accept_kw("VERBOSE")
+                analyze = bool(self.accept_kw("ANALYZE"))
+            return n.Vacuum(self.ident("a table name") if self.is_name() else None, full, analyze)
+        if word == "TRUNCATE":
+            self.accept_kw("TABLE")
+            tables = self.comma_list(lambda: self.ident("a table name"))
+            if self.is_kw("RESTART"):
+                raise self.unsupported("TRUNCATE ... RESTART IDENTITY")
+            if self.accept_kw("CONTINUE"):
+                self.expect_kw("IDENTITY")
+            cascade = self.accept_kw("CASCADE", "RESTRICT") == "CASCADE"
+            return n.Truncate(tables, cascade)
         raise self.error(f"expected a statement, got {self.describe(tok)}", tok)
+
+    def explain_options(self):
+        """EXPLAIN's options, old style (EXPLAIN ANALYZE VERBOSE) or in parentheses; whether to run the query."""
+        if self.is_op("(") and self.peek().kind == WORD and not self.peek_starts_query():
+            known = {"ANALYZE", "VERBOSE", "COSTS", "BUFFERS", "TIMING", "SUMMARY", "SETTINGS", "WAL", "FORMAT"}
+            return self.options("EXPLAIN", known).get("ANALYZE", False)
+        analyze = bool(self.accept_kw("ANALYZE"))
+        self.accept_kw("VERBOSE")
+        return analyze
+
+    def options(self, statement, known):
+        """A parenthesized option list such as (ANALYZE, COSTS false, FORMAT TEXT): {OPTION: value}."""
+        self.expect_op("(")
+        options = {}
+        while True:
+            tok = self.tok
+            if tok.kind != WORD:
+                raise self.error(f"expected a {statement} option, got {self.describe()}")
+            name = self.advance().value.upper()  # option names such as FULL may be reserved words
+            if name not in known:
+                raise self.error(f"unrecognized {statement} option {name.lower()}", tok)
+            if name == "FORMAT":
+                if self.ident("a format").upper() != "TEXT":
+                    raise self.unsupported("EXPLAIN formats other than TEXT", tok)
+                options[name] = "TEXT"
+            elif word := self.accept_kw("TRUE", "FALSE", "ON", "OFF"):
+                options[name] = word in ("TRUE", "ON")
+            elif self.tok.kind == INT and self.tok.value in ("0", "1"):
+                options[name] = self.advance().value == "1"
+            else:
+                options[name] = True
+            if not self.accept_op(","):
+                break
+        self.expect_op(")")
+        return options
 
     def insert(self):
         self.expect_kw("INTO")
         table = self.ident("a table name")
         columns = self.paren_names() if self.is_op("(") and not self.is_kw(*_QUERY_START, tok=self.peek()) else None
+        if self.accept_kw("DEFAULT"):
+            self.expect_kw("VALUES")
+            if columns:
+                raise self.error("DEFAULT VALUES takes no column list")
+            return self.insert_rest(table, n.Query(n.Values([[]])), [])
         if not (self.starts_query() or self.is_op("(")):
-            raise self.error(f"expected VALUES or SELECT, got {self.describe()}")
-        source = self.query()
+            raise self.error(f"expected VALUES, SELECT or DEFAULT VALUES, got {self.describe()}")
+        return self.insert_rest(table, self.query(), columns)
+
+    def insert_rest(self, table, source, columns):
         on_conflict = None
         if self.accept_kw("ON"):
             self.expect_kw("CONFLICT")
@@ -282,18 +375,40 @@ class _Parser:
 
     def update(self):
         table = self.ident("a table name")
+        alias = self.target_alias()
         self.expect_kw("SET")
         assignments = self.comma_list(self.assignment)
         from_ = self.from_clause() if self.accept_kw("FROM") else None
         where = self.expr() if self.accept_kw("WHERE") else None
-        return n.Update(table, assignments, where, self.returning(), from_)
+        return n.Update(table, assignments, where, self.returning(), from_, alias)
 
     def delete(self):
         self.expect_kw("FROM")
         table = self.ident("a table name")
+        alias = self.target_alias()
         using = self.from_clause() if self.accept_kw("USING") else None
         where = self.expr() if self.accept_kw("WHERE") else None
-        return n.Delete(table, where, self.returning(), using)
+        return n.Delete(table, where, self.returning(), using, alias)
+
+    def names_then_as(self):
+        """Whether a parenthesized list of bare names followed by AS comes next: CREATE TABLE t (a, b) AS ..."""
+        if not self.is_op("("):
+            return False
+        k = 1
+        while self.peek(k).kind in (WORD, QUOTED):
+            after = self.peek(k + 1)
+            if after.kind == OP and after.value == ")":
+                return self.is_kw("AS", tok=self.peek(k + 2))
+            if not (after.kind == OP and after.value == ","):
+                return False
+            k += 2
+        return False
+
+    def target_alias(self):
+        """The optional alias after UPDATE's or DELETE's table: [AS] name."""
+        if self.accept_kw("AS"):
+            return self.ident("an alias")
+        return self.ident("an alias") if self.is_name() else None
 
     def create(self):
         if self.accept_kw("OR"):
@@ -326,6 +441,17 @@ class _Parser:
     def create_table(self):
         if_not_exists = self.if_not_exists()
         name = self.ident("a table name")
+        if self.is_kw("AS") or self.names_then_as():
+            columns = self.paren_names() if self.is_op("(") else None
+            self.expect_kw("AS")
+            if not (self.starts_query() or self.is_op("(")):
+                raise self.error(f"expected a query after AS, got {self.describe()}")
+            query = self.query()
+            with_data = True
+            if self.accept_kw("WITH"):
+                with_data = not self.accept_kw("NO")
+                self.expect_kw("DATA")
+            return n.CreateTableAs(name, query, columns, if_not_exists, with_data)
         self.expect_op("(")
         stmt = n.CreateTable(name, [], [], if_not_exists)
         while True:
@@ -624,10 +750,27 @@ class _Parser:
         body = self.set_expr()
         order_by = self.order_by() if self.accept_kw("ORDER") else []
         limit = offset = None
-        if self.accept_kw("LIMIT"):
-            limit = self.expr()
-        if self.accept_kw("OFFSET"):
-            offset = self.expr()
+        seen = set()
+        while self.is_kw("LIMIT", "OFFSET", "FETCH"):
+            # LIMIT n and OFFSET n in either order, or the standard OFFSET n ROWS FETCH FIRST n ROWS ONLY.
+            tok = self.tok
+            word = self.advance().value.upper()
+            clause = "OFFSET" if word == "OFFSET" else "LIMIT"
+            if clause in seen:
+                raise self.error(f"{'OFFSET' if clause == 'OFFSET' else 'LIMIT or FETCH'} is given twice", tok)
+            seen.add(clause)
+            if word == "LIMIT":
+                limit = None if self.accept_kw("ALL") else self.expr()
+            elif word == "OFFSET":
+                offset = self.additive()
+                self.accept_kw("ROW", "ROWS")
+            else:
+                self.expect_kw_of("FIRST", "NEXT")
+                limit = n.Literal(1) if self.is_kw("ROW", "ROWS") else self.additive()
+                self.expect_kw_of("ROW", "ROWS")
+                if self.is_kw("WITH"):
+                    raise self.unsupported("FETCH ... WITH TIES")
+                self.expect_kw("ONLY")
         return n.Query(body, with_, order_by, limit, offset)
 
     def cte(self):
@@ -676,6 +819,7 @@ class _Parser:
 
     def select(self):
         self.expect_kw("SELECT")
+        self.window_refs.append([])
         distinct = self.accept_kw("DISTINCT", "ALL") == "DISTINCT"
         distinct_on = []
         if distinct and self.accept_kw("ON"):
@@ -683,6 +827,12 @@ class _Parser:
             distinct_on = self.comma_list(self.expr)
             self.expect_op(")")
         columns = self.comma_list(self.select_item)
+        if self.is_kw("INTO"):
+            tok = self.advance()
+            if self.nesting != 1 or self.select_into is not None:
+                raise self.error("SELECT ... INTO is only allowed in the outermost SELECT", tok)
+            self.accept_kw("TABLE")
+            self.select_into = (tok, self.ident("a table name"))
         from_ = self.from_clause() if self.accept_kw("FROM") else None
         where = self.expr() if self.accept_kw("WHERE") else None
         group_by, grouping_sets = [], None
@@ -690,8 +840,13 @@ class _Parser:
             self.expect_kw("BY")
             group_by, grouping_sets = self.group_by()
         having = self.expr() if self.accept_kw("HAVING") else None
-        if self.is_kw("WINDOW"):
-            raise self.unsupported("named windows")
+        named = {}
+        if self.accept_kw("WINDOW"):
+            for tok, name, spec in self.comma_list(self.named_window):
+                if name in named:
+                    raise self.error(f"window {name} is already defined", tok)
+                named[name] = spec
+        self.resolve_windows(named, self.window_refs.pop())
         return n.Select(columns, from_, where, group_by, having, distinct and not distinct_on, distinct_on,
                         grouping_sets)
 
@@ -888,7 +1043,7 @@ class _Parser:
                 if self.is_kw("ANY", "SOME", "ALL") and self.peek().kind == OP and self.peek().value == "(":
                     left = self.quantified(op, left)
                 else:
-                    left = n.Binary(op, left, self.concat(), pos)
+                    left = self.row_compare(op, left, self.concat(), pos)
             elif self.accept_kw("IS"):
                 negated = bool(self.accept_kw("NOT"))
                 if word := self.accept_kw("TRUE", "FALSE"):
@@ -911,7 +1066,9 @@ class _Parser:
                     self.expect_kw("AND")
                     left = n.Between(left, low, self.concat(), negated)
                 elif word := self.accept_kw("LIKE", "ILIKE"):
-                    left = n.Like(left, self.concat(), negated, word == "ILIKE")
+                    pattern = self.concat()
+                    escape = self.concat() if self.accept_kw("ESCAPE") else None
+                    left = n.Like(left, pattern, negated, word == "ILIKE", escape)
                 else:
                     return left
 
@@ -931,14 +1088,39 @@ class _Parser:
         self.expect_op(")")
         return n.Quantified(op, left, right, every)
 
+    def row_compare(self, op, left, right, pos=None):
+        """left op right, where a row on either side compares field by field: (a, b) = (c, d) is a = c AND b = d,
+        != is a != c OR b != d, and < <= > >= compare in order, as in PostgreSQL: (a, b) < (c, d) is
+        a < c OR (a = c AND b < d)."""
+        rows = [x for x in (left, right) if isinstance(x, n.RowValue)]
+        if not rows:
+            return n.Binary(op, left, right, pos)
+        if len(rows) == 1 or len(left.items) != len(right.items):
+            raise self.error("both sides of a row comparison must be rows with the same number of fields")
+        pairs = list(zip(left.items, right.items, strict=True))
+        if op in ("=", "!="):
+            join = "AND" if op == "=" else "OR"
+            return functools.reduce(lambda x, y: n.Binary(join, x, y), (n.Binary(op, a, b, pos) for a, b in pairs))
+        strict = op[0]  # < or >
+        result = n.Binary(op, *pairs[-1], pos)
+        for a, b in reversed(pairs[:-1]):
+            result = n.Binary("OR", n.Binary(strict, a, b, pos), n.Binary("AND", n.Binary("=", a, b, pos), result))
+        return result
+
     def in_rest(self, left, negated):
         self.expect_op("(")
         if self.starts_query():
+            if isinstance(left, n.RowValue):
+                raise self.unsupported("row values with IN (subquery)")
             query = self.query()
             self.expect_op(")")
             return n.InSubquery(left, query, negated)
         items = self.comma_list(self.expr)
         self.expect_op(")")
+        if isinstance(left, n.RowValue) or any(isinstance(item, n.RowValue) for item in items):
+            # (a, b) IN ((1, 2), (3, 4)) is (a = 1 AND b = 2) OR (a = 3 AND b = 4)
+            match = functools.reduce(lambda x, y: n.Binary("OR", x, y), (self.row_compare("=", left, i) for i in items))
+            return n.Unary("NOT", match) if negated else match
         return n.InList(left, items, negated)
 
     def concat(self):
@@ -1010,8 +1192,16 @@ class _Parser:
                 self.expect_op(")")
                 return n.Subquery(query)
             expr = self.expr()
+            if self.accept_op(","):
+                expr = n.RowValue([expr, *self.comma_list(self.expr)], tok.pos)
             self.expect_op(")")
             return expr
+        if tok.kind == WORD and tok.value.upper() == "ROW" and self.peek().kind == OP and self.peek().value == "(":
+            self.advance()
+            self.advance()
+            items = [] if self.is_op(")") else self.comma_list(self.expr)
+            self.expect_op(")")
+            return n.RowValue(items, tok.pos)
         if tok.kind == WORD and tok.value.upper() == "ARRAY" and self.peek().kind == OP and self.peek().value == "[":
             self.advance()
             self.advance()
@@ -1086,6 +1276,14 @@ class _Parser:
             if self.accept_kw("ORDER"):
                 call.order_by = self.order_by()
         self.expect_op(")")
+        if self.accept_kw("WITHIN"):
+            self.expect_kw("GROUP")
+            self.expect_op("(")
+            self.expect_kw("ORDER")
+            if call.order_by:
+                raise self.error("an aggregate cannot have both ORDER BY in its arguments and WITHIN GROUP")
+            call.order_by, call.within_group = self.order_by(), True
+            self.expect_op(")")
         if self.accept_kw("FILTER"):
             self.expect_op("(")
             self.expect_kw("WHERE")
@@ -1095,11 +1293,59 @@ class _Parser:
             call.over = self.window_spec()
         return call
 
-    def window_spec(self):
+    def named_window(self):
+        tok = self.tok
+        name = self.ident("a window name")
+        self.expect_kw("AS")
         if not self.is_op("("):
-            raise self.unsupported("named windows")
-        self.advance()
+            raise self.error(f"expected '(' after AS, got {self.describe()}")
+        return tok, name, self.window_spec()
+
+    def resolve_windows(self, named, refs):
+        """Fill each OVER name and OVER (name ...) of one SELECT from its WINDOW clause, as PostgreSQL does:
+        a definition may build on an earlier one, and a reference may add ORDER BY and a frame."""
+        by_spec = {id(ref[0]): ref for ref in refs}
+        done = set()
+
+        def resolve(spec, name, parenthesized, tok, seen=()):
+            if name in seen:
+                raise self.error(f"window {name} refers to itself", tok)
+            base = named.get(name)
+            if base is None:
+                raise self.error(f"window {name} does not exist", tok)
+            if id(base) in by_spec and id(base) not in done:
+                resolve(*by_spec[id(base)], seen=(*seen, name))
+            if spec.partition_by:
+                raise self.error(f"cannot override the PARTITION BY clause of window {name}", tok)
+            if spec.order_by and base.order_by:
+                raise self.error(f"cannot override the ORDER BY clause of window {name}", tok)
+            if parenthesized and base.frame is not None:
+                raise self.error(f"cannot copy window {name} because it has a frame clause", tok)
+            spec.partition_by = base.partition_by
+            spec.order_by = spec.order_by or base.order_by
+            spec.frame = spec.frame or base.frame
+            done.add(id(spec))
+
+        for ref in refs:
+            if id(ref[0]) not in done:
+                resolve(*ref)
+
+    def window_ref(self, spec, parenthesized):
+        """OVER name, or OVER (name ...): spec takes the named window's clauses once the WINDOW clause is read."""
+        tok = self.tok
+        name = self.ident("a window name")
+        if not self.window_refs:
+            raise self.error(f"window {name} does not exist", tok)
+        self.window_refs[-1].append((spec, name, parenthesized, tok))
+        return spec
+
+    def window_spec(self):
         spec = n.WindowSpec()
+        if not self.is_op("("):
+            return self.window_ref(spec, parenthesized=False)
+        self.advance()
+        if self.is_name() and not self.is_kw("PARTITION", "ORDER", "ROWS", "RANGE"):
+            self.window_ref(spec, parenthesized=True)
         if self.accept_kw("PARTITION"):
             self.expect_kw("BY")
             spec.partition_by = self.comma_list(self.expr)

@@ -11,14 +11,15 @@ UNBOUNDED TRUE FALSE CAST INTEGER REAL TEXT BOOLEAN NUMERIC DECIMAL DATE TIMESTA
 CHECK CONSTRAINT FOREIGN REFERENCES CASCADE RESTRICT RETURNING CONFLICT DO NOTHING EXCLUDED GENERATED ALWAYS
 IDENTITY FILTER EXTRACT CURRENT_DATE CURRENT_TIMESTAMP ISOLATION LEVEL SERIALIZABLE REPEATABLE READ COMMITTED
 VIEW REPLACE ALTER ADD COLUMN RENAME TO TYPE SAVEPOINT RELEASE LATERAL ROLLUP CUBE GROUPING SETS ARRAY JSONB
-JSON ANY SOME`.split(/\s+/);
+JSON ANY SOME TRUNCATE FETCH NEXT ONLY WINDOW WITHIN ESCAPE WRITE`.split(/\s+/);
 const FUNCTIONS = `count sum avg min max abs length lower upper trim ltrim rtrim replace substr round coalesce ifnull
 nullif row_number rank dense_rank lag lead first_value last_value string_agg bool_and bool_or now date_trunc
 date_part to_char to_date to_timestamp make_date age concat concat_ws greatest least left right lpad rpad strpos
 split_part initcap repeat reverse starts_with regexp_replace ceil floor trunc mod power sqrt sign array_agg
 unnest generate_series array_length cardinality array_append array_to_string string_to_array jsonb_agg
 jsonb_object_agg jsonb_build_object jsonb_build_array jsonb_each jsonb_each_text jsonb_array_elements jsonb_set
-jsonb_typeof to_jsonb grouping`.split(/\s+/);
+jsonb_typeof to_jsonb grouping ntile percent_rank cume_dist nth_value percentile_cont percentile_disc mode format
+md5 quote_ident quote_literal`.split(/\s+/);
 const KEYWORD_SET = new Set(KEYWORDS);
 const MAX_SUGGESTIONS = 6;
 const INDENT = "  ";
