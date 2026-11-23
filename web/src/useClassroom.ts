@@ -183,11 +183,15 @@ export function useClassroom() {
     const set = (patch: Partial<Following>) =>
       setRoom((r) => (r?.role === "student" && r.code === followingCode ? { ...r, ...patch } : r));
 
+    let closedWith: number | null = null; // the server's reason, sent as a message too (proxies may drop close codes)
     const connect = () => {
+      closedWith = null;
       socket = new WebSocket(api.classLiveUrl(followingCode));
       socket.onmessage = (message) => {
         const data = JSON.parse(message.data as string);
-        if (data.type === "joined") {
+        if (data.type === "closed") {
+          closedWith = data.code;
+        } else if (data.type === "joined") {
           tries = 0;
           set({ title: data.title, posts: data.history, status: "live", lesson: data.lesson });
         } else if (data.type === "lesson") {
@@ -200,8 +204,9 @@ export function useClassroom() {
       };
       socket.onclose = (event) => {
         if (stopped) return;
-        if (event.code === 4410) return set({ status: "ended" });
-        if (event.code === 4404) return set({ status: "unknown" });
+        const code = closedWith ?? event.code;
+        if (code === 4410) return set({ status: "ended" });
+        if (code === 4404) return set({ status: "unknown" });
         if (tries >= RETRIES) return set({ status: "lost" });
         set({ status: "connecting" });
         timer = window.setTimeout(connect, 1000 * 2 ** tries++);

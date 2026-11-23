@@ -309,14 +309,17 @@ def test_websockets_check_origin_and_are_capped(make_client):
     with client.websocket_connect(events, headers={"origin": "http://localhost:5173"}) as ws:
         ws.receive_json()
         with client.websocket_connect(events) as second, pytest.raises(WebSocketDisconnect) as capped:
+            assert second.receive_json() == {"type": "closed", "code": 4429}
             second.receive_json()
         assert capped.value.code == 4429
 
 
 def test_a_socket_for_a_vanished_session_says_so_after_the_handshake(client):
     # A browser sees a close code only on an accepted socket; the page starts a new session on 4404.
-    with client.websocket_connect("/sessions/AAAAAAAAAAAAAAAAAAAAAAAA/events") as ws,             pytest.raises(WebSocketDisconnect) as gone:
-        ws.receive_json()
+    with client.websocket_connect("/sessions/AAAAAAAAAAAAAAAAAAAAAAAA/events") as ws:
+        assert ws.receive_json() == {"type": "closed", "code": 4404}  # proxies may replace the close code
+        with pytest.raises(WebSocketDisconnect) as gone:
+            ws.receive_json()
     assert gone.value.code == 4404
 
 
@@ -582,6 +585,7 @@ def test_a_classroom_streams_the_teachers_posts_to_students(client):
             assert client.post(f"/classrooms/{code}/posts", json=post, headers=headers).status_code == 403
             assert client.delete(f"/classrooms/{code}", headers=headers).status_code == 403
         assert client.delete(f"/classrooms/{code}", headers=teacher).status_code == 204
+        assert ws.receive_json() == {"type": "closed", "code": 4410}
         with pytest.raises(WebSocketDisconnect) as ended:
             ws.receive_json()
         assert ended.value.code == 4410
@@ -674,7 +678,7 @@ def test_forwarding_ends_when_the_client_leaves_even_with_nothing_to_send():
         return socket
 
     socket = asyncio.run(deliver())
-    assert socket.sent == [{"n": 1}] and socket.closed == 4410
+    assert socket.sent == [{"n": 1}, {"type": "closed", "code": 4410}] and socket.closed == 4410
 
 
 def test_lab_sizes_follow_the_servers_lab_scale(make_client):

@@ -665,7 +665,7 @@ async def _forward(websocket, subscriber, messages):
             if batch in done:  # first, so a batch that arrived with the goodbye is not lost
                 items = batch.result()
                 if items is None:
-                    await websocket.close(code=4410)
+                    await _close(websocket, 4410)
                     return
                 for message in messages(items):
                     await websocket.send_json(message)
@@ -685,6 +685,12 @@ async def _refuse(websocket, code):
     connection (code 1006), and the page would keep retrying. Foreign origins are still refused at the
     handshake."""
     await websocket.accept()
+    await _close(websocket, code)
+
+
+async def _close(websocket, code):
+    """Close with a reason code, said first in a message too: some proxies replace a close frame's code."""
+    await websocket.send_json({"type": "closed", "code": code})
     await websocket.close(code=code)
 
 

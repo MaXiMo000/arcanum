@@ -294,20 +294,23 @@ export function useEngineFeed(sessionId: string | null, onSessionGone: () => voi
     let retry = 0;
     let timer: number | undefined;
     let stopped = false;
+    let closedWith: number | null = null; // the server's reason, sent as a message too (proxies may drop close codes)
     const connect = () => {
       setConnection("connecting");
+      closedWith = null;
       socket = new WebSocket(api.eventsUrl(sessionId));
       socket.onopen = () => {
         retry = 0;
         setConnection("live");
       };
       socket.onmessage = (message) => {
-        let data: { type?: string; events?: EngineEvent[] };
+        let data: { type?: string; code?: number; events?: EngineEvent[] };
         try {
           data = JSON.parse(String(message.data));
         } catch {
           return;
         }
+        if (data.type === "closed" && typeof data.code === "number") closedWith = data.code;
         if (data.type !== "events" || !Array.isArray(data.events)) return;
         for (const event of data.events) queue.current.push(event);
         if (queue.current.length > MAX_QUEUE) queue.current.splice(0, queue.current.length - MAX_QUEUE);
@@ -316,7 +319,8 @@ export function useEngineFeed(sessionId: string | null, onSessionGone: () => voi
       socket.onclose = (event) => {
         if (stopped) return;
         setConnection("offline");
-        if (event.code === 4404 || event.code === 4410) {
+        const code = closedWith ?? event.code;
+        if (code === 4404 || code === 4410) {
           callbacks.current.onSessionGone();
           return;
         }
