@@ -246,8 +246,9 @@ class ScalingLab(BaseModel):
 LABS = {"engines": EnginesLab, "buffer-pool": BufferPoolLab, "scaling": ScalingLab, "access": AccessLab,
         "sharding": ShardingLab}
 # The fields that decide how much work a lab does. ARCANUM_LAB_SCALE lowers their upper limits, so a small
-# instance answers in seconds instead of timing out; tuning knobs (value sizes, pool sizes) keep their range.
-LAB_SIZES = {"engines": ("keys",), "buffer-pool": ("rows", "lookups"), "access": ("rows",), "sharding": ("shards", "rows")}
+# instance answers in seconds instead of timing out; tuning knobs (value sizes, pool sizes, the number of shards,
+# which barely changes the work) keep their range.
+LAB_SIZES = {"engines": ("keys",), "buffer-pool": ("rows", "lookups"), "access": ("rows",), "sharding": ("rows",)}
 
 
 def lab_limits(scale):

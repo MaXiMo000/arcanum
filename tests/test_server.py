@@ -259,6 +259,16 @@ def test_session_creation_is_rate_limited_and_capped_per_client(make_client):
     assert response.status_code == 429 and response.json()["error"]["type"] == "RateLimited"
 
 
+def test_a_client_at_its_limit_takes_over_its_longest_idle_session(make_client):
+    client = make_client(max_sessions=10, max_sessions_per_client=2, session_ttl=600)
+    first, second = new_session(client), new_session(client)
+    manager = client.app.state.manager
+    manager.sessions[first].last_used -= 120  # idle for two minutes: past a tenth of the TTL
+    third = new_session(client)
+    assert first not in manager.sessions and {second, third} <= set(manager.sessions)
+    assert client.get(f"/sessions/{first}/state").status_code == 404  # its tab starts a new one
+
+
 def test_request_bodies_are_bounded(client):
     session = new_session(client)
     response = client.post(f"/sessions/{session}/query", content=b"{" + b" " * 50_000 + b"}",
@@ -663,10 +673,10 @@ def test_lab_sizes_follow_the_servers_lab_scale(make_client):
     client = make_client(lab_scale=0.4, labs_per_minute=100)
     session = new_session(client)
     labs = client.post("/sessions").json()["limits"]["labs"]
-    assert labs["sharding"] == {"shards": 4, "rows": 4600} and labs["scaling"] == {"steps": 3}
-    refused = client.post(f"/sessions/{session}/labs/sharding", json={"shards": 8, "rows": 2000})
-    assert refused.status_code == 422 and "limited to 4" in refused.json()["error"]["message"]
-    ok = client.post(f"/sessions/{session}/labs/sharding", json={"shards": 4, "rows": 1000})
+    assert labs["sharding"] == {"rows": 4600} and labs["scaling"] == {"steps": 3}
+    refused = client.post(f"/sessions/{session}/labs/sharding", json={"shards": 8, "rows": 5000})
+    assert refused.status_code == 422 and "limited to 4,600" in refused.json()["error"]["message"]
+    ok = client.post(f"/sessions/{session}/labs/sharding", json={"shards": 8, "rows": 1000})  # shards are not scaled
     assert ok.status_code == 200
     scaled = client.post(f"/sessions/{session}/labs/scaling", json={}).json()
     assert len(scaled["sizes"]) == 3  # fewer doubling steps on a small machine

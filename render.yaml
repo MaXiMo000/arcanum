@@ -18,7 +18,7 @@ services:
       - key: ARCANUM_MAX_SESSIONS
         value: "8"
       - key: ARCANUM_MAX_SESSIONS_PER_CLIENT
-        value: "2"
+        value: "3"
       - key: ARCANUM_MAX_CONCURRENT_QUERIES
         value: "2"
       - key: ARCANUM_WORKER_MEMORY_MB

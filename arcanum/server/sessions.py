@@ -245,11 +245,15 @@ class SessionManager:
         if self.slots is None:
             self.slots = asyncio.Semaphore(self.settings.max_concurrent_queries)
             self.lab_slots = asyncio.Semaphore(self.settings.max_concurrent_labs)
-        owned = sum(1 for s in self.sessions.values() if s.owner == owner)
-        if owned >= self.settings.max_sessions_per_client:
-            raise SessionError(429, "TooManySessions",
-                               f"each client may hold {self.settings.max_sessions_per_client} sessions; "
-                               "delete one first")
+        owned = [s for s in self.sessions.values() if s.owner == owner]
+        if len(owned) >= self.settings.max_sessions_per_client:
+            # A forgotten tab, or someone else on the same network: give way when its database has sat idle.
+            oldest = min(owned, key=lambda s: s.last_used)
+            if time.monotonic() - oldest.last_used <= self.settings.session_ttl / 10 or oldest.lock.locked():
+                raise SessionError(429, "TooManySessions",
+                                   f"Arcanum is already open in {len(owned)} tabs on your network; close one, or "
+                                   "try again in a minute or two")
+            await self.delete(oldest.id)
         if len(self.sessions) >= self.settings.max_sessions:
             await self.reap(force_oldest=True)
         if len(self.sessions) >= self.settings.max_sessions:
