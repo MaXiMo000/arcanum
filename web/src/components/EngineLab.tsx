@@ -4,11 +4,12 @@ import { useEffect, useRef, useState } from "react";
 import { api, type LabParams, type LabResult, type LsmMoment, type LsmShape } from "../api";
 import { formatCount } from "../format";
 import { LabTour } from "./LabTour";
-import { capParams, labMax, useLab, type LabLimits } from "../useLab";
+import { capParams, labMax, useLab, type LabLimits, type Slider } from "../useLab";
 import { BarCompare, type Bar } from "./BarCompare";
 import { LineChart, type Series } from "./LineChart";
 
 const DEFAULTS: LabParams = { keys: 5000, order: "random", updates: 0.5, value_bytes: 64, memory_pages: 16 };
+const SIZES = { keys: { min: 500, max: 10000, step: 500 } } satisfies Record<string, Slider>;
 const PLAY_MS = 450;
 
 function bytes(n: number): string {
@@ -32,7 +33,7 @@ const TOUR: { title: string; body: string; params: Partial<LabParams> }[] = [
 
 export function EngineLab({ sessionId, limits }: { sessionId: string | null; limits?: LabLimits }) {
   const [params, setParams] = useState<LabParams>(DEFAULTS);
-  useEffect(() => setParams((p) => capParams(p, limits)), [limits]); // this server's limits arrive with the session
+  useEffect(() => setParams((p) => capParams(p, limits, SIZES)), [limits]); // this server's limits arrive with the session
   const { result, running, error, run } = useLab(sessionId, api.lab);
   const set = <K extends keyof LabParams>(key: K, value: LabParams[K]) => setParams((p) => ({ ...p, [key]: value }));
 
@@ -51,7 +52,7 @@ export function EngineLab({ sessionId, limits }: { sessionId: string | null; lim
         title,
         body,
         run: () => {
-          const next = capParams({ ...DEFAULTS, ...changes }, limits);
+          const next = capParams({ ...DEFAULTS, ...changes }, limits, SIZES);
           setParams(next);
           return run(next);
         },
@@ -62,7 +63,7 @@ export function EngineLab({ sessionId, limits }: { sessionId: string | null; lim
           <span>
             Keys <b>{formatCount(params.keys)}</b>
           </span>
-          <input type="range" min={500} max={labMax(limits, "keys", 500, 10000, 500)} step={500} value={params.keys} onChange={(e) => set("keys", Number(e.target.value))} />
+          <input type="range" {...SIZES.keys} max={labMax(limits, "keys", SIZES.keys)} value={params.keys} onChange={(e) => set("keys", Number(e.target.value))} />
         </label>
         <label>
           <span>

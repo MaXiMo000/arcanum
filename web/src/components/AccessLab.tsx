@@ -22,7 +22,7 @@ const WHY: Record<string, string> = {
 
 export function AccessLab({ sessionId, limits }: { sessionId: string | null; limits?: LabLimits }) {
   const [rows, setRows] = useState(5000);
-  const most = labMax(limits, "rows", 1000, 20000, 1000);
+  const most = labMax(limits, "rows", { min: 1000, max: 20000, step: 1000 });
   useEffect(() => setRows((r) => Math.min(r, most)), [most]); // this server's limits arrive with the session
   const { result, running, error, run } = useLab(sessionId, api.accessLab);
 

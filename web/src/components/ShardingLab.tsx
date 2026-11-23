@@ -22,8 +22,8 @@ const WHY: Record<string, string> = {
 export function ShardingLab({ sessionId, limits }: { sessionId: string | null; limits?: LabLimits }) {
   const [shards, setShards] = useState(4);
   const [rows, setRows] = useState(4000);
-  const mostShards = labMax(limits, "shards", 2, 8, 1);
-  const mostRows = labMax(limits, "rows", 1000, 10000, 1000);
+  const mostShards = labMax(limits, "shards", { min: 2, max: 8, step: 1 });
+  const mostRows = labMax(limits, "rows", { min: 1000, max: 10000, step: 1000 });
   useEffect(() => {
     setShards((s) => Math.min(s, mostShards)); // this server's limits arrive with the session
     setRows((r) => Math.min(r, mostRows));
