@@ -203,7 +203,9 @@ export default function App() {
   }, [theme]);
   useEffect(() => writeStorage(local, VIEW_KEY, view), [view]);
   useEffect(() => writeStorage(local, MODE_KEY, mode), [mode]);
-  const use2d = useCallback(() => setView("2d"), []);
+  // The 3D view gave up (no WebGL, or its context was lost). Its canvas also loses the context when the visitor
+  // leaves 3D for another view, so fall back only while 3D is still the chosen view.
+  const use2d = useCallback(() => setView((current) => (current === "3d" ? "2d" : current)), []);
 
   const { feed, pending, speed, setSpeed, skip, connection, clearCrash, startCrash, syncPool } = useEngineFeed(
     sessionId,

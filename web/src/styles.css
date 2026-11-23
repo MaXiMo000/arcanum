@@ -797,6 +797,7 @@ h3 {
 
 .class-choice {
   display: grid;
+  grid-template-columns: minmax(0, 1fr); /* fields fit the card; an input's built-in width would widen it */
   gap: 8px;
   align-content: start;
   padding: 14px;
@@ -815,6 +816,8 @@ h3 {
 }
 
 .class-input {
+  width: 100%;
+  min-width: 0;
   padding: 9px 10px;
   border: 1px solid var(--line-2);
   border-radius: 9px;
@@ -4079,6 +4082,7 @@ p.session-badge {
 
 .lab-controls input[type="range"] {
   width: 100%;
+  margin-inline: 0; /* browsers add a side margin that would push a full-width slider past its box */
   accent-color: var(--accent);
 }
 
@@ -4615,7 +4619,8 @@ p.session-badge {
 
 .raft-grid {
   display: grid;
-  grid-template-columns: minmax(260px, 380px) minmax(0, 1fr);
+  /* side by side only when the lab pane has room for both; the logs column must not shrink to nothing */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
   gap: 12px;
   align-items: start;
 }
