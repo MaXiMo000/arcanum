@@ -265,13 +265,13 @@ export default function App() {
       /** Sends the work instead of running `sql` (a CSV import); `sql` then only describes it. */
       send?: (id: string) => Promise<QueryReply>,
     ): Promise<Outcome | ApiError | Waiting | null> => {
-      const id = idRef.current;
+      let id = idRef.current;
       if (!id) return null;
       setRunError(null);
       setComparison(null);
 
       const fail = (e: unknown): ApiError => {
-        if (e instanceof ApiError && e.status === 404) onSessionGone();
+        if (e instanceof ApiError && e.status === 404) void onSessionGone();
         const error = e instanceof ApiError ? e : new ApiError(0, { type: "Error", message: String(e) });
         setRunError({ error, sql });
         setPane((p) => (p === "stage" ? "inspector" : p)); // the doctor's diagnosis is in the inspector
@@ -306,8 +306,20 @@ export default function App() {
         return next;
       };
 
+      const attempt = (sid: string) => (send ? send(sid) : api.query(sid, sql, session));
       try {
-        let reply = await (send ? send(id) : api.query(id, sql, session));
+        let reply: QueryReply;
+        try {
+          reply = await attempt(id);
+        } catch (e) {
+          if (!(e instanceof ApiError && e.status === 404)) throw e;
+          // The server forgot this session (it restarted, or the session sat idle too long): open a fresh
+          // database and run the statement there instead of showing the visitor an error.
+          await onSessionGone();
+          if (!idRef.current || idRef.current === id) throw e;
+          id = idRef.current;
+          reply = await attempt(id);
+        }
         if (!reply.waiting) return await finish(reply);
         // A statement is waiting for another session's transaction: show the lock, then follow the
         // ticket until the holder finishes (or the wait is cancelled or times out).

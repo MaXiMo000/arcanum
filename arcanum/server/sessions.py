@@ -272,7 +272,8 @@ class SessionManager:
     def get(self, session_id):
         session = self.sessions.get(session_id) if SESSION_ID.match(session_id) else None
         if session is None:
-            raise SessionError(404, "UnknownSession", "no such session; create one with POST /sessions")
+            raise SessionError(404, "UnknownSession", "this session has ended (the server restarted, or it sat idle "
+                               "too long); reload the page for a fresh database")
         return session
 
     async def delete(self, session_id):

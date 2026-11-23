@@ -109,7 +109,7 @@ export function useSession() {
   /** The server no longer knows this session (it expired or restarted): start a new one. */
   const lost = useCallback(() => {
     writeStorage(tab, SESSION_KEY, null);
-    void start(true);
+    return start(true);
   }, [start]);
 
   /** Note statements that changed the database, for share links. */
