@@ -545,13 +545,13 @@ def create_app(settings=None):
             await websocket.close(code=4403)
             return
         if room is None:
-            await websocket.close(code=4404)
+            await _refuse(websocket, 4404)
             return
         if (not limiter.allow(client, "request", settings.rate_per_second, settings.rate_burst)
                 or sockets["total"] >= settings.max_websockets
                 or sockets["by_client"].get(client, 0) >= settings.max_websockets_per_client
                 or len(room.students) >= settings.max_students_per_classroom):
-            await websocket.close(code=4429)
+            await _refuse(websocket, 4429)
             return
         await websocket.accept()
         student = Subscriber(client)
@@ -606,13 +606,13 @@ def create_app(settings=None):
             await websocket.close(code=4403)  # browsers always send Origin; refuse foreign pages
             return
         if session is None:
-            await websocket.close(code=4404)
+            await _refuse(websocket, 4404)
             return
         if (not limiter.allow(client, "request", settings.rate_per_second, settings.rate_burst)
                 or sockets["total"] >= settings.max_websockets
                 or sockets["by_client"].get(client, 0) >= settings.max_websockets_per_client
                 or len(session.subscribers) >= settings.max_websockets_per_session):
-            await websocket.close(code=4429)
+            await _refuse(websocket, 4429)
             return
         await websocket.accept()
         subscriber = Subscriber(client)
@@ -677,6 +677,15 @@ async def _forward(websocket, subscriber, messages):
     finally:
         batch.cancel()
         inbound.cancel()
+
+
+async def _refuse(websocket, code):
+    """Close with a reason code the page can act on (4404: the session or classroom is gone, so start over;
+    4429: too many connections). Closing before the handshake would reach a browser only as a failed
+    connection (code 1006), and the page would keep retrying. Foreign origins are still refused at the
+    handshake."""
+    await websocket.accept()
+    await websocket.close(code=code)
 
 
 def _page(path, public_url):

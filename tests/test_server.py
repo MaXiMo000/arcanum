@@ -308,9 +308,16 @@ def test_websockets_check_origin_and_are_capped(make_client):
     assert refused.value.code == 4403
     with client.websocket_connect(events, headers={"origin": "http://localhost:5173"}) as ws:
         ws.receive_json()
-        with pytest.raises(WebSocketDisconnect) as capped, client.websocket_connect(events):
-            pass
+        with client.websocket_connect(events) as second, pytest.raises(WebSocketDisconnect) as capped:
+            second.receive_json()
         assert capped.value.code == 4429
+
+
+def test_a_socket_for_a_vanished_session_says_so_after_the_handshake(client):
+    # A browser sees a close code only on an accepted socket; the page starts a new session on 4404.
+    with client.websocket_connect("/sessions/AAAAAAAAAAAAAAAAAAAAAAAA/events") as ws,             pytest.raises(WebSocketDisconnect) as gone:
+        ws.receive_json()
+    assert gone.value.code == 4404
 
 
 def test_internal_errors_do_not_leak_details():
