@@ -16,6 +16,7 @@ inside a savepoint, its original bytes are kept in memory, and rollback()
 puts them back. Statements and transactions are built on this.
 """
 
+import contextlib
 import os
 import struct
 
@@ -59,6 +60,7 @@ class Pager:
         # result). A page's bytes object is replaced on every write, so an identity check is enough to
         # know an entry is current; entries leave with their page so this stays as small as the pool.
         self.decoded = {}
+        self._inspecting = 0  # inside inspecting(): reads leave no trace
         self._savepoints = []  # [(original page images, page_count, free_head)], innermost last
         self._closed = False
         self._file = self.fs.open(self.path)
@@ -83,6 +85,8 @@ class Pager:
     # ---- pages -----------------------------------------------------------------
 
     def read(self, page_id) -> bytes:
+        if self._inspecting:
+            return self.peek(page_id)
         self._check(page_id)
         entry = self._pool.get(page_id)
         if entry is not None:
@@ -253,6 +257,17 @@ class Pager:
         if len(data) != PAGE_SIZE:
             raise CorruptDatabaseError(f"page {page_id} is truncated")
         return data
+
+    @contextlib.contextmanager
+    def inspecting(self):
+        """Read the database to show it, without changing what is shown: reads inside the block touch
+        neither the replacement policy nor the stats, and no events are emitted."""
+        self._inspecting += 1
+        try:
+            with self.events.muted():
+                yield
+        finally:
+            self._inspecting -= 1
 
     def peek(self, page_id):
         """A page's bytes without touching the replacement policy, stats or events (for inspection)."""

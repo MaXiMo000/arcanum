@@ -493,7 +493,13 @@ def _failure(db, e, sql):
 
 
 def _state(db, message, jobs):
-    """Everything a visualizer needs to draw the database: trees, cache and log."""
+    """Everything a visualizer needs to draw the database: trees, cache and log. Reading it leaves no trace:
+    the stage would otherwise show the snapshot's own reads as the last query's work."""
+    with db.pager.inspecting():
+        return _snapshot(db, message, jobs)
+
+
+def _snapshot(db, message, jobs):
     catalog, pager = db.catalog, db.pager
     limit = message.get("node_limit", 2000)
 

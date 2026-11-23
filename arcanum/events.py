@@ -6,9 +6,13 @@ subscribers, emitting costs one loop over an empty list.
 """
 
 
+import contextlib
+
+
 class EventBus:
     def __init__(self):
         self._subscribers = []
+        self._muted = 0
 
     def subscribe(self, fn):
         """Call fn(kind, data) for every event. Returns a function that unsubscribes."""
@@ -16,5 +20,16 @@ class EventBus:
         return lambda: self._subscribers.remove(fn)
 
     def emit(self, kind, **data):
+        if self._muted:
+            return
         for fn in self._subscribers:
             fn(kind, data)
+
+    @contextlib.contextmanager
+    def muted(self):
+        """Emit nothing inside the block."""
+        self._muted += 1
+        try:
+            yield
+        finally:
+            self._muted -= 1

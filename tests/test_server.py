@@ -12,9 +12,10 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from arcanum import Database
 from arcanum.server.app import Settings, _forward, create_app
 from arcanum.server.sessions import Subscriber
-from arcanum.server.worker import error_json
+from arcanum.server.worker import SEED_SQL, _state, error_json
 from arcanum.storage import CorruptDatabaseError
 
 GENEROUS = {"query_timeout": 3, "max_sessions": 2, "max_sessions_per_client": 5, "max_rows": 5, "max_pages": 300,
@@ -707,3 +708,20 @@ def test_the_page_carries_absolute_link_preview_images(tmp_path):
         page = client.get("/")
     assert page.status_code == 200 and 'content="https://arcanum.example.org/og.jpg"' in page.text
     assert "default-src 'self'" in page.headers["content-security-policy"]  # the page keeps its policy
+
+
+def test_drawing_the_database_leaves_no_trace(tmp_path):
+    db = Database(tmp_path / "d.db", max_keys=4, pool_size=64)
+    db.execute_script(SEED_SQL)
+    a, _ = db.connect("A"), db.connect("B")  # the worker's two sessions
+    a.execute("BEGIN")
+    a.execute("UPDATE orders SET amount = amount + 1 WHERE id < 5")  # row versions for the snapshot to report
+    events, stats, order = [], dict(db.pager.stats), db.pager.cached_pages()
+    db.events.subscribe(lambda kind, data: events.append(kind))
+    state = _state(db, {}, type("Jobs", (), {"waits": lambda self: []})())
+    assert state["trees"] and state["versions"] is not None
+    # The stage would show these reads as the last query's walk, and the pool's hit rate would count them.
+    assert events == [] and dict(db.pager.stats) == stats and db.pager.cached_pages() == order
+    db.execute("SELECT * FROM customers WHERE id = 17")
+    assert events.count("node_visit") == 3  # events flow again after the snapshot
+    db.close()
