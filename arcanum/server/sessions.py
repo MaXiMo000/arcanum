@@ -198,6 +198,15 @@ class Session:
             time.sleep(random.uniform(0, CRASH_DELAY_SECONDS))
         self.broadcast([{"kind": "crash", "during_write": during_write}])
         self.kill()
+        if during_write:
+            # Commits acknowledged before the kill may still be waiting in the pipe; count them too.
+            try:
+                while self.conn.poll(0):
+                    message = receive(self.conn)
+                    if message.get("progress"):
+                        committed = message
+            except (EOFError, OSError, ValueError):
+                pass
         self.start()  # opening the database replays the log
         summary = {"recovered_frames": self.recovered_frames, "during_write": during_write}
         if during_write and committed is not None:

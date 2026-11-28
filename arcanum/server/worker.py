@@ -181,7 +181,12 @@ def _limit_memory(megabytes):
     except ImportError:
         return  # Windows: the per-statement row and spill budgets still apply
     limit = megabytes * 1024 * 1024
-    resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    except (ValueError, OSError):
+        # macOS refuses an address-space cap below what the process has already reserved;
+        # the per-statement row and spill budgets still apply.
+        log.warning("could not cap worker address space at %d MB on this platform", megabytes)
 
 
 def worker_main(path, conn, event_conn, options):
